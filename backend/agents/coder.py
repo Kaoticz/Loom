@@ -22,7 +22,7 @@ class AgentDeps(BaseModel):
     git: GitManagerService
 
 coder_agent: Agent[AgentDeps, str] = Agent(
-    'ollama:llama3', # Example model, should be configurable
+    'ollama:llama3', # Default model, will be overridden
     deps_type=AgentDeps,
     system_prompt=(
         'You are an expert AI software engineer. Your goal is to complete the given task '
@@ -44,12 +44,15 @@ async def search_code(ctx: RunContext[AgentDeps], query: str) -> str:
     import httpx
     import os
     
+    # We'll need a way to pass the embedding model. For now, we can use an environment variable or a default.
+    # Ideally, it should be in ctx.deps.
+    embedding_model = os.getenv('EMBEDDING_MODEL', 'llama3')
     ollama_url = os.getenv('OLLAMA_BASE_URL', 'http://ollama:11434')
     try:
         async with httpx.AsyncClient() as client:
             resp = await client.post(
                 f'{ollama_url}/api/embeddings',
-                json={'model': 'llama3', 'prompt': query}
+                json={'model': embedding_model, 'prompt': query}
             )
             embedding = resp.json().get('embedding', [0.0] * 768)
     except Exception:

@@ -1,4 +1,5 @@
 import { writable, get } from 'svelte/store';
+import { browser } from '$app/environment';
 
 export type MessageType = 'prompt' | 'thought' | 'action' | 'observation' | 'plan' | 'review' | 'done' | 'error';
 
@@ -16,6 +17,16 @@ export interface FileDiff {
     modified: string;
 }
 
+export interface AgentConfig {
+    coderModel: string;
+    reviewerModel: string;
+    embeddingModel: string;
+    repoPath: string;
+    dockerfile: string;
+    secrets: { key: string; value: string }[];
+    theme: 'light' | 'dark' | 'system';
+}
+
 export interface AgentState {
     messages: Message[];
     status: TaskStatus;
@@ -24,8 +35,20 @@ export interface AgentState {
     selectedFile: string | null;
     requiresAction: boolean;
     actionType: 'approve_plan' | 'approve_review' | null;
+    config: AgentConfig;
 }
 
+const defaultConfig: AgentConfig = {
+    coderModel: 'ollama:llama3',
+    reviewerModel: 'ollama:llama3',
+    embeddingModel: 'llama3',
+    repoPath: '',
+    dockerfile: 'FROM python:3.14-slim\n\nWORKDIR /workspace\n',
+    secrets: [],
+    theme: 'system'
+};
+
+const savedConfig = browser ? localStorage.getItem('loom_config') : null;
 const initialState: AgentState = {
     messages: [],
     status: 'idle',
@@ -33,7 +56,8 @@ const initialState: AgentState = {
     files: [],
     selectedFile: null,
     requiresAction: false,
-    actionType: null
+    actionType: null,
+    config: savedConfig ? JSON.parse(savedConfig) : defaultConfig
 };
 
 function createAgentStore() {
@@ -121,13 +145,47 @@ function createAgentStore() {
 
     return {
         subscribe,
+        updateConfig: (config: Partial<AgentConfig>) => {
+            update(state => {
+                const repoChanged = config.repoPath !== undefined && config.repoPath !== state.config.repoPath;
+                const nextConfig = { ...state.config, ...config };
+                
+                if (browser) {
+                    localStorage.setItem('loom_config', JSON.stringify(nextConfig));
+                }
+
+                if (repoChanged) {
+                    // Archive current task by resetting state
+                    return {
+                        ...state,
+                        config: nextConfig,
+                        messages: [],
+                        status: 'idle',
+                        fileDiffs: {},
+                        files: [],
+                        selectedFile: null,
+                        requiresAction: false,
+                        actionType: null
+                    };
+                }
+                
+                return { ...state, config: nextConfig };
+            });
+        },
         sendPrompt: (prompt: string) => {
+            const state = get({ subscribe });
             update(state => ({
                 ...state,
                 messages: [...state.messages, { type: 'prompt', content: prompt, timestamp: new Date() }],
                 status: 'indexing'
             }));
-            socket?.send(JSON.stringify({ prompt }));
+            socket?.send(JSON.stringify({
+                prompt,
+                coder_model: state.config.coderModel,
+                reviewer_model: state.config.reviewerModel,
+                embedding_model: state.config.embeddingModel,
+                repo_path: state.config.repoPath
+            }));
         },
         approve: (approved: boolean) => {
             update(state => ({ ...state, requiresAction: false, actionType: null }));

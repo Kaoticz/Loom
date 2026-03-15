@@ -49,11 +49,25 @@ class AgentSocketController:
         )
         
         try:
-            # Wait for the first message which should contain the prompt
+            # Wait for the first message which should contain the prompt and config
             data = await websocket.receive_text()
             message_data = json.loads(data)
             initial_prompt = message_data.get('prompt', '')
-            
+            coder_model = message_data.get('coder_model', 'ollama:llama3')
+            reviewer_model = message_data.get('reviewer_model', 'ollama:llama3')
+            embedding_model = message_data.get('embedding_model', 'llama3')
+            repo_path = message_data.get('repo_path')
+
+            if repo_path:
+                import os
+                os.environ['REPO_PATH'] = repo_path
+                os.environ['EMBEDDING_MODEL'] = embedding_model
+                # Re-initialize services with the new path
+                self.docker.repo_path = repo_path
+                self.editor.root_path = repo_path
+                self.git.repo_path = repo_path
+                self.indexing.repo_path = repo_path
+
             if not initial_prompt:
                 await websocket.send_json({'type': 'error', 'content': 'No prompt provided.'})
                 await websocket.close()
@@ -75,7 +89,7 @@ class AgentSocketController:
             
             # Generate actual plan using the agent
             plan_prompt = f'Task: {initial_prompt}\n\nPlease generate a step-by-step plan. Do not execute any tools yet.'
-            plan_result = await coder_agent.run(plan_prompt, deps=deps)
+            plan_result = await coder_agent.run(plan_prompt, deps=deps, model=coder_model)
             
             await websocket.send_json({
                 'type': 'plan',
@@ -92,7 +106,7 @@ class AgentSocketController:
                 
                 # Execute agent run with streaming
                 execution_prompt = f'Task: {initial_prompt}\n\nPlan: {plan_result.data}\n\nPlease execute the plan.' # type: ignore
-                async with coder_agent.run_stream(execution_prompt, deps=deps) as result:
+                async with coder_agent.run_stream(execution_prompt, deps=deps, model=coder_model) as result:
                     async for event in result.stream_responses():
                         # Stream thoughts (messages from model)
                         await websocket.send_json({'type': 'thought', 'content': str(event)})
@@ -102,7 +116,7 @@ class AgentSocketController:
 
                     # Review phase
                     diff = await self.git.get_diff()
-                    review = await reviewer_agent.run(f'Please review these changes:\n\n{diff}')
+                    review = await reviewer_agent.run(f'Please review these changes:\n\n{diff}', model=reviewer_model)
                     
                     review_data = review.data # type: ignore
                     await websocket.send_json({

@@ -24,6 +24,19 @@ services:
       - ./data/ollama:/root/.ollama/models
     ports:
       - '11434:11434'
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: all
+              capabilities: [gpu]
+    healthcheck:
+      # Checks if something is listening on port 11434
+      test: ["CMD-SHELL", "/bin/bash -c '</dev/tcp/localhost/11434' || exit 1"]
+      interval: 5s
+      timeout: 5s
+      retries: 3
 
   searxng:
     container_name: loom-searxng
@@ -42,9 +55,10 @@ services:
       dockerfile: Dockerfile
     volumes:
       - ./backend:/app
-      #- /var/run/docker.sock:/var/run/docker.sock
-      - ${XDG_RUNTIME_DIR}/podman/podman.sock:/var/run/docker.sock:Z
+      #- /var/run/docker.sock:/var/run/docker.sock  # If you use Docker
+      - ${XDG_RUNTIME_DIR}/podman/podman.sock:/var/run/docker.sock:Z    # If you use Podman
       - .:/user_repo # Bind mount for the target repository
+      #- /home/kotz:/host:rw # Mount host root to /host inside container with read-write access
     environment:
       - DATABASE_URL=postgres://loom:loom_password@postgres:5432/loom
       - OLLAMA_BASE_URL=http://ollama:11434
@@ -55,7 +69,7 @@ services:
       postgres:
         condition: service_healthy
       ollama:
-        condition: service_started
+        condition: service_healthy
       searxng:
         condition: service_started
 

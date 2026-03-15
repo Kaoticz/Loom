@@ -10,11 +10,12 @@
         if (typeof window !== 'undefined') {
             monaco = await import('monaco-editor');
             
+            const isDark = document.documentElement.classList.contains('dark');
             diffEditor = monaco.editor.createDiffEditor(editorContainer, {
                 originalEditable: false,
                 readOnly: true,
                 automaticLayout: true,
-                theme: 'vs-dark',
+                theme: isDark ? 'vs-dark' : 'vs',
                 renderSideBySide: true
             });
 
@@ -50,6 +51,11 @@
         updateDiff();
     }
 
+    $: if (monaco && diffEditor && $agentStore.config.theme) {
+        const isDark = document.documentElement.classList.contains('dark');
+        monaco.editor.setTheme(isDark ? 'vs-dark' : 'vs');
+    }
+
     onMount(() => {
         initMonaco();
     });
@@ -61,19 +67,19 @@
     });
 </script>
 
-<div class="flex flex-col h-full bg-[#1e1e1e]">
+<div class="flex flex-col h-full bg-white dark:bg-[#1e1e1e] transition-colors duration-200">
     <!-- File Selector -->
-    <div class="flex bg-[#252526] border-b border-[#333] overflow-x-auto no-scrollbar">
+    <div class="flex bg-gray-50 dark:bg-[#252526] border-b border-gray-200 dark:border-[#333] overflow-x-auto no-scrollbar">
         {#each $agentStore.files as file}
             <button
                 on:click={() => agentStore.selectFile(file)}
-                class="px-4 py-2 text-sm border-r border-[#333] whitespace-nowrap {$agentStore.selectedFile === file ? 'bg-[#1e1e1e] text-blue-400' : 'text-gray-400 hover:bg-[#2a2d2e]'}"
+                class="px-4 py-2 text-sm border-r border-gray-200 dark:border-[#333] whitespace-nowrap transition-colors {$agentStore.selectedFile === file ? 'bg-white dark:bg-[#1e1e1e] text-blue-600 dark:text-blue-400 font-medium' : 'text-gray-500 dark:text-gray-400 hover:bg-gray-100 dark:hover:bg-[#2a2d2e]'}"
             >
                 {file.split('/').pop()}
             </button>
         {/each}
         {#if $agentStore.files.length === 0}
-            <div class="px-4 py-2 text-sm text-gray-500 italic">No files modified yet</div>
+            <div class="px-4 py-2 text-sm text-gray-400 dark:text-gray-500 italic">No files modified yet</div>
         {/if}
     </div>
 
