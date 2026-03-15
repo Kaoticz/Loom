@@ -1,4 +1,7 @@
-from fastapi import FastAPI
+from fastapi import FastAPI, Request
+from fastapi.exceptions import HTTPException as FastAPIHTTPException
+from fastapi.responses import JSONResponse
+from starlette.exceptions import HTTPException as StarletteHTTPException
 from dishka import make_async_container
 from dishka.integrations.fastapi import setup_dishka
 
@@ -15,6 +18,27 @@ def create_app() -> FastAPI:
     app: FastAPI = FastAPI(title='Loom API')
     
     app.include_router(api_router, prefix='/api/v1')
+
+    @app.exception_handler(StarletteHTTPException)
+    @app.exception_handler(FastAPIHTTPException)
+    async def http_exception_handler(request: Request, exc: StarletteHTTPException | FastAPIHTTPException):
+        return JSONResponse(
+            status_code=exc.status_code,
+            content={
+                "detail": exc.detail,
+                "type": "HTTPException"
+            }
+        )
+
+    @app.exception_handler(Exception)
+    async def global_exception_handler(request: Request, exc: Exception):
+        return JSONResponse(
+            status_code=500,
+            content={
+                "detail": str(exc),
+                "type": type(exc).__name__
+            }
+        )
     
     container = make_async_container(MainProvider())
     setup_dishka(container, app)

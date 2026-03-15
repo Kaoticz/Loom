@@ -7,15 +7,16 @@ class FileEditorService:
     root_path: str
 
     def __init__(self, root_path: str):
-        self.root_path = os.path.abspath(root_path)
+        self.root_path = root_path
 
     def _safe_path(self, path: str) -> str:
         """
         Validate and return an absolute path within the root.
         """
-        safe_path = os.path.abspath(os.path.join(self.root_path, path))
-        if not safe_path.startswith(self.root_path):
-            raise ValueError(f'Path {path} is outside of root {self.root_path}')
+        abs_root = os.path.abspath(self.root_path)
+        safe_path = os.path.abspath(os.path.join(abs_root, path))
+        if not safe_path.startswith(abs_root):
+            raise ValueError(f'Path {path} is outside of root {abs_root}')
         return safe_path
 
     async def edit_file(self, path: str, search_block: str, replace_block: str) -> bool:

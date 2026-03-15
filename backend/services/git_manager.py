@@ -6,10 +6,30 @@ class GitManagerService:
     """
     Service for repository management using GitPython.
     """
-    repo: Repo
+    _repo: Repo | None = None
+    _repo_path: str
 
     def __init__(self, repo_path: str):
-        self.repo = Repo(repo_path)
+        self._repo_path = repo_path
+
+    @property
+    def repo_path(self) -> str:
+        return self._repo_path
+
+    @repo_path.setter
+    def repo_path(self, value: str):
+        if self._repo_path != value:
+            self._repo_path = value
+            self._repo = None
+
+    @property
+    def repo(self) -> Repo:
+        """
+        Lazy-loaded GitPython Repo instance.
+        """
+        if self._repo is None:
+            self._repo = Repo(self.repo_path)
+        return self._repo
 
     async def create_branch(self, branch_name: str) -> None:
         """

@@ -19,8 +19,10 @@ async def list_ollama_models() -> List[str]:
             data = resp.json()
             return [model['name'] for model in data.get('models', [])]
     except Exception as e:
-        print(f"Error fetching Ollama models: {e}")
-        return []
+        raise HTTPException(
+            status_code=500,
+            detail=f"Error fetching Ollama models: {str(e)}"
+        )
 
 @router.get('/repos/validate')
 async def validate_repo(path: str) -> Dict[str, Any]:
@@ -28,15 +30,15 @@ async def validate_repo(path: str) -> Dict[str, Any]:
     Validate if the given path is a valid git repository.
     """
     if not os.path.exists(path):
-        return {'valid': False, 'error': 'Path does not exist'}
+        raise HTTPException(status_code=400, detail="Path does not exist")
     
     try:
         git.Repo(path)
         return {'valid': True}
     except git.InvalidGitRepositoryError:
-        return {'valid': False, 'error': 'Not a valid git repository'}
+        raise HTTPException(status_code=400, detail="Not a valid git repository")
     except Exception as e:
-        return {'valid': False, 'error': str(e)}
+        raise HTTPException(status_code=500, detail=str(e))
 
 @router.get('/repos/list')
 async def list_directories(path: str = '/') -> List[str]:

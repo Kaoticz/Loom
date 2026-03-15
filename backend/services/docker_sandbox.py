@@ -6,17 +6,37 @@ class DockerSandboxManager:
     """
     Manager for Docker sandbox environments.
     """
-    client: Any
-    repo_path: str
+    _client: Any | None = None
+    _repo_path: str
     container_name: str
 
     def __init__(self, repo_path: str):
         """
         :param repo_path: The host path to the repository to bind mount.
         """
-        self.client = docker.from_env()
-        self.repo_path = repo_path
+        self._repo_path = repo_path
         self.container_name = 'loom-sandbox'
+
+    @property
+    def repo_path(self) -> str:
+        return self._repo_path
+
+    @repo_path.setter
+    def repo_path(self, value: str):
+        if self._repo_path != value:
+            self._repo_path = value
+            # We don't necessarily need to reset self._client here as it's the docker client,
+            # but it doesn't hurt if we want to be super safe.
+            # However, repo_path is used in spawn_sandbox.
+
+    @property
+    def client(self) -> Any:
+        """
+        Lazy-loaded Docker client.
+        """
+        if self._client is None:
+            self._client = docker.from_env()
+        return self._client
 
     async def spawn_sandbox(self, image: str = 'python:3.13-slim') -> Any:
         """

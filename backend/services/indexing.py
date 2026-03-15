@@ -15,19 +15,20 @@ class IndexingService:
     repo_path: str
 
     def __init__(self, repo_path: str):
-        self.repo_path = os.path.abspath(repo_path)
+        self.repo_path = repo_path
 
     async def index_repository(self) -> None:
         """
         Scan the repository and update 'files', 'symbols', and 'embeddings' tables.
         """
-        for root, _, files in os.walk(self.repo_path):
+        abs_repo_path = os.path.abspath(self.repo_path)
+        for root, _, files in os.walk(abs_repo_path):
             if '.git' in root:
                 continue
             
             for file_name in files:
                 file_path = os.path.join(root, file_name)
-                rel_path = os.path.relpath(file_path, self.repo_path)
+                rel_path = os.path.relpath(file_path, abs_repo_path)
                 
                 with open(file_path, 'r', errors='ignore') as f:
                     content = f.read()
@@ -93,7 +94,8 @@ class IndexingService:
         """
         Use ast-grep to extract symbols from a file.
         """
-        abs_path = os.path.join(self.repo_path, file_obj.file_path)
+        abs_repo_path = os.path.abspath(self.repo_path)
+        abs_path = os.path.join(abs_repo_path, file_obj.file_path)
         
         # Predefined rule to find functions and classes in Python
         # In production, we would support multiple languages
