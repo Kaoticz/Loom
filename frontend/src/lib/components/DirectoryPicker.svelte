@@ -2,7 +2,7 @@
     import { createEventDispatcher, onMount } from 'svelte';
 
     const dispatch = createEventDispatcher();
-    export let initialPath = '/';
+    export let initialPath = '/repo';
 
     let currentPath = initialPath;
     let directories: string[] = [];

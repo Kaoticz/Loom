@@ -57,7 +57,7 @@ services:
       - ./backend:/app
       #- /var/run/docker.sock:/var/run/docker.sock  # If you use Docker
       - ${XDG_RUNTIME_DIR}/podman/podman.sock:/var/run/docker.sock:Z    # If you use Podman
-      - .:/user_repo # Bind mount for the target repository
+      - ./data/repo:/repo # Bind mount for the target repository
       #- /home/kotz:/host:rw # Mount host root to /host inside container with read-write access
     environment:
       - DATABASE_URL=postgres://loom:loom_password@postgres:5432/loom

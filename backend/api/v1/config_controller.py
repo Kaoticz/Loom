@@ -47,6 +47,11 @@ async def list_directories(path: str = '/') -> List[str]:
         raise HTTPException(status_code=404, detail="Path not found")
     
     try:
-        return [d for d in os.listdir(path) if os.path.isdir(os.path.join(path, d))]
+        dirs = []
+        for name in os.listdir(path):
+            full_path = os.path.join(path, name)
+            if os.path.isdir(full_path):
+                dirs.append(name)
+        return sorted(dirs)
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))

@@ -223,7 +223,7 @@
             {#if showPicker}
                 <div class="fixed inset-0 bg-black/50 backdrop-blur-sm z-50 flex items-center justify-center p-4">
                     <DirectoryPicker 
-                        initialPath={config.repoPath || '/'}
+                        initialPath={config.repoPath || '/repo'}
                         on:close={() => showPicker = false}
                         on:select={(e) => {
                             config.repoPath = e.detail;
