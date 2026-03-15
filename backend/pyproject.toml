@@ -7,7 +7,7 @@ name = "loom-backend"
 version = "0.0.1"
 description = "Simple local agentic coder."
 readme = "README.md"
-requires-python = ">=3.14" # The minimum supported Python version
+requires-python = ">=3.13" # The minimum supported Python version
 license = "AGPL-3.0-or-later"
 license-files = ["LICENSE"]
 authors = [
@@ -27,8 +27,13 @@ dependencies = [
     "tortoise-orm[asyncpg]",
     "aerich[toml]",
     "pydantic",
-    "pydantic-ai>=1.67.0,<1.68.0",
-    "pyjwt"
+    "pydantic-ai>=0.0.18",
+    "pyjwt",
+    "tortoise-vector",
+    "dishka",
+    "GitPython",
+    "docker",
+    "python-multipart"
 ]
 
 [tool.setuptools.packages.find]
@@ -40,7 +45,7 @@ location = "database/migrations"
 verbosity = 1
 
 [tool.mypy]
-python_version = 3.14
+python_version = 3.13
 strict = true
 local_partial_types = true
 plugins = ["pydantic.mypy"]
