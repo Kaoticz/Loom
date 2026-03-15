@@ -17,10 +17,13 @@ coverage
 
 # build output
 .vercel
+.svelte-kit/
+build/
 
 # OS-specific
 .DS_Store
 
 tmp
+*.log
 
 benchmarking/compare/.results

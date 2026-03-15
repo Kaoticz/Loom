@@ -1,0 +1,93 @@
+<script lang="ts">
+    import { agentStore } from '$lib/stores/agent';
+    import { afterUpdate } from 'svelte';
+
+    let promptInput = '';
+    let chatContainer: HTMLElement;
+
+    function handleSend() {
+        if (promptInput.trim()) {
+            agentStore.sendPrompt(promptInput);
+            promptInput = '';
+        }
+    }
+
+    afterUpdate(() => {
+        if (chatContainer) {
+            chatContainer.scrollTop = chatContainer.scrollHeight;
+        }
+    });
+
+    const typeStyles = {
+        prompt: 'bg-blue-50 border-blue-200 text-blue-800 self-end',
+        thought: 'bg-gray-50 border-gray-200 text-gray-600 italic',
+        action: 'bg-yellow-50 border-yellow-200 text-yellow-800 font-mono text-xs',
+        observation: 'bg-green-50 border-green-200 text-green-800 font-mono text-xs',
+        plan: 'bg-purple-50 border-purple-200 text-purple-800',
+        review: 'bg-orange-50 border-orange-200 text-orange-800',
+        done: 'bg-green-100 border-green-300 text-green-900 font-bold',
+        error: 'bg-red-50 border-red-200 text-red-800'
+    };
+</script>
+
+<div class="flex flex-col h-full bg-white border-r border-gray-200">
+    <!-- Header -->
+    <div class="p-4 border-b border-gray-200 flex justify-between items-center">
+        <h2 class="font-bold text-lg">Agent Chat</h2>
+        <span class="text-xs px-2 py-1 rounded bg-gray-100 uppercase tracking-wider font-semibold">
+            {$agentStore.status}
+        </span>
+    </div>
+
+    <!-- Messages -->
+    <div 
+        bind:this={chatContainer}
+        class="flex-1 overflow-y-auto p-4 space-y-4 flex flex-col"
+    >
+        {#each $agentStore.messages as message}
+            <div class="max-w-[90%] p-3 rounded-lg border {typeStyles[message.type] || 'bg-gray-100'} shadow-sm">
+                <div class="text-[10px] opacity-50 mb-1 uppercase font-bold">{message.type}</div>
+                <div class="whitespace-pre-wrap">{message.content}</div>
+            </div>
+        {/each}
+
+        {#if $agentStore.requiresAction}
+            <div class="p-4 border-2 border-dashed border-blue-300 rounded-lg bg-blue-50 space-y-3">
+                <p class="text-sm font-semibold text-blue-800">User Action Required:</p>
+                <div class="flex gap-2">
+                    <button 
+                        on:click={() => agentStore.approve(true)}
+                        class="px-4 py-2 bg-blue-600 text-white rounded text-sm hover:bg-blue-700 shadow-sm"
+                    >
+                        Approve
+                    </button>
+                    <button 
+                        on:click={() => agentStore.approve(false)}
+                        class="px-4 py-2 bg-white text-blue-600 border border-blue-600 rounded text-sm hover:bg-blue-50"
+                    >
+                        Reject
+                    </button>
+                </div>
+            </div>
+        {/if}
+    </div>
+
+    <!-- Input -->
+    <div class="p-4 border-t border-gray-200">
+        <div class="flex gap-2">
+            <textarea
+                bind:value={promptInput}
+                on:keydown={(e) => e.key === 'Enter' && !e.shiftKey && (e.preventDefault(), handleSend())}
+                placeholder="Describe a task for the agent..."
+                class="flex-1 p-2 border border-gray-300 rounded-md focus:ring-2 focus:ring-blue-500 focus:border-transparent resize-none h-20 text-sm"
+            ></textarea>
+            <button
+                on:click={handleSend}
+                disabled={$agentStore.status !== 'idle' && $agentStore.status !== 'completed' && $agentStore.status !== 'failed'}
+                class="px-4 bg-blue-600 text-white rounded-md hover:bg-blue-700 disabled:opacity-50 disabled:cursor-not-allowed transition-colors"
+            >
+                Send
+            </button>
+        </div>
+    </div>
+</div>
