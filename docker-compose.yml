@@ -19,6 +19,7 @@ services:
     image: ollama/ollama:latest
     volumes:
       - ollama_data:/root/.ollama
+      - ./data/ollama:/root/.ollama/models
     ports:
       - '11434:11434'
 
@@ -27,7 +28,7 @@ services:
     ports:
       - '8080:8080'
     volumes:
-      - ./searxng:/etc/searxng:rw
+      - ./data/searxng:/etc/searxng:rw
     environment:
       - SEARXNG_BASE_URL=http://localhost:8080/
 
