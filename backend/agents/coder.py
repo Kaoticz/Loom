@@ -85,7 +85,10 @@ async def run_test(ctx: RunContext[AgentDeps], command: str) -> str:
     """
     Run a test command in the sandbox.
     """
-    return await ctx.deps.docker.run_test_command(command)
+    try:
+        return await ctx.deps.docker.run_test_command(command)
+    except Exception as e:
+        return f'Error: Could not run command in sandbox. {str(e)}'
 
 @coder_agent.tool
 async def web_search(ctx: RunContext[AgentDeps], query: str) -> str:

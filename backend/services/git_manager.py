@@ -28,7 +28,21 @@ class GitManagerService:
         Lazy-loaded GitPython Repo instance.
         """
         if self._repo is None:
+            # Ensure the directory is considered safe by Git
+            from git import Git
+            try:
+                Git().config('--global', '--add', 'safe.directory', self.repo_path)
+            except Exception:
+                pass # Already added or cannot add
+
             self._repo = Repo(self.repo_path)
+            
+            # Set agent identity
+            with self._repo.config_writer() as writer:
+                writer.set_value('user', 'name', 'Loom AI')
+                writer.set_value('user', 'email', 'agent@loom.ai')
+                writer.release()
+
         return self._repo
 
     async def create_branch(self, branch_name: str) -> None:

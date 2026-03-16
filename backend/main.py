@@ -2,8 +2,17 @@ from fastapi import FastAPI, Request
 from fastapi.exceptions import HTTPException as FastAPIHTTPException
 from fastapi.responses import JSONResponse
 from starlette.exceptions import HTTPException as StarletteHTTPException
+import logging
+import traceback
 from dishka import make_async_container
 from dishka.integrations.fastapi import setup_dishka
+
+# Configure logging
+logging.basicConfig(
+    level=logging.INFO,
+    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s'
+)
+logger = logging.getLogger(__name__)
 
 from providers.main import MainProvider
 from api.v1.router import api_router
@@ -32,6 +41,7 @@ def create_app() -> FastAPI:
 
     @app.exception_handler(Exception)
     async def global_exception_handler(request: Request, exc: Exception):
+        logger.exception(f"Unhandled exception: {str(exc)}")
         return JSONResponse(
             status_code=500,
             content={

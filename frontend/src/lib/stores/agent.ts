@@ -42,7 +42,7 @@ const defaultConfig: AgentConfig = {
     coderModel: 'ollama:llama3',
     reviewerModel: 'ollama:llama3',
     embeddingModel: 'llama3',
-    repoPath: '',
+    repoPath: '/tmp/repo',
     dockerfile: 'FROM python:3.14-slim\n\nWORKDIR /workspace\n',
     secrets: [],
     theme: 'system'

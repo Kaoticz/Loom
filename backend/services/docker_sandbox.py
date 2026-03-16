@@ -1,4 +1,5 @@
 import docker
+import os
 from typing import Any
 import asyncio
 
@@ -35,7 +36,19 @@ class DockerSandboxManager:
         Lazy-loaded Docker client.
         """
         if self._client is None:
-            self._client = docker.from_env()
+            try:
+                self._client = docker.from_env()
+                # Test connection
+                self._client.ping()
+            except Exception as e:
+                if "Permission denied" in str(e) or (hasattr(e, 'errno') and e.errno == 13):
+                    raise RuntimeError(
+                        "Permission denied when connecting to Docker socket. "
+                        "Please ensure the user running the application has read/write access to /var/run/docker.sock. "
+                        "If using Docker, you might need 'sudo usermod -aG docker $USER'. "
+                        "If using Podman, ensure the podman.socket is running and the path is correct."
+                    ) from e
+                raise
         return self._client
 
     async def spawn_sandbox(self, image: str = 'python:3.13-slim') -> Any:
@@ -59,7 +72,7 @@ class DockerSandboxManager:
                 detach=True,
                 name=self.container_name,
                 volumes={
-                    self.repo_path: {'bind': '/workspace', 'mode': 'rw'}
+                    os.path.abspath(self.repo_path): {'bind': '/workspace', 'mode': 'rw'}
                 },
                 working_dir='/workspace'
             )

@@ -9,7 +9,7 @@ class CodeEmbedding(models.Model):
     id: Any = fields.IntField(pk=True)
     file: Any = fields.ForeignKeyField('models.File', related_name='embeddings')
     chunk_text: Any = fields.TextField()
-    embedding: Any = VectorField(vector_size=768) # Typical size for many models, can be adjusted
+    embedding: Any = VectorField(vector_size=1024) # Matches modern models like llama3
     start_line: Any = fields.IntField()
 
     class Meta: # type: ignore

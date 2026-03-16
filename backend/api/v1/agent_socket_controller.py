@@ -7,6 +7,15 @@ from services.file_editor import FileEditorService
 from services.git_manager import GitManagerService
 from services.indexing import IndexingService
 import json
+import logging
+import traceback
+import os
+import uuid
+import asyncio
+from pydantic_ai.models.openai import OpenAIChatModel
+from pydantic_ai.providers.openai import OpenAIProvider
+
+logger = logging.getLogger(__name__)
 
 class AgentSocketController:
     """
@@ -59,7 +68,6 @@ class AgentSocketController:
             repo_path = message_data.get('repo_path')
 
             if repo_path:
-                import os
                 os.environ['REPO_PATH'] = repo_path
                 os.environ['EMBEDDING_MODEL'] = embedding_model
                 # Re-initialize services with the new path
@@ -73,27 +81,56 @@ class AgentSocketController:
                 await websocket.close()
                 return
             
+            websocket_lock = asyncio.Lock()
+            completed_count = 0
+
+            async def progress_callback(current, total, message):
+                async with websocket_lock:
+                    await websocket.send_json({
+                        'type': 'thought',
+                        'content': f'Indexing [{current}/{total}]: {message}'
+                    })
+
             await websocket.send_json({'type': 'thought', 'content': 'Indexing repository...'})
-            await self.indexing.index_repository()
+            await self.indexing.index_repository(progress_callback=progress_callback)
             
             await websocket.send_json({'type': 'thought', 'content': 'Initializing sandbox...'})
-            await self.docker.spawn_sandbox()
+            try:
+                await self.docker.spawn_sandbox()
+            except Exception as e:
+                logger.warning(f"Failed to spawn sandbox: {str(e)}")
+                await websocket.send_json({
+                    'type': 'thought', 
+                    'content': f'Warning: Sandbox initialization failed ({str(e)}). You can still edit files, but test execution will be unavailable.'
+                })
             
             # Use a unique branch name per session
-            import uuid
             session_id = str(uuid.uuid4())[:8]
             branch_name = f'ai-task-{session_id}'
             await self.git.create_branch(branch_name)
             
             await websocket.send_json({'type': 'thought', 'content': 'Generating plan...'})
             
+            def get_model(model_name: str):
+                if model_name.startswith('ollama:'):
+                    base_url = os.getenv('OLLAMA_BASE_URL', 'http://ollama:11434')
+                    provider = OpenAIProvider(
+                        base_url=f'{base_url}/v1',
+                        api_key='ollama'
+                    )
+                    return OpenAIChatModel(
+                        model_name=model_name.replace('ollama:', ''),
+                        provider=provider
+                    )
+                return model_name
+
             # Generate actual plan using the agent
             plan_prompt = f'Task: {initial_prompt}\n\nPlease generate a step-by-step plan. Do not execute any tools yet.'
-            plan_result = await coder_agent.run(plan_prompt, deps=deps, model=coder_model)
+            plan_result = await coder_agent.run(plan_prompt, deps=deps, model=get_model(coder_model))
             
             await websocket.send_json({
                 'type': 'plan',
-                'content': plan_result.data, # type: ignore
+                'content': plan_result.output, # type: ignore
                 'requires_approval': True
             })
             
@@ -105,20 +142,20 @@ class AgentSocketController:
                 from agents.reviewer import reviewer_agent
                 
                 # Execute agent run with streaming
-                execution_prompt = f'Task: {initial_prompt}\n\nPlan: {plan_result.data}\n\nPlease execute the plan.' # type: ignore
-                async with coder_agent.run_stream(execution_prompt, deps=deps, model=coder_model) as result:
+                execution_prompt = f'Task: {initial_prompt}\n\nPlan: {plan_result.output}\n\nPlease execute the plan.' # type: ignore
+                async with coder_agent.run_stream(execution_prompt, deps=deps, model=get_model(coder_model)) as result:
                     async for event in result.stream_responses():
                         # Stream thoughts (messages from model)
                         await websocket.send_json({'type': 'thought', 'content': str(event)})
                     
-                    final_result: str = await result.get_data() # type: ignore
+                    final_result: str = await result.get_output() # type: ignore
                     await websocket.send_json({'type': 'thought', 'content': 'Coder finished. Starting review...'})
 
                     # Review phase
                     diff = await self.git.get_diff()
-                    review = await reviewer_agent.run(f'Please review these changes:\n\n{diff}', model=reviewer_model)
+                    review = await reviewer_agent.run(f'Please review these changes:\n\n{diff}', model=get_model(reviewer_model))
                     
-                    review_data = review.data # type: ignore
+                    review_data = review.output # type: ignore
                     await websocket.send_json({
                         'type': 'review',
                         'content': review_data.comments,
@@ -135,5 +172,6 @@ class AgentSocketController:
         except WebSocketDisconnect:
             await self.docker.stop_sandbox()
         except Exception as e:
+            logger.exception(f"Error in WebSocket session: {str(e)}")
             await websocket.send_json({'type': 'error', 'content': str(e)})
             await websocket.close()
