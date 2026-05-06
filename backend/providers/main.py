@@ -42,7 +42,8 @@ class MainProvider(Provider):
         """
         Provide an instance of DockerSandboxManager.
         """
-        return DockerSandboxManager(repo_path=os.getenv('REPO_PATH', '/tmp/repo'))
+        repo_path: str = os.getenv('REPO_PATH', '/tmp/repo')
+        return DockerSandboxManager(repo_path=repo_path)
 
     @provide
     def get_code_search_service(self) -> CodeSearchService:
@@ -56,18 +57,21 @@ class MainProvider(Provider):
         """
         Provide an instance of FileEditorService.
         """
-        return FileEditorService(root_path=os.getenv('REPO_PATH', '/tmp/repo'))
+        root_path: str = os.getenv('REPO_PATH', '/tmp/repo')
+        return FileEditorService(root_path=root_path)
 
     @provide
     def get_git_manager_service(self) -> GitManagerService:
         """
         Provide an instance of GitManagerService.
         """
-        return GitManagerService(repo_path=os.getenv('REPO_PATH', '/tmp/repo'))
+        repo_path: str = os.getenv('REPO_PATH', '/tmp/repo')
+        return GitManagerService(repo_path=repo_path)
 
     @provide
     def get_indexing_service(self) -> IndexingService:
         """
         Provide an instance of IndexingService.
         """
-        return IndexingService(repo_path=os.getenv('REPO_PATH', '/tmp/repo'))
+        repo_path: str = os.getenv('REPO_PATH', '/tmp/repo')
+        return IndexingService(repo_path=repo_path)

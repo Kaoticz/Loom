@@ -17,12 +17,13 @@ class CodeSearchService:
         :returns: List of CodeEmbedding instances.
         """
         # Format the embedding list as a pgvector string '[v1, v2, ...]'
-        vector_str = '[' + ','.join(map(str, query_embedding)) + ']'
+        vector_str: str = '[' + ','.join(map(str, query_embedding)) + ']'
         
         # Using tortoise-vector's capabilities or raw SQL for distance
-        return await CodeEmbedding.annotate(
+        results: list[CodeEmbedding] = await CodeEmbedding.annotate(
             distance=RawSQL(f"embedding <-> '{vector_str}'")
         ).order_by('distance').limit(limit)
+        return results
 
     async def get_symbol_definition(self, symbol_name: str) -> list[Symbol]:
         """

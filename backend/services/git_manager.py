@@ -9,7 +9,7 @@ class GitManagerService:
     _repo: Repo | None = None
     _repo_path: str
 
-    def __init__(self, repo_path: str):
+    def __init__(self, repo_path: str) -> None:
         self._repo_path = repo_path
 
     @property
@@ -17,7 +17,7 @@ class GitManagerService:
         return self._repo_path
 
     @repo_path.setter
-    def repo_path(self, value: str):
+    def repo_path(self, value: str) -> None:
         if self._repo_path != value:
             self._repo_path = value
             self._repo = None
@@ -51,11 +51,12 @@ class GitManagerService:
 
         :param branch_name: The name of the new branch.
         """
-        def _create():
+        def _create() -> None:
             if branch_name in self.repo.heads:
                 self.repo.heads[branch_name].checkout()
             else:
-                new_branch = self.repo.create_head(branch_name)
+                from git import Head
+                new_branch: Head = self.repo.create_head(branch_name)
                 new_branch.checkout()
         await asyncio.to_thread(_create)
 
@@ -65,7 +66,7 @@ class GitManagerService:
 
         :param message: The commit message.
         """
-        def _commit():
+        def _commit() -> None:
             self.repo.git.add(A=True)
             self.repo.index.commit(message)
         await asyncio.to_thread(_commit)
@@ -76,15 +77,15 @@ class GitManagerService:
 
         :returns: The diff string.
         """
-        def _diff():
-            return self.repo.git.diff('HEAD~1' if len(self.repo.heads) > 1 else None)
+        def _diff() -> str:
+            return str(self.repo.git.diff('HEAD~1' if len(self.repo.heads) > 1 else None))
         return await asyncio.to_thread(_diff)
         
     async def merge_branch(self, branch_name: str) -> None:
         """
         Merge the given branch into main.
         """
-        def _merge():
+        def _merge() -> None:
             self.repo.heads.main.checkout()
             self.repo.git.merge(branch_name)
         await asyncio.to_thread(_merge)

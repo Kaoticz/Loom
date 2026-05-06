@@ -43,14 +43,16 @@ async def search_code(ctx: RunContext[AgentDeps], query: str) -> str:
     # We can use httpx to call the local Ollama instance for embeddings.
     import httpx
     import os
+    from httpx import Response
     
     # We'll need a way to pass the embedding model. For now, we can use an environment variable or a default.
     # Ideally, it should be in ctx.deps.
-    embedding_model = os.getenv('EMBEDDING_MODEL', 'llama3')
-    ollama_url = os.getenv('OLLAMA_BASE_URL', 'http://ollama:11434')
+    embedding_model: str = os.getenv('EMBEDDING_MODEL', 'llama3')
+    ollama_url: str = os.getenv('OLLAMA_BASE_URL', 'http://ollama:11434')
+    embedding: list[float]
     try:
         async with httpx.AsyncClient() as client:
-            resp = await client.post(
+            resp: Response = await client.post(
                 f'{ollama_url}/api/embeddings',
                 json={'model': embedding_model, 'prompt': query}
             )
@@ -58,7 +60,7 @@ async def search_code(ctx: RunContext[AgentDeps], query: str) -> str:
     except Exception:
         embedding = [0.0] * 768
 
-    results = await ctx.deps.search.search_code_semantic(embedding) 
+    results: list[Any] = await ctx.deps.search.search_code_semantic(embedding) 
     return str(results)
 
 @coder_agent.tool
@@ -74,7 +76,7 @@ async def edit_file(ctx: RunContext[AgentDeps], path: str, search: str, replace:
     """
     Edit a file surgically and commit changes.
     """
-    success = await ctx.deps.editor.edit_file(path, search, replace)
+    success: bool = await ctx.deps.editor.edit_file(path, search, replace)
     if success:
         await ctx.deps.git.commit_changes(f'Edit {path}')
         return 'Success'
@@ -96,7 +98,8 @@ async def web_search(ctx: RunContext[AgentDeps], query: str) -> str:
     Search the web for information using SearXNG.
     """
     import httpx
-    searxng_url = os.getenv('SEARXNG_URL', 'http://searxng:8080')
+    from httpx import Response
+    searxng_url: str = os.getenv('SEARXNG_URL', 'http://searxng:8080')
     async with httpx.AsyncClient() as client:
-        response = await client.get(f'{searxng_url}/search', params={'q': query, 'format': 'json'})
+        response: Response = await client.get(f'{searxng_url}/search', params={'q': query, 'format': 'json'})
         return str(response.json())

@@ -11,13 +11,14 @@ async def list_ollama_models() -> List[str]:
     """
     List models available in the local Ollama instance.
     """
-    ollama_url = os.getenv('OLLAMA_BASE_URL', 'http://ollama:11434')
+    ollama_url: str = os.getenv('OLLAMA_BASE_URL', 'http://ollama:11434')
     try:
         async with httpx.AsyncClient() as client:
-            resp = await client.get(f'{ollama_url}/api/tags')
+            resp: httpx.Response = await client.get(f'{ollama_url}/api/tags')
             resp.raise_for_status()
-            data = resp.json()
-            return [model['name'] for model in data.get('models', [])]
+            data: dict[str, Any] = resp.json()
+            models: list[str] = [model['name'] for model in data.get('models', [])]
+            return models
     except Exception as e:
         raise HTTPException(
             status_code=500,
@@ -49,9 +50,9 @@ async def list_directories(path: str = '/') -> List[str]:
         raise HTTPException(status_code=404, detail="Path not found")
     
     try:
-        dirs = []
+        dirs: list[str] = []
         for name in os.listdir(path):
-            full_path = os.path.join(path, name)
+            full_path: str = os.path.join(path, name)
             if os.path.isdir(full_path):
                 dirs.append(name)
         return sorted(dirs)

@@ -1,7 +1,7 @@
 services:
   postgres:
     container_name: loom-postgres
-    image: ankane/pgvector:latest
+    image: pgvector/pgvector:pg18-trixie
     environment:
       POSTGRES_DB: loom
       POSTGRES_USER: loom
@@ -9,7 +9,7 @@ services:
     ports:
       - '5432:5432'
     volumes:
-      - postgres_data:/var/lib/postgresql/data
+      - postgres_data:/var/lib/postgresql
     healthcheck:
       test: ['CMD-SHELL', 'pg_isready -U loom -d loom']
       interval: 5s
@@ -56,10 +56,11 @@ services:
     user: "${UID}:${GID}"
     volumes:
       - ./backend:/app
-      #- /var/run/docker.sock:/var/run/docker.sock  # If you use Docker
-      - ${XDG_RUNTIME_DIR:-/run/user/1000}/podman/podman.sock:/var/run/docker.sock:Z    # If you use Podman
+      # If you use Docker, uncomment this:
+      #- /var/run/docker.sock:/var/run/docker.sock
+      # If you use Podman, uncomment this:
+      - ${XDG_RUNTIME_DIR:-/run/user/1000}/podman/podman.sock:/var/run/docker.sock:Z
       - ./data/repo:/tmp/repo # Bind mount for the target repository
-      #- /home/kotz:/host:rw # Mount host root to /host inside container with read-write access
     environment:
       - DATABASE_URL=postgres://loom:loom_password@postgres:5432/loom
       - OLLAMA_BASE_URL=http://ollama:11434

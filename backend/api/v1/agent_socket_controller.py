@@ -12,6 +12,7 @@ import traceback
 import os
 import uuid
 import asyncio
+from typing import Any
 from pydantic_ai.models.openai import OpenAIChatModel
 from pydantic_ai.providers.openai import OpenAIProvider
 
@@ -34,7 +35,7 @@ class AgentSocketController:
         editor: FileEditorService,
         git: GitManagerService,
         indexing: IndexingService,
-    ):
+    ) -> None:
         self.docker = docker
         self.search = search
         self.editor = editor
@@ -50,7 +51,7 @@ class AgentSocketController:
         """
         await websocket.accept()
         
-        deps = AgentDeps(
+        deps: AgentDeps = AgentDeps(
             docker=self.docker,
             search=self.search,
             editor=self.editor,
@@ -59,13 +60,13 @@ class AgentSocketController:
         
         try:
             # Wait for the first message which should contain the prompt and config
-            data = await websocket.receive_text()
-            message_data = json.loads(data)
-            initial_prompt = message_data.get('prompt', '')
-            coder_model = message_data.get('coder_model', 'ollama:llama3')
-            reviewer_model = message_data.get('reviewer_model', 'ollama:llama3')
-            embedding_model = message_data.get('embedding_model', 'llama3')
-            repo_path = message_data.get('repo_path')
+            data: str = await websocket.receive_text()
+            message_data: dict[str, Any] = json.loads(data)
+            initial_prompt: str = message_data.get('prompt', '')
+            coder_model: str = message_data.get('coder_model', 'ollama:llama3')
+            reviewer_model: str = message_data.get('reviewer_model', 'ollama:llama3')
+            embedding_model: str = message_data.get('embedding_model', 'llama3')
+            repo_path: str | None = message_data.get('repo_path')
 
             if repo_path:
                 os.environ['REPO_PATH'] = repo_path
@@ -81,10 +82,10 @@ class AgentSocketController:
                 await websocket.close()
                 return
             
-            websocket_lock = asyncio.Lock()
-            completed_count = 0
+            websocket_lock: asyncio.Lock = asyncio.Lock()
+            completed_count: int = 0
 
-            async def progress_callback(current, total, message):
+            async def progress_callback(current: int, total: int, message: str) -> None:
                 async with websocket_lock:
                     await websocket.send_json({
                         'type': 'thought',
@@ -105,16 +106,16 @@ class AgentSocketController:
                 })
             
             # Use a unique branch name per session
-            session_id = str(uuid.uuid4())[:8]
-            branch_name = f'ai-task-{session_id}'
+            session_id: str = str(uuid.uuid4())[:8]
+            branch_name: str = f'ai-task-{session_id}'
             await self.git.create_branch(branch_name)
             
             await websocket.send_json({'type': 'thought', 'content': 'Generating plan...'})
             
-            def get_model(model_name: str):
+            def get_model(model_name: str) -> OpenAIChatModel | str:
                 if model_name.startswith('ollama:'):
-                    base_url = os.getenv('OLLAMA_BASE_URL', 'http://ollama:11434')
-                    provider = OpenAIProvider(
+                    base_url: str = os.getenv('OLLAMA_BASE_URL', 'http://ollama:11434')
+                    provider: OpenAIProvider = OpenAIProvider(
                         base_url=f'{base_url}/v1',
                         api_key='ollama'
                     )
@@ -125,8 +126,8 @@ class AgentSocketController:
                 return model_name
 
             # Generate actual plan using the agent
-            plan_prompt = f'Task: {initial_prompt}\n\nPlease generate a step-by-step plan. Do not execute any tools yet.'
-            plan_result = await coder_agent.run(plan_prompt, deps=deps, model=get_model(coder_model))
+            plan_prompt: str = f'Task: {initial_prompt}\n\nPlease generate a step-by-step plan. Do not execute any tools yet.'
+            plan_result: Any = await coder_agent.run(plan_prompt, deps=deps, model=get_model(coder_model))
             
             await websocket.send_json({
                 'type': 'plan',
@@ -135,14 +136,14 @@ class AgentSocketController:
             })
             
             # Wait for approval
-            approval_data = await websocket.receive_text()
+            approval_data: str = await websocket.receive_text()
             if json.loads(approval_data).get('approved'):
                 await websocket.send_json({'type': 'thought', 'content': 'Executing plan...'})
                 
-                from agents.reviewer import reviewer_agent
+                from agents.reviewer import reviewer_agent, ReviewResult
                 
                 # Execute agent run with streaming
-                execution_prompt = f'Task: {initial_prompt}\n\nPlan: {plan_result.output}\n\nPlease execute the plan.' # type: ignore
+                execution_prompt: str = f'Task: {initial_prompt}\n\nPlan: {plan_result.output}\n\nPlease execute the plan.' # type: ignore
                 async with coder_agent.run_stream(execution_prompt, deps=deps, model=get_model(coder_model)) as result:
                     async for event in result.stream_responses():
                         # Stream thoughts (messages from model)
@@ -152,10 +153,10 @@ class AgentSocketController:
                     await websocket.send_json({'type': 'thought', 'content': 'Coder finished. Starting review...'})
 
                     # Review phase
-                    diff = await self.git.get_diff()
-                    review = await reviewer_agent.run(f'Please review these changes:\n\n{diff}', model=get_model(reviewer_model))
+                    diff: str = await self.git.get_diff()
+                    review: Any = await reviewer_agent.run(f'Please review these changes:\n\n{diff}', model=get_model(reviewer_model))
                     
-                    review_data = review.output # type: ignore
+                    review_data: ReviewResult = review.output # type: ignore
                     await websocket.send_json({
                         'type': 'review',
                         'content': review_data.comments,

@@ -2,6 +2,7 @@ import os
 import subprocess
 import json
 import hashlib
+from typing import Any
 from database.models.file import File
 from database.models.symbol import Symbol
 from database.models.code_embedding import CodeEmbedding
@@ -14,43 +15,44 @@ class IndexingService:
     """
     repo_path: str
 
-    def __init__(self, repo_path: str):
+    def __init__(self, repo_path: str) -> None:
         self.repo_path = repo_path
 
-    async def index_repository(self, progress_callback=None) -> None:
+    async def index_repository(self, progress_callback: Any = None) -> None:
         """
         Scan the repository and update 'files', 'symbols', and 'embeddings' tables.
         """
-        abs_repo_path = os.path.abspath(self.repo_path)
-        exclude_dirs = {'.git', 'node_modules', '__pycache__', 'dist', 'build', '.venv', 'venv'}
+        abs_repo_path: str = os.path.abspath(self.repo_path)
+        exclude_dirs: set[str] = {'.git', 'node_modules', '__pycache__', 'dist', 'build', '.venv', 'venv'}
         
-        all_files = []
+        all_files: list[str] = []
         for root, dirs, files in os.walk(abs_repo_path):
             dirs[:] = [d for d in dirs if d not in exclude_dirs]
             for file_name in files:
                 all_files.append(os.path.join(root, file_name))
         
-        total_files = len(all_files)
+        total_files: int = len(all_files)
         if progress_callback:
             await progress_callback(0, total_files, "Starting indexing...")
 
-        semaphore = asyncio.Semaphore(10) # Process 10 files at a time
+        semaphore: asyncio.Semaphore = asyncio.Semaphore(10) # Process 10 files at a time
         
         async with httpx.AsyncClient(timeout=30.0) as client:
-            tasks = []
+            tasks: list[Any] = []
             for idx, file_path in enumerate(all_files):
                 tasks.append(self._process_file(file_path, abs_repo_path, semaphore, client, idx, total_files, progress_callback))
             
             await asyncio.gather(*tasks)
 
-    async def _process_file(self, file_path, abs_repo_path, semaphore, client, idx, total_files, progress_callback):
+    async def _process_file(self, file_path: str, abs_repo_path: str, semaphore: asyncio.Semaphore, client: httpx.AsyncClient, idx: int, total_files: int, progress_callback: Any) -> None:
         async with semaphore:
-            rel_path = os.path.relpath(file_path, abs_repo_path)
+            rel_path: str = os.path.relpath(file_path, abs_repo_path)
             
+            content: str
             try:
                 # Check if it is a binary file first
                 with open(file_path, 'rb') as f:
-                    chunk = f.read(1024)
+                    chunk: bytes = f.read(1024)
                     if b'\x00' in chunk:
                         return # Skip binary files
 
@@ -65,14 +67,16 @@ class IndexingService:
             if not content.strip():
                 return
 
-            file_hash = hashlib.sha256(content.encode()).hexdigest()
+            file_hash: str = hashlib.sha256(content.encode()).hexdigest()
             
+            file_obj: File
+            created: bool
             file_obj, created = await File.get_or_create(
                 file_path=rel_path,
                 defaults={'raw_content': content, 'hash': file_hash}
             )
             
-            needs_indexing = created
+            needs_indexing: bool = created
             if not created and file_obj.hash != file_hash:
                 file_obj.raw_content = content
                 file_obj.hash = file_hash
@@ -94,27 +98,27 @@ class IndexingService:
         """
         Generate chunks and embeddings for a file.
         """
-        content = file_obj.raw_content
-        lines = content.splitlines()
-        chunk_size = 50 # lines per chunk
+        content: str = file_obj.raw_content
+        lines: list[str] = content.splitlines()
+        chunk_size: int = 50 # lines per chunk
         
-        ollama_url = os.getenv('OLLAMA_BASE_URL', 'http://ollama:11434')
-        embedding_model = os.getenv('EMBEDDING_MODEL', 'llama3')
+        ollama_url: str = os.getenv('OLLAMA_BASE_URL', 'http://ollama:11434')
+        embedding_model: str = os.getenv('EMBEDDING_MODEL', 'llama3')
         
         for i in range(0, len(lines), chunk_size):
-            chunk_lines = lines[i:i + chunk_size]
-            chunk_text = '\n'.join(chunk_lines)
+            chunk_lines: list[str] = lines[i:i + chunk_size]
+            chunk_text: str = '\n'.join(chunk_lines)
             
             if not chunk_text.strip():
                 continue
             
             try:
-                resp = await client.post(
+                resp: httpx.Response = await client.post(
                     f'{ollama_url}/api/embeddings',
                     json={'model': embedding_model, 'prompt': chunk_text}
                 )
                 if resp.status_code == 200:
-                    embedding = resp.json().get('embedding')
+                    embedding: list[float] | None = resp.json().get('embedding')
                     
                     if embedding:
                         await CodeEmbedding.create(
@@ -133,16 +137,16 @@ class IndexingService:
         if not file_obj.file_path.endswith('.py'):
             return # Currently only support Python
             
-        rules = [
+        rules: list[dict[str, str]] = [
             {'id': 'function', 'pattern': 'def $NAME($$$): $$$'},
             {'id': 'class', 'pattern': 'class $NAME: $$$'}
         ]
         
-        ast_grep_bin = os.getenv('AST_GREP_BIN', 'ast-grep')
+        ast_grep_bin: str = os.getenv('AST_GREP_BIN', 'ast-grep')
         for rule in rules:
             try:
                 # Use subprocess to run ast-grep
-                result = await asyncio.to_thread(
+                result: subprocess.CompletedProcess[str] = await asyncio.to_thread(
                     lambda: subprocess.run(
                         [ast_grep_bin, 'run', '--pattern', rule['pattern'], '--json'],
                         input=file_obj.raw_content,
@@ -153,7 +157,7 @@ class IndexingService:
                 
                 if result.returncode == 0 and result.stdout:
                     try:
-                        matches = json.loads(result.stdout)
+                        matches: list[Any] = json.loads(result.stdout)
                         for match in matches:
                             await Symbol.create(
                                 file=file_obj,

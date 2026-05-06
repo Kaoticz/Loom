@@ -23,7 +23,7 @@ class DockerSandboxManager:
         return self._repo_path
 
     @repo_path.setter
-    def repo_path(self, value: str):
+    def repo_path(self, value: str) -> None:
         if self._repo_path != value:
             self._repo_path = value
             # We don't necessarily need to reset self._client here as it's the docker client,
@@ -58,10 +58,11 @@ class DockerSandboxManager:
         :param image: The Docker image to use for the sandbox.
         :returns: The created container instance.
         """
-        def _spawn():
+        def _spawn() -> Any:
             # Kill existing container if any
             try:
-                container = self.client.containers.get(self.container_name)
+                from docker.models.containers import Container
+                container: Container = self.client.containers.get(self.container_name)
                 container.remove(force=True)
             except docker.errors.NotFound: # type: ignore
                 pass
@@ -86,10 +87,12 @@ class DockerSandboxManager:
         :param command: The shell command to run.
         :returns: The stdout/stderr output of the command.
         """
-        def _run():
-            container = self.client.containers.get(self.container_name)
-            result = container.exec_run(command)
-            return result.output.decode('utf-8')
+        def _run() -> str:
+            from docker.models.containers import Container
+            container: Container = self.client.containers.get(self.container_name)
+            result: Any = container.exec_run(command)
+            output: str = result.output.decode('utf-8')
+            return output
         
         return await asyncio.to_thread(_run)
 
@@ -97,9 +100,10 @@ class DockerSandboxManager:
         """
         Stop and remove the sandbox container.
         """
-        def _stop():
+        def _stop() -> None:
             try:
-                container = self.client.containers.get(self.container_name)
+                from docker.models.containers import Container
+                container: Container = self.client.containers.get(self.container_name)
                 container.remove(force=True)
             except docker.errors.NotFound: # type: ignore
                 pass

@@ -4,7 +4,8 @@ from fastapi.responses import JSONResponse
 from starlette.exceptions import HTTPException as StarletteHTTPException
 import logging
 import traceback
-from dishka import make_async_container
+from typing import AsyncIterator
+from dishka import make_async_container, AsyncContainer
 from dishka.integrations.fastapi import setup_dishka
 
 # Configure logging
@@ -30,7 +31,7 @@ def create_app() -> FastAPI:
 
     @app.exception_handler(StarletteHTTPException)
     @app.exception_handler(FastAPIHTTPException)
-    async def http_exception_handler(request: Request, exc: StarletteHTTPException | FastAPIHTTPException):
+    async def http_exception_handler(request: Request, exc: StarletteHTTPException | FastAPIHTTPException) -> JSONResponse:
         return JSONResponse(
             status_code=exc.status_code,
             content={
@@ -40,7 +41,7 @@ def create_app() -> FastAPI:
         )
 
     @app.exception_handler(Exception)
-    async def global_exception_handler(request: Request, exc: Exception):
+    async def global_exception_handler(request: Request, exc: Exception) -> JSONResponse:
         logger.exception(f"Unhandled exception: {str(exc)}")
         return JSONResponse(
             status_code=500,
@@ -50,22 +51,23 @@ def create_app() -> FastAPI:
             }
         )
     
-    container = make_async_container(MainProvider())
+    container: AsyncContainer = make_async_container(MainProvider())
     setup_dishka(container, app)
     
     from contextlib import asynccontextmanager
 
     @asynccontextmanager
-    async def lifespan(app: FastAPI):
+    async def lifespan(app: FastAPI) -> AsyncIterator[None]:
         """
         Lifecycle events for the FastAPI application.
         """
         from tortoise import Tortoise
+        from tortoise.backends.base.client import BaseDBAsyncClient
         # Initialize Tortoise
         await Tortoise.init(config=TORTOISE_ORM)
         
         # Ensure pgvector is initialized BEFORE generating schemas
-        connection = Tortoise.get_connection('default')
+        connection: BaseDBAsyncClient = Tortoise.get_connection('default')
         await connection.execute_script('CREATE EXTENSION IF NOT EXISTS vector;')
         
         await Tortoise.generate_schemas()
