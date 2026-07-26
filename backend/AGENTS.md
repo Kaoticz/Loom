@@ -57,11 +57,12 @@ Every function and class must have a docstring written in **reST style**. Includ
 - `:returns:` describing the return value (if any).
 - `:raises <ExceptionType>:` for each exception the function may raise (if any).
 
+**Endpoint functions** (those decorated with `@router.get`, `@router.post`, `@router.put`, `@router.delete`, etc.) must have a docstring with **only the summary line** — omit `:param`, `:returns`, and `:raises`.
+
 ```python
 def create_order(user_id: int, items: list[Item]) -> Order:
     """
     Create a new order for the given user.
-
     :param user_id: The ID of the user placing the order.
     :param items: The list of items to include in the order.
     :returns: The newly created Order instance.
@@ -94,7 +95,7 @@ class CreateUserResponse(BaseModel):
     id: Annotated[int, Field()]
     username: Annotated[str, Field()]
 
-@router.post('/users')
+@router.post('/users', response_model=CreateUserResponse)
 async def create_user(body: CreateUserRequest) -> CreateUserResponse:
     ...
 ```
@@ -182,7 +183,7 @@ from pydantic import BaseModel, Field
 from typing import Annotated, TYPE_CHECKING
 
 if TYPE_CHECKING:
-    from database.enums.user_permission import UserPermission
+    from database.enums import UserPermission
 
 
 class AdminUser(BaseModel):
@@ -190,7 +191,7 @@ class AdminUser(BaseModel):
     permissions: Annotated[UserPermission, Field()]
 
 
-from database.enums.user_permission import UserPermission
+from database.enums import UserPermission
 AdminUser.model_rebuild()
 
 # Bad
@@ -198,7 +199,7 @@ from pydantic import BaseModel, Field
 from typing import Annotated, TYPE_CHECKING
 
 if TYPE_CHECKING:
-    from database.enums.user_permission import UserPermission
+    from database.enums import UserPermission
 
 
 class AdminUser(BaseModel):
@@ -206,16 +207,76 @@ class AdminUser(BaseModel):
     permissions: Annotated['UserPermission', Field()]
 ```
 
+### Prefer PEP 585-compliant over PEP 484-compliant annotations
+
+PEP 484-compliant type annotations are being dropped on Python 3.17, so let's keep the project clear of them for a future smoother transition.
+
+If no alternative is available, import from the `collections.abc` module.
+
+```py
+# Good
+names: list[str] = []
+
+# Acceptable if there is no other alternative
+from collections.abc import Sequence
+
+names: Sequence[str] = []
+
+# Bad
+from typing import List
+
+names: List[str] = []
+```
+
+### Preferred Type References
+
+Prefer direct imports to dotted references for **type annotations** and **object instantiation**. Module-level **function calls** (e.g., `logging.info()`, `os.path.join()`) may keep the dotted form.
+
+```python
+# Good — direct import for type annotation and instantiation
+from asyncio import Lock
+from httpx import AsyncClient, HTTPStatusError
+
+lock: Lock = Lock()
+client: AsyncClient = AsyncClient()
+
+# Good — dotted form is acceptable for module-level function calls
+import logging
+import os.path
+
+logging.info('Starting...')
+path = os.path.join('a', 'b')
+
+# Bad — dotted form used for type annotation or instantiation
+import asyncio
+import httpx
+
+lock: asyncio.Lock = asyncio.Lock()
+client: httpx.AsyncClient = httpx.AsyncClient()
+```
+
+### Null Checking
+
+Prefer `is` and `is not` to check for null, as it is more expressive.
+
+```python
+text: str | None = maybe_get_text()
+
+# Good
+if text is not None:
+    ...
+
+# Bad
+if text:
+    ...
+```
+
 ### Post-Task
 
 Once you're done writing your changes, execute the following command:
 
 ```bash
-mypy .
-```
-
-```bash
-basedpyright .
+mypy . && basedpyright .
 ```
 
 Fix any error returned by the linters, even if they are not related to the task at hand.

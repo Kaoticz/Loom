@@ -62,7 +62,13 @@ def create_app() -> FastAPI:
         Lifecycle events for the FastAPI application.
         """
         from tortoise import Tortoise
+        import tortoise.backends.asyncpg
+        from tortoise_embeddings import VectorAsyncpgDBClient
         from tortoise.backends.base.client import BaseDBAsyncClient
+
+        # Override the client class for the asyncpg backend to support pgvector
+        tortoise.backends.asyncpg.client_class = VectorAsyncpgDBClient
+
         # Initialize Tortoise
         await Tortoise.init(config=TORTOISE_ORM)
         
