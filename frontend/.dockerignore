@@ -1,0 +1,21 @@
+# Installed inside the image instead, so host binaries never leak in
+node_modules/
+
+# Build output
+.svelte-kit/
+build/
+dist/
+
+# Version control and editor state
+.git/
+.gitignore
+.idea/
+.vscode/
+
+# Local environment overrides, which must not be baked into an image
+.env
+.env.*
+
+# Logs and OS noise
+npm-debug.log*
+.DS_Store

@@ -1,14 +1,56 @@
-from tortoise import fields, models
+from datetime import datetime
 from typing import Any
 
-class TaskMemory(models.Model):
-    """
-    Stores agent task logs and tool outputs.
-    """
-    id: Any = fields.IntField(pk=True)
-    task_id: Any = fields.CharField(max_length=255)
-    log_content: Any = fields.TextField()
-    created_at: Any = fields.DatetimeField(auto_now_add=True)
+from database.enums import TaskLogEntryType
+from database.models.task import Task
+from tortoise.fields import (
+    CharEnumField,
+    DatetimeField,
+    Field,
+    ForeignKeyField,
+    ForeignKeyRelation,
+    IntField,
+    JSONField,
+    OnDelete,
+)
+from tortoise.models import Model
 
-    class Meta: # type: ignore
+class TaskMemory(Model):
+    """
+    An append-only record of what happened during a task.
+
+    One row per event rather than one row per task, so recording an action is a
+    single insert instead of rewriting the whole log.
+    """
+    id: Field[int] = IntField(primary_key=True)
+    """
+    The unique identifier for the log entry.
+    """
+
+    task: ForeignKeyRelation[Task] = ForeignKeyField(
+        'models.Task',
+        related_name='log_entries',
+        on_delete=OnDelete.CASCADE
+    )
+    """
+    The task this entry belongs to.
+    """
+
+    entry_type: TaskLogEntryType = CharEnumField(TaskLogEntryType, max_length=32)
+    """
+    What kind of event this entry records.
+    """
+
+    content: Field[dict[str, Any]] = JSONField(default=dict)
+    """
+    The details of the event, shaped according to its type.
+    """
+
+    created_at: Field[datetime] = DatetimeField(auto_now_add=True)
+    """
+    When the entry was recorded.
+    """
+
+    class Meta:  # pyright: ignore[reportIncompatibleVariableOverride]
         table: str = 'task_memory'
+        indexes: list[tuple[str, ...]] = [('task',)]

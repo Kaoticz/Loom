@@ -1,15 +1,16 @@
-from tortoise import fields, models
-from typing import Any
+from datetime import datetime
+from tortoise.fields import CharField, DatetimeField, Field, IntField, TextField
+from tortoise.models import Model
 
-class File(models.Model):
+class File(Model):
     """
     Stores file information from the repository.
     """
-    id: Any = fields.IntField(pk=True)
-    file_path: Any = fields.CharField(max_length=1024, unique=True)
-    raw_content: Any = fields.TextField()
-    hash: Any = fields.CharField(max_length=64)
-    last_indexed: Any = fields.DatetimeField(auto_now=True)
+    id: Field[int] = IntField(primary_key=True)
+    file_path: Field[str] = CharField(max_length=1024, unique=True)
+    raw_content: Field[str] = TextField()
+    hash: Field[str] = CharField(max_length=64)
+    last_indexed: Field[datetime] = DatetimeField(auto_now=True)
 
-    class Meta: # type: ignore
+    class Meta:  # pyright: ignore[reportIncompatibleVariableOverride]
         table: str = 'files'

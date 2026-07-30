@@ -1,0 +1,31 @@
+# Local virtual environment. Several hundred megabytes, and built for the host's
+# architecture and Python version rather than the image's.
+.venv/
+venv/
+
+# Python build and cache artefacts
+__pycache__/
+*.py[cod]
+*.egg-info/
+build/
+dist/
+
+# Tooling caches
+.mypy_cache/
+.pytest_cache/
+.ruff_cache/
+.coverage
+htmlcov/
+
+# Version control and editor state
+.git/
+.gitignore
+.idea/
+.vscode/
+
+# Local environment overrides, which must not be baked into an image
+.env
+.env.*
+
+# NOTE: database/migrations/ must NOT be excluded. The schema is created by
+# migrations at startup, and an image without them refuses to boot.

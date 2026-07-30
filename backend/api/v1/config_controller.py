@@ -1,20 +1,20 @@
 from fastapi import APIRouter, HTTPException
-from typing import List, Dict, Any
-import httpx
+from typing import Any
+from httpx import AsyncClient, Response
+from git import Repo, InvalidGitRepositoryError
 import os
-import git
 
-router = APIRouter()
+router: APIRouter = APIRouter()
 
 @router.get('/ollama/models')
-async def list_ollama_models() -> List[str]:
+async def list_ollama_models() -> list[str]:
     """
     List models available in the local Ollama instance.
     """
     ollama_url: str = os.getenv('OLLAMA_BASE_URL', 'http://ollama:11434')
     try:
-        async with httpx.AsyncClient() as client:
-            resp: httpx.Response = await client.get(f'{ollama_url}/api/tags')
+        async with AsyncClient() as client:
+            resp: Response = await client.get(f'{ollama_url}/api/tags')
             resp.raise_for_status()
             data: dict[str, Any] = resp.json()
             models: list[str] = [model['name'] for model in data.get('models', [])]
@@ -22,33 +22,33 @@ async def list_ollama_models() -> List[str]:
     except Exception as e:
         raise HTTPException(
             status_code=500,
-            detail=f"Error fetching Ollama models: {str(e)}"
+            detail=f'Error fetching Ollama models: {str(e)}'
         )
 
 @router.get('/repos/validate')
-async def validate_repo(path: str) -> Dict[str, Any]:
+async def validate_repo(path: str) -> dict[str, Any]:
     """
     Validate if the given path is a valid git repository.
     """
     if not os.path.exists(path):
-        raise HTTPException(status_code=400, detail="Path does not exist")
-    
+        raise HTTPException(status_code=400, detail='Path does not exist')
+
     try:
-        git.Repo(path)
+        Repo(path)
         return {'valid': True}
-    except git.InvalidGitRepositoryError:
-        raise HTTPException(status_code=400, detail="Not a valid git repository")
+    except InvalidGitRepositoryError:
+        raise HTTPException(status_code=400, detail='Not a valid git repository')
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
 
 @router.get('/repos/list')
-async def list_directories(path: str = '/') -> List[str]:
+async def list_directories(path: str = '/') -> list[str]:
     """
     List subdirectories of a given path.
     """
     if not os.path.exists(path):
-        raise HTTPException(status_code=404, detail="Path not found")
-    
+        raise HTTPException(status_code=404, detail='Path not found')
+
     try:
         dirs: list[str] = []
         for name in os.listdir(path):

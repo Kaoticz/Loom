@@ -8,13 +8,20 @@ from services.code_search import CodeSearchService
 from services.file_editor import FileEditorService
 from services.git_manager import GitManagerService
 from services.indexing import IndexingService
+from collections.abc import AsyncIterator
+from services.embedding import EmbeddingService, DEFAULT_EMBEDDING_MODEL
+from services.session_registry import SessionRegistry
 import os
 
 class MainProvider(Provider):
     """
     Main dependency provider for Dishka.
     """
-    scope: Any = Scope.APP
+    # REQUEST scope gives every WebSocket connection its own service instances.
+    # These services carry per-session state (repository path, sandbox container,
+    # embedding model), so sharing them across sessions lets one session
+    # repoint another mid-run.
+    scope: Any = Scope.SESSION
 
     @provide
     def get_task_controller(self) -> TaskController:
@@ -31,11 +38,13 @@ class MainProvider(Provider):
         editor: FileEditorService,
         git: GitManagerService,
         indexing: IndexingService,
+        embedding: EmbeddingService,
+        registry: SessionRegistry,
     ) -> AgentSocketController:
         """
         Provide an instance of AgentSocketController with injected services.
         """
-        return AgentSocketController(docker, search, editor, git, indexing)
+        return AgentSocketController(docker, search, editor, git, indexing, embedding, registry)
 
     @provide
     def get_docker_sandbox_manager(self) -> DockerSandboxManager:
@@ -43,7 +52,10 @@ class MainProvider(Provider):
         Provide an instance of DockerSandboxManager.
         """
         repo_path: str = os.getenv('REPO_PATH', '/tmp/repo')
-        return DockerSandboxManager(repo_path=repo_path)
+        # The path the container runtime's host uses for the same directory.
+        # Empty when Loom runs outside a container and the two agree.
+        host_repo_root: str = os.getenv('HOST_REPO_PATH', '')
+        return DockerSandboxManager(repo_path=repo_path, host_repo_root=host_repo_root)
 
     @provide
     def get_code_search_service(self) -> CodeSearchService:
@@ -68,10 +80,39 @@ class MainProvider(Provider):
         repo_path: str = os.getenv('REPO_PATH', '/tmp/repo')
         return GitManagerService(repo_path=repo_path)
 
+    @provide(scope=Scope.APP)
+    def get_session_registry(self) -> SessionRegistry:
+        """
+        Provide the process-wide registry of the active session.
+
+        Deliberately application scoped: a registry created per connection could
+        never see the session held by another connection.
+        """
+        return SessionRegistry()
+
     @provide
-    def get_indexing_service(self) -> IndexingService:
+    async def get_embedding_service(self) -> AsyncIterator[EmbeddingService]:
+        """
+        Provide an instance of EmbeddingService, closed when the session ends.
+
+        The service owns an HTTP connection pool. Now that one is created per
+        session rather than per process, leaving it open would leak sockets for
+        every connection the user makes.
+        """
+        ollama_url: str = os.getenv('OLLAMA_BASE_URL', 'http://ollama:11434')
+        embedding_model: str = os.getenv('EMBEDDING_MODEL', DEFAULT_EMBEDDING_MODEL)
+        service: EmbeddingService = EmbeddingService(
+            ollama_url=ollama_url, embedding_model=embedding_model
+        )
+        try:
+            yield service
+        finally:
+            await service.aclose()
+
+    @provide
+    def get_indexing_service(self, embedding: EmbeddingService) -> IndexingService:
         """
         Provide an instance of IndexingService.
         """
         repo_path: str = os.getenv('REPO_PATH', '/tmp/repo')
-        return IndexingService(repo_path=repo_path)
+        return IndexingService(repo_path=repo_path, embedding=embedding)

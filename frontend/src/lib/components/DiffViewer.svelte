@@ -83,6 +83,12 @@
         {/if}
     </div>
 
+    {#if $agentStore.selectedFile && $agentStore.fileDiffs[$agentStore.selectedFile]?.truncated}
+        <div class="px-4 py-2 text-xs bg-amber-50 dark:bg-amber-900/20 text-amber-800 dark:text-amber-300 border-b border-amber-200 dark:border-amber-800">
+            This file is too large to show in full. The diff below is truncated.
+        </div>
+    {/if}
+
     <!-- Editor -->
     <div bind:this={editorContainer} class="flex-1"></div>
 </div>

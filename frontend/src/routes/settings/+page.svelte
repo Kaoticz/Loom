@@ -1,8 +1,11 @@
 <script lang="ts">
     import { onMount } from 'svelte';
     import { agentStore } from '$lib/stores/agent';
+    import type { Theme } from '$lib/stores/agent';
     import { goto } from '$app/navigation';
     import DirectoryPicker from '$lib/components/DirectoryPicker.svelte';
+
+    const THEMES: Theme[] = ['light', 'dark', 'system'];
 
     let availableModels: string[] = [];
     let showPicker = false;
@@ -52,7 +55,7 @@
         config.secrets = config.secrets.filter((_, i) => i !== index);
     }
 
-    function updateThemeInstant(t: 'light' | 'dark' | 'system') {
+    function updateThemeInstant(t: Theme) {
         config.theme = t;
         agentStore.updateConfig({ theme: t });
     }
@@ -76,8 +79,9 @@
                 <h2 class="text-xl font-semibold mb-4 text-gray-900 dark:text-white">AI Models</h2>
                 <div class="grid grid-cols-1 gap-4 sm:grid-cols-2">
                     <div>
-                        <label class="block text-sm font-medium text-gray-700 dark:text-gray-300 mb-1">Coder Model</label>
+                        <label for="coderModel" class="block text-sm font-medium text-gray-700 dark:text-gray-300 mb-1">Coder Model</label>
                         <select 
+                            id="coderModel"
                             bind:value={config.coderModel}
                             disabled={availableModels.length === 0}
                             class="w-full p-2 border border-gray-300 dark:border-gray-600 rounded bg-white dark:bg-gray-700 text-gray-900 dark:text-white"
@@ -92,8 +96,9 @@
                         </select>
                     </div>
                     <div>
-                        <label class="block text-sm font-medium text-gray-700 dark:text-gray-300 mb-1">Reviewer Model</label>
+                        <label for="reviewerModel" class="block text-sm font-medium text-gray-700 dark:text-gray-300 mb-1">Reviewer Model</label>
                         <select 
+                            id="reviewerModel"
                             bind:value={config.reviewerModel}
                             disabled={availableModels.length === 0}
                             class="w-full p-2 border border-gray-300 dark:border-gray-600 rounded bg-white dark:bg-gray-700 text-gray-900 dark:text-white"
@@ -108,8 +113,13 @@
                         </select>
                     </div>
                     <div>
-                        <label class="block text-sm font-medium text-gray-700 dark:text-gray-300 mb-1">Embedding Model</label>
+                        <label for="embeddingModel" class="block text-sm font-medium text-gray-700 dark:text-gray-300 mb-1">Embedding Model</label>
+                        <p class="text-xs text-gray-500 dark:text-gray-400 mb-1">
+                            Must be an embedding-capable model (e.g. <code>nomic-embed-text</code>, <code>mxbai-embed-large</code>).
+                            Chat models such as <code>llama3</code> will not produce usable embeddings.
+                        </p>
                         <select 
+                            id="embeddingModel"
                             bind:value={config.embeddingModel}
                             disabled={availableModels.length === 0}
                             class="w-full p-2 border border-gray-300 dark:border-gray-600 rounded bg-white dark:bg-gray-700 text-gray-900 dark:text-white"
@@ -130,9 +140,10 @@
             <section class="bg-white dark:bg-gray-800 shadow rounded-lg p-6">
                 <h2 class="text-xl font-semibold mb-4 text-gray-900 dark:text-white">Project Repository</h2>
                 <div>
-                    <label class="block text-sm font-medium text-gray-700 dark:text-gray-300 mb-1">Repository Path</label>
+                    <label for="repoPath" class="block text-sm font-medium text-gray-700 dark:text-gray-300 mb-1">Repository Path</label>
                     <div class="flex gap-2">
                         <input 
+                            id="repoPath"
                             type="text" 
                             bind:value={config.repoPath}
                             on:blur={validateRepo}
@@ -161,16 +172,17 @@
                 <h2 class="text-xl font-semibold mb-4 text-gray-900 dark:text-white">Environment</h2>
                 
                 <div class="mb-6">
-                    <label class="block text-sm font-medium text-gray-700 dark:text-gray-300 mb-1">Dockerfile</label>
+                    <label for="dockerfile" class="block text-sm font-medium text-gray-700 dark:text-gray-300 mb-1">Dockerfile</label>
                     <textarea
+                        id="dockerfile"
                         bind:value={config.dockerfile}
                         class="w-full h-32 p-2 font-mono text-sm border border-gray-300 dark:border-gray-600 rounded bg-white dark:bg-gray-700 text-gray-900 dark:text-white"
                     ></textarea>
                 </div>
 
-                <div>
+                <div role="group" aria-labelledby="secrets-heading">
                     <div class="flex justify-between items-center mb-2">
-                        <label class="block text-sm font-medium text-gray-700 dark:text-gray-300">Secrets / Env Vars</label>
+                        <span id="secrets-heading" class="block text-sm font-medium text-gray-700 dark:text-gray-300">Secrets / Env Vars</span>
                         <button
                             on:click={addSecret}
                             class="text-sm bg-blue-600 text-white px-2 py-1 rounded hover:bg-blue-700"
@@ -185,16 +197,19 @@
                                     type="text"
                                     bind:value={secret.key}
                                     placeholder="KEY"
+                                    aria-label="Secret {i + 1} name"
                                     class="flex-1 p-2 border border-gray-300 dark:border-gray-600 rounded bg-white dark:bg-gray-700 text-gray-900 dark:text-white"
                                 />
                                 <input
                                     type="password"
                                     bind:value={secret.value}
                                     placeholder="VALUE"
+                                    aria-label="Secret {i + 1} value"
                                     class="flex-1 p-2 border border-gray-300 dark:border-gray-600 rounded bg-white dark:bg-gray-700 text-gray-900 dark:text-white"
                                 />
                                 <button
                                     on:click={() => removeSecret(i)}
+                                    aria-label="Remove secret {i + 1}"
                                     class="text-red-500 hover:text-red-700 px-2"
                                 >
                                     &times;
@@ -209,7 +224,7 @@
             <section class="bg-white dark:bg-gray-800 shadow rounded-lg p-6">
                 <h2 class="text-xl font-semibold mb-4 text-gray-900 dark:text-white">Appearance</h2>
                 <div class="flex gap-4">
-                    {#each ['light', 'dark', 'system'] as t}
+                    {#each THEMES as t}
                         <button
                             on:click={() => updateThemeInstant(t)}
                             class="flex-1 py-2 px-4 rounded border {config.theme === t ? 'bg-blue-600 text-white border-blue-600' : 'bg-white dark:bg-gray-700 text-gray-700 dark:text-gray-300 border-gray-300 dark:border-gray-600'}"

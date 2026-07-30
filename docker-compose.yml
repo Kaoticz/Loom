@@ -47,36 +47,73 @@ services:
       - ./data/searxng:/etc/searxng:Z
     environment:
       - SEARXNG_BASE_URL=http://localhost:8080/
+    healthcheck:
+      test: ['CMD-SHELL', 'wget -q --spider http://localhost:8080/healthz || exit 1']
+      interval: 5s
+      timeout: 5s
+      retries: 5
+      start_period: 10s
 
   backend:
     container_name: loom-backend
     build:
       context: ./backend
       dockerfile: Dockerfile
-    user: "${UID}:${GID}"
+      args:
+        # Must match the group that owns the socket on the host:
+        #   stat -c '%g' /var/run/docker.sock
+        DOCKER_GID: ${DOCKER_GID:-999}
+    # Defaults keep the service usable when UID and GID are not exported; without
+    # them the substitution yields an empty string and the container fails to start.
+    user: "${UID:-1000}:${GID:-1000}"
     volumes:
       - ./backend:/app
-      # If you use Docker, uncomment this:
-      #- /var/run/docker.sock:/var/run/docker.sock
-      # If you use Podman, uncomment this:
-      - ${XDG_RUNTIME_DIR:-/run/user/1000}/podman/podman.sock:/var/run/docker.sock:Z
+      # The container runtime socket, used to spawn sandbox containers. Docker's
+      # path is the default. For rootless Podman, set CONTAINER_SOCKET in .env:
+      #   CONTAINER_SOCKET=/run/user/1000/podman/podman.sock
+      # SELinux hosts additionally need the :Z relabel, which cannot be expressed
+      # in a variable; use docker-compose.podman.yml for that case.
+      - ${CONTAINER_SOCKET:-/var/run/docker.sock}:/var/run/docker.sock
       - ./data/repo:/tmp/repo # Bind mount for the target repository
+    # The same file a direct run reads. Optional, so a fresh clone works without
+    # one. Anything under `environment` below wins over it, which is what keeps
+    # the container pointed at the service names rather than a developer's
+    # localhost values.
+    env_file:
+      - path: ./backend/.env
+        required: false
     environment:
+      # Bind mount sources are resolved by the container runtime on the host, so
+      # the sandbox needs the host's path for the repository, not this
+      # container's. Must be absolute: a relative path is silently treated as a
+      # named volume and the sandbox would start with an empty tree.
+      - HOST_REPO_PATH=${HOST_REPO_PATH:-${PWD}/data/repo}
       - DATABASE_URL=postgres://loom:loom_password@postgres:5432/loom
       - OLLAMA_BASE_URL=http://ollama:11434
       - SEARXNG_URL=http://searxng:8080
     ports:
       - '8000:8000'
+    healthcheck:
+      # The endpoint queries the database, so a passing check means the service
+      # can actually answer requests, not merely that the port is open.
+      test: ['CMD-SHELL', 'curl -fsS http://localhost:8000/api/v1/health || exit 1']
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 30s
     depends_on:
       postgres:
         condition: service_healthy
       ollama:
         condition: service_healthy
       searxng:
-        condition: service_started
+        condition: service_healthy
 
   frontend:
     container_name: loom-frontend
+    env_file:
+      - path: ./frontend/.env
+        required: false
     build:
       context: ./frontend
       dockerfile: Dockerfile
@@ -86,9 +123,14 @@ services:
     ports:
       - '5173:5173'
     environment:
-      - VITE_API_BASE_URL=http://localhost:8000
+      - VITE_API_BASE_URL=${VITE_API_BASE_URL:-http://localhost:8000}
+      # Set explicitly: the frontend falls back to a hardcoded address otherwise,
+      # so changing the published backend port would break the WebSocket while
+      # leaving REST working.
+      - VITE_WS_URL=${VITE_WS_URL:-ws://localhost:8000/api/v1/agent-session}
     depends_on:
-      - backend
+      backend:
+        condition: service_healthy
 
 volumes:
   postgres_data:

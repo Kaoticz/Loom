@@ -1,0 +1,17 @@
+# Overrides for rootless Podman on an SELinux host, where the runtime socket
+# needs the :Z relabel that cannot be expressed through a variable.
+#
+#   docker compose -f docker-compose.yml -f docker-compose.podman.yml up
+#
+# Without SELinux, no override file is needed: set CONTAINER_SOCKET in .env to
+# the Podman socket path instead.
+#
+# The full volume list is restated deliberately. Compose merges service volumes
+# by target path, but spelling them all out means the result does not depend on
+# that behaviour.
+services:
+  backend:
+    volumes:
+      - ./backend:/app
+      - ${XDG_RUNTIME_DIR:-/run/user/1000}/podman/podman.sock:/var/run/docker.sock:Z
+      - ./data/repo:/tmp/repo
