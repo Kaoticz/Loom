@@ -1,17 +1,27 @@
-# Overrides for rootless Podman on an SELinux host, where the runtime socket
-# needs the :Z relabel that cannot be expressed through a variable.
+# Overrides for rootless Podman.
 #
+# Rootless Podman maps the host user to UID 0 inside the container via its
+# user namespace. Any other UID falls into the subordinate ID range (e.g.
+# 100000+) and cannot write to bind-mounted files owned by the host user.
+# Overriding `user: "0:0"` makes the container process run as the host user,
+# fixing EACCES errors on bind mounts (e.g. SvelteKit creating `.svelte-kit`).
+#
+# Usage:
 #   docker compose -f docker-compose.yml -f docker-compose.podman.yml up
 #
-# Without SELinux, no override file is needed: set CONTAINER_SOCKET in .env to
-# the Podman socket path instead.
+# CAUTION: This override is intended for Podman only. Using it with Docker
+# runs the container as root, which is not a best practice.
 #
-# The full volume list is restated deliberately. Compose merges service volumes
-# by target path, but spelling them all out means the result does not depend on
-# that behaviour.
+# Backend volumes are restated here because the socket path and SELinux :Z flag
+# differ from the main compose file. Frontend only overrides user (volumes are
+# identical to the main file).
 services:
   backend:
+    user: "0:0"
     volumes:
       - ./backend:/app
       - ${XDG_RUNTIME_DIR:-/run/user/1000}/podman/podman.sock:/var/run/docker.sock:Z
       - ./data/repo:/tmp/repo
+
+  frontend:
+    user: "0:0"

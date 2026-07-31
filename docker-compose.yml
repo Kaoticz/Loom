@@ -18,6 +18,8 @@ services:
 
   ollama:
     container_name: loom-ollama
+    environment:
+      - OLLAMA_CONTEXT_LENGTH=131072 # Default: 8192 - Maximum amount of tokens models can use for their context window
     image: ollama/ollama:latest
     volumes:
       - ollama_data:/root/.ollama
