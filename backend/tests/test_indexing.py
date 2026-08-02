@@ -7,10 +7,12 @@ from unittest.mock import MagicMock
 
 import pytest
 
+from database.models.code_embedding import CodeEmbedding
 from database.models.embedding_model import EmbeddingModel
 from database.models.file import File
 from database.models.symbol import Symbol
-from services.indexing import IndexingService
+from services.embedding import ChunkTooLargeForModel, EmbeddingError, EmbeddingInputTooLong
+from services.indexing import IndexingService, clamp_chunk_lines
 from tests.conftest import ast_grep_available, stub_embedding_service
 
 SAMPLE_SOURCE: str = '''import os
@@ -508,3 +510,298 @@ async def test_unlimited_size_indexes_everything(
     )
 
     assert await File.all().count() == 1
+
+
+class LengthLimitedEmbedding:
+    """
+    An embedding service that refuses anything over a character budget.
+
+    Stands in for a model whose tokenizer makes a chunk too long. The budget is
+    in characters only because the test needs something measurable; the point is
+    that the indexer discovers the limit by being refused, not by predicting it.
+    """
+
+    budget: int
+    dimensions: int
+    accepted: list[str]
+    refused: list[str]
+    embedding_model: str
+
+    def __init__(self, budget: int, dimensions: int = 3) -> None:
+        """
+        Create a service that accepts text up to a budget.
+
+        :param budget: The longest text this service will embed.
+        :param dimensions: The width of the vectors it returns.
+        """
+        self.budget = budget
+        self.dimensions = dimensions
+        self.accepted = []
+        self.refused = []
+        self.embedding_model = 'nomic-embed-text'
+
+    async def embed(self, text: str) -> list[float]:
+        """
+        Embed the text, or refuse it as too long.
+
+        :param text: The text to embed.
+        :returns: A vector of the configured width.
+        :raises EmbeddingInputTooLong: If the text exceeds the budget.
+        """
+        if len(text) > self.budget:
+            self.refused.append(text)
+            raise EmbeddingInputTooLong('the input length exceeds the context length')
+        self.accepted.append(text)
+        return [0.1] * self.dimensions
+
+    async def detect_dimensions(self) -> int:
+        """
+        Report the width of this service's vectors.
+
+        :returns: The configured width.
+        """
+        return self.dimensions
+
+
+def without_vector_storage(monkeypatch: pytest.MonkeyPatch) -> None:
+    """
+    Let the embedding loop run without a vector store behind it.
+
+    `CodeEmbedding` is absent from the SQLite fixture because its column needs
+    pgvector. These tests are about which text reaches the model, so storage is
+    stubbed out rather than the tests being confined to a Postgres run.
+
+    :param monkeypatch: Fixture used to replace the create call.
+    """
+
+    async def stored(**kwargs: Any) -> None:
+        return None
+
+    class Discardable:
+        """A query that can be awaited away without a vector column behind it."""
+
+        async def delete(self) -> None:
+            """Discard the matching rows."""
+
+    monkeypatch.setattr(CodeEmbedding, 'create', stored)
+    monkeypatch.setattr(CodeEmbedding, 'filter', lambda **kwargs: Discardable())
+
+
+@pytest.mark.usefixtures('sqlite_db')
+async def test_an_over_long_chunk_is_split_and_retried(repo: str, monkeypatch: pytest.MonkeyPatch) -> None:
+    """
+    A refused chunk is divided until the model accepts it.
+
+    No estimate made on this side can be reliable, because how many tokens a
+    chunk costs depends on the model's tokenizer. Being refused is the only
+    trustworthy signal, so it is treated as one.
+    """
+    without_vector_storage(monkeypatch)
+    embedding: LengthLimitedEmbedding = LengthLimitedEmbedding(budget=40)
+    model: EmbeddingModel = await EmbeddingModel.create(
+        model_name='nomic-embed-text', dimensions=3
+    )
+    service: IndexingService = IndexingService(repo_path=repo, embedding=embedding)  # type: ignore[arg-type]
+    content: str = '\n'.join(f'line number {index} of the file' for index in range(12))
+    file_obj: File = await File.create(file_path='a.py', raw_content=content, hash='h')
+
+    await service._index_embeddings(file_obj, model)
+
+    assert embedding.refused, 'the first attempt should have been refused'
+    assert embedding.accepted, 'the split chunks should have been accepted'
+    assert all(len(text) <= 40 for text in embedding.accepted)
+
+
+@pytest.mark.usefixtures('sqlite_db')
+async def test_splitting_covers_the_whole_file(repo: str, monkeypatch: pytest.MonkeyPatch) -> None:
+    """
+    Dividing a chunk must not lose the lines it contained.
+    """
+    without_vector_storage(monkeypatch)
+    embedding: LengthLimitedEmbedding = LengthLimitedEmbedding(budget=40)
+    model: EmbeddingModel = await EmbeddingModel.create(
+        model_name='nomic-embed-text', dimensions=3
+    )
+    service: IndexingService = IndexingService(repo_path=repo, embedding=embedding)  # type: ignore[arg-type]
+    lines: list[str] = [f'line number {index} of the file' for index in range(12)]
+    file_obj: File = await File.create(
+        file_path='a.py', raw_content='\n'.join(lines), hash='h'
+    )
+
+    await service._index_embeddings(file_obj, model)
+
+    embedded: str = '\n'.join(embedding.accepted)
+    for line in lines:
+        assert line in embedded, f'{line!r} was lost when the chunk was split'
+
+
+@pytest.mark.usefixtures('sqlite_db')
+async def test_a_single_unacceptable_line_is_skipped_not_fatal(repo: str, monkeypatch: pytest.MonkeyPatch) -> None:
+    """
+    One pathological line must not cost the repository its index.
+
+    A minified file can hold a single line longer than any context. Losing that
+    line's semantic search is a far smaller loss than losing every file's.
+    """
+    without_vector_storage(monkeypatch)
+    embedding: LengthLimitedEmbedding = LengthLimitedEmbedding(budget=30)
+    model: EmbeddingModel = await EmbeddingModel.create(
+        model_name='nomic-embed-text', dimensions=3
+    )
+    service: IndexingService = IndexingService(repo_path=repo, embedding=embedding)  # type: ignore[arg-type]
+    content: str = 'short line\n' + 'x' * 500 + '\nanother short line'
+    file_obj: File = await File.create(file_path='a.py', raw_content=content, hash='h')
+
+    await service._index_embeddings(file_obj, model)
+
+    # The short lines are indexed; the impossible one is not.
+    assert 'short line' in '\n'.join(embedding.accepted)
+    assert 'another short line' in '\n'.join(embedding.accepted)
+    assert not any(len(text) > 30 for text in embedding.accepted)
+
+
+@pytest.mark.usefixtures('sqlite_db')
+async def test_an_unreachable_service_still_fails_the_run(repo: str) -> None:
+    """
+    Skipping is for text a model will not take, not for a broken backend.
+
+    Swallowing this would leave a silently empty index and a run that looked
+    successful.
+    """
+
+    class Unreachable:
+        embedding_model: str = 'nomic-embed-text'
+
+        async def embed(self, text: str) -> list[float]:
+            raise EmbeddingError('Could not reach Ollama')
+
+    model: EmbeddingModel = await EmbeddingModel.create(
+        model_name='nomic-embed-text', dimensions=3
+    )
+    service: IndexingService = IndexingService(repo_path=repo, embedding=Unreachable())  # type: ignore[arg-type]
+    file_obj: File = await File.create(file_path='a.py', raw_content='print(1)\n', hash='h')
+
+    with pytest.raises(EmbeddingError):
+        await service._index_embeddings(file_obj, model)
+
+
+def test_automatic_sizing_is_the_default() -> None:
+    """
+    Nobody who has not asked for a chunk size should have one imposed.
+    """
+    service: IndexingService = IndexingService(repo_path='/tmp', embedding=MagicMock())
+
+    assert service.chunk_lines is None
+
+
+@pytest.mark.parametrize(
+    'requested,expected',
+    [(None, None), (0, None), (-5, None), (1, 10), (10, 10), (150, 150), (5000, 1000)],
+    ids=['auto', 'zero', 'negative', 'below minimum', 'minimum', 'ordinary', 'above maximum'],
+)
+def test_a_hand_set_chunk_size_is_held_within_bounds(
+    requested: int | None, expected: int | None
+) -> None:
+    """
+    The value arrives from the client, so it is not taken on trust.
+
+    Below the minimum a chunk holds too little to mean anything; above the
+    maximum no model will take it.
+    """
+    assert clamp_chunk_lines(requested) == expected
+
+
+@pytest.mark.usefixtures('sqlite_db')
+async def test_a_hand_set_size_that_the_model_refuses_fails_the_run(
+    repo: str, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """
+    A chosen chunk size is a decision, not a suggestion.
+
+    Splitting anyway would leave the setting appearing to work while doing
+    nothing, and skipping the chunk would leave a silently incomplete index that
+    answers "no matches" for code that plainly exists.
+    """
+    without_vector_storage(monkeypatch)
+    embedding: LengthLimitedEmbedding = LengthLimitedEmbedding(budget=40)
+    model: EmbeddingModel = await EmbeddingModel.create(
+        model_name='nomic-embed-text', dimensions=3
+    )
+    service: IndexingService = IndexingService(
+        repo_path=repo, embedding=embedding, chunk_lines=50  # type: ignore[arg-type]
+    )
+    content: str = '\n'.join(f'line number {index} of the file' for index in range(12))
+    file_obj: File = await File.create(file_path='big.py', raw_content=content, hash='h')
+
+    with pytest.raises(ChunkTooLargeForModel) as raised:
+        await service._index_embeddings(file_obj, model)
+
+    # The message has to name what to change and where.
+    assert 'big.py' in str(raised.value)
+    assert '50 lines' in str(raised.value)
+    assert 'nomic-embed-text' in str(raised.value)
+    assert 'Settings' in str(raised.value)
+
+
+@pytest.mark.usefixtures('sqlite_db')
+async def test_automatic_sizing_still_recovers(repo: str, monkeypatch: pytest.MonkeyPatch) -> None:
+    """
+    The failure is for a chosen size only; automatic sizing carries on splitting.
+    """
+    without_vector_storage(monkeypatch)
+    embedding: LengthLimitedEmbedding = LengthLimitedEmbedding(budget=40)
+    model: EmbeddingModel = await EmbeddingModel.create(
+        model_name='nomic-embed-text', dimensions=3
+    )
+    service: IndexingService = IndexingService(repo_path=repo, embedding=embedding)  # type: ignore[arg-type]
+    content: str = '\n'.join(f'line number {index} of the file' for index in range(12))
+    file_obj: File = await File.create(file_path='a.py', raw_content=content, hash='h')
+
+    await service._index_embeddings(file_obj, model)
+
+    assert embedding.accepted
+
+
+@pytest.mark.usefixtures('sqlite_db')
+async def test_changing_the_chunk_size_discards_the_old_embeddings(
+    repo: str, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """
+    Otherwise the setting would appear to do nothing on an existing index.
+
+    Files are skipped when their hash is unchanged, so without clearing both the
+    vectors and the hashes, every already-indexed file would keep its old
+    chunking and the new value would only affect files that happened to change.
+    """
+    without_vector_storage(monkeypatch)
+    service: IndexingService = IndexingService(
+        repo_path=repo, embedding=stub_embedding_service([0.1, 0.2, 0.3]), chunk_lines=100
+    )
+    first: EmbeddingModel = await service.resolve_embedding_model()
+    assert first.chunk_lines == 100
+    await File.create(file_path='a.py', raw_content='print(1)\n', hash='unchanged')
+
+    service.chunk_lines = 60
+    second: EmbeddingModel = await service.resolve_embedding_model()
+
+    assert second.id == first.id
+    assert second.chunk_lines == 60
+    stale: File | None = await File.get_or_none(file_path='a.py')
+    assert stale is not None and stale.hash == '', 'the file should be indexed again'
+
+
+@pytest.mark.usefixtures('sqlite_db')
+async def test_an_unchanged_chunk_size_keeps_the_index(repo: str) -> None:
+    """
+    Re-indexing with the same settings must not throw the work away.
+    """
+    service: IndexingService = IndexingService(
+        repo_path=repo, embedding=stub_embedding_service([0.1, 0.2, 0.3]), chunk_lines=100
+    )
+    await service.resolve_embedding_model()
+    await File.create(file_path='a.py', raw_content='print(1)\n', hash='unchanged')
+
+    await service.resolve_embedding_model()
+
+    kept: File | None = await File.get_or_none(file_path='a.py')
+    assert kept is not None and kept.hash == 'unchanged'

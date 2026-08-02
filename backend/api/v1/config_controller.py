@@ -4,6 +4,8 @@ from httpx import AsyncClient, Response
 from git import Repo, InvalidGitRepositoryError
 import os
 
+from services.embedding import EmbeddingService, ModelDescription
+
 router: APIRouter = APIRouter()
 
 @router.get('/ollama/models')
@@ -24,6 +26,29 @@ async def list_ollama_models() -> list[str]:
             status_code=500,
             detail=f'Error fetching Ollama models: {str(e)}'
         )
+
+@router.get('/ollama/models/{name:path}/description')
+async def describe_ollama_model(name: str) -> dict[str, int | None]:
+    """
+    Report what an embedding model says about itself.
+
+    Answers the two questions a person choosing a model actually has: how wide
+    are its vectors, and how much text will it take. Both come from the model's
+    metadata rather than from using it, so selecting a model in the interface
+    does not load it.
+
+    Either value may be null, because a model need not describe itself and
+    neither answer is required for indexing to work.
+    """
+    ollama_url: str = os.getenv('OLLAMA_BASE_URL', 'http://ollama:11434')
+    service: EmbeddingService = EmbeddingService(ollama_url, embedding_model=name)
+    try:
+        described: ModelDescription = await service.describe_model()
+    finally:
+        await service.aclose()
+
+    return {'dimensions': described.dimensions, 'context_length': described.context_length}
+
 
 @router.get('/repos/validate')
 async def validate_repo(path: str) -> dict[str, Any]:

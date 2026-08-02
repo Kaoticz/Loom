@@ -36,7 +36,7 @@ from services.event_bus import (
 from services.docker_sandbox import DockerSandboxManager, SandboxError
 from services.file_editor import FileEditorService
 from services.git_manager import FileChange, GitManagerService
-from services.indexing import IndexingService
+from services.indexing import IndexingService, clamp_chunk_lines
 from services.plan_parser import NO_STEPS_CORRECTION, ParsedPlan, parse_plan, render_plan
 from services.review_context import build_review_prompt, collect_review_diffs
 from services.model_resolution import resolve_model
@@ -348,6 +348,11 @@ class AgentSession:
         self._session.configure(self._task, self._reviewer_model)
         self._services.embedding.embedding_model = str(
             message.get('embedding_model', DEFAULT_EMBEDDING_MODEL)
+        )
+        # Absent or null means automatic sizing, which is the default and the
+        # only mode that recovers from a chunk the model will not take.
+        self._services.indexing.chunk_lines = clamp_chunk_lines(
+            _read_chunk_lines(message.get('chunk_lines'))
         )
 
         self._task_id = str(message.get('task_id', '') or '')
@@ -963,3 +968,19 @@ class AgentSession:
 
 
 
+
+
+def _read_chunk_lines(value: Any) -> int | None:
+    """
+    Interpret the chunk size the client sent.
+
+    Anything unusable is treated as a request for automatic sizing, because a
+    client sending nonsense should get the behaviour that always works rather
+    than a session that refuses to start.
+
+    :param value: The value from the opening message.
+    :returns: The requested size, or None for automatic sizing.
+    """
+    if isinstance(value, bool) or not isinstance(value, int):
+        return None
+    return value if value > 0 else None

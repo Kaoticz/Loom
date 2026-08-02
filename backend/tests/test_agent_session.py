@@ -159,12 +159,14 @@ class FakeIndexing:
 
     repo_path: str = '/tmp/repo'
     files: list[str]
+    chunk_lines: int | None
 
     def __init__(self) -> None:
         """
         Create an indexer that reports no work.
         """
         self.files = []
+        self.chunk_lines = None
 
     async def index_repository(self, progress_callback: Any = None) -> None:
         """
@@ -1302,3 +1304,61 @@ async def test_a_working_sandbox_leaves_the_gate_armed(
     await session.run()
 
     assert session._session.sandbox_available is True
+
+
+async def test_the_chunk_size_reaches_the_indexer(monkeypatch: pytest.MonkeyPatch) -> None:
+    """
+    A size chosen in the interface has to arrive where chunks are built.
+    """
+    stub_agents(monkeypatch, ['1. Do the thing'], [(True, 'Looks correct.')])
+    session, _, _, services = build_session([
+        json.dumps({'prompt': 'do it', 'chunk_lines': 80}),
+        json.dumps({'approved': True}),
+        json.dumps({'approved': True}),
+    ])
+
+    await session.run()
+
+    assert services.indexing.chunk_lines == 80
+
+
+async def test_an_absent_chunk_size_means_automatic(monkeypatch: pytest.MonkeyPatch) -> None:
+    """
+    A client that says nothing gets the behaviour that always works.
+    """
+    stub_agents(monkeypatch, ['1. Do the thing'], [(True, 'Looks correct.')])
+    session, _, _, services = build_session([
+        opening(),
+        json.dumps({'approved': True}),
+        json.dumps({'approved': True}),
+    ])
+
+    await session.run()
+
+    assert services.indexing.chunk_lines is None
+
+
+@pytest.mark.parametrize(
+    'sent,expected',
+    [(None, None), (0, None), (-1, None), (True, None), ('80', None), (5, 10), (2000, 1000)],
+    ids=['null', 'zero', 'negative', 'boolean', 'string', 'below minimum', 'above maximum'],
+)
+async def test_an_unusable_chunk_size_does_not_stop_the_session(
+    monkeypatch: pytest.MonkeyPatch, sent: object, expected: int | None
+) -> None:
+    """
+    The value arrives from a client, so it is bounded rather than trusted.
+
+    A client sending nonsense gets automatic sizing, which always works, rather
+    than a session that refuses to start.
+    """
+    stub_agents(monkeypatch, ['1. Do the thing'], [(True, 'Looks correct.')])
+    session, _, _, services = build_session([
+        json.dumps({'prompt': 'do it', 'chunk_lines': sent}),
+        json.dumps({'approved': True}),
+        json.dumps({'approved': True}),
+    ])
+
+    await session.run()
+
+    assert services.indexing.chunk_lines == expected

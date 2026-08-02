@@ -130,6 +130,15 @@ export interface AgentConfig {
     coderModel: string;
     reviewerModel: string;
     embeddingModel: string;
+    /**
+     * Lines per chunk when indexing, or null to size chunks automatically.
+     *
+     * Automatic is the default and the only mode that recovers from a chunk the
+     * embedding model will not accept. A number is honoured exactly: if the
+     * model refuses a chunk that size, indexing fails and says so, rather than
+     * quietly using a different size and leaving the setting looking effective.
+     */
+    chunkLines: number | null;
     repoPath: string;
     dockerfile: string;
     secrets: { key: string; value: string }[];
@@ -160,6 +169,7 @@ const defaultConfig: AgentConfig = {
     coderModel: 'ollama:llama3',
     reviewerModel: 'ollama:llama3',
     embeddingModel: 'nomic-embed-text',
+    chunkLines: null,
     repoPath: '/tmp/repo',
     dockerfile: 'FROM python:3.14-slim\n\nWORKDIR /workspace\n',
     secrets: [],
@@ -673,6 +683,7 @@ function createAgentStore() {
                     coder_model: state.config.coderModel,
                     reviewer_model: state.config.reviewerModel,
                     embedding_model: state.config.embeddingModel,
+                    chunk_lines: state.config.chunkLines,
                     repo_path: state.config.repoPath,
                     dockerfile: state.config.dockerfile,
                     secrets: state.config.secrets

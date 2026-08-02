@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import os
+from pathlib import Path
 from collections.abc import AsyncIterator
 from urllib.parse import urlsplit, urlunsplit
 
@@ -16,6 +17,9 @@ pytestmark = pytest.mark.skipif(
 )
 
 SCRATCH_DATABASE: str = 'loom_migration_test'
+MIGRATIONS_DIRECTORY: Path = (
+    Path(__file__).resolve().parent.parent / 'database' / 'migrations' / 'models'
+)
 EXPECTED_TABLES: set[str] = {
     'aerich',
     'code_embeddings',
@@ -106,7 +110,16 @@ async def test_migrations_build_the_whole_schema(scratch_database: str) -> None:
     await ensure_vector_extension(scratch_database)
     applied: list[str] = await apply_migrations(config_for(scratch_database))
 
-    assert len(applied) == 3
+    # Counted from the directory rather than written down, so that adding a
+    # migration does not fail a test about whether migrations apply.
+    expected: int = len(
+        [
+            path
+            for path in MIGRATIONS_DIRECTORY.glob('*.py')
+            if not path.name.startswith('__')
+        ]
+    )
+    assert len(applied) == expected
     assert applied == sorted(applied), 'migrations must apply in order'
     assert await table_names(scratch_database) == EXPECTED_TABLES
 

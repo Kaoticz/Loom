@@ -257,10 +257,17 @@ def test_a_whole_session_runs_against_real_infrastructure(project: str) -> None:
             assert plan['steps'] == ['Add a subtract function']
             assert plan['requires_approval'] is True
 
-            thoughts: str = ' '.join(
-                m.get('content', '') for m in to_plan if m.get('type') == 'thought'
+            # Requirement 3 moved status announcements from `thought` to
+            # `system`; the model's own reasoning is all that remains a thought.
+            announced: str = ' '.join(
+                m.get('content', '') for m in to_plan if m.get('type') == 'system'
             )
-            assert 'Indexing' in thoughts
+            assert 'Indexing' in announced
+            assert not any(
+                'Indexing' in m.get('content', '')
+                for m in to_plan
+                if m.get('type') == 'thought'
+            )
 
             # Execution.
             websocket.send_text(json.dumps({'approved': True}))

@@ -7,14 +7,32 @@ from database.models.file import File
 from database.models.symbol import Symbol
 from database.models.code_embedding import CodeEmbedding
 from database.models.embedding_model import EmbeddingModel
-from services.embedding import EmbeddingError, EmbeddingService
+from services.embedding import (
+    ChunkTooLargeForModel,
+    EmbeddingError,
+    EmbeddingInputTooLong,
+    EmbeddingService,
+)
 from asyncio import Semaphore
+from logging import Logger, getLogger
 from collections.abc import Sequence
 from services.symbol_patterns import build_rules, language_for
 from services.chunking import Chunk, SymbolSpan, build_chunks
 from services.indexing_progress import ProgressCallback, ProgressReporter
 from subprocess import CompletedProcess
 import asyncio
+
+logger: Logger = getLogger(__name__)
+
+MIN_CHUNK_LINES: int = 10
+MAX_CHUNK_LINES: int = 1000
+"""
+Bounds on a hand-set chunk size.
+
+Below the minimum a chunk holds too little to mean anything; above the maximum
+no embedding model will take it. Enforced here as well as in the interface,
+because the value arrives from the client.
+"""
 
 DEFAULT_MAX_FILE_SIZE_BYTES: int = 1024 * 1024
 
@@ -39,22 +57,46 @@ def max_file_size_bytes() -> int:
         return DEFAULT_MAX_FILE_SIZE_BYTES
 
 
+def clamp_chunk_lines(chunk_lines: int | None) -> int | None:
+    """
+    Hold a hand-set chunk size within usable bounds.
+
+    A value of zero or less means automatic, matching how the opening message
+    reader treats one: two places interpreting the same number differently is a
+    bug waiting for someone to find it.
+
+    :param chunk_lines: The requested size, or None for automatic sizing.
+    :returns: The size to use, or None for automatic sizing.
+    """
+    if chunk_lines is None or chunk_lines <= 0:
+        return None
+    return max(MIN_CHUNK_LINES, min(chunk_lines, MAX_CHUNK_LINES))
+
+
 class IndexingService:
     """
     Service for scanning the codebase and populating the database.
     """
     repo_path: str
     embedding: EmbeddingService
+    chunk_lines: int | None
 
-    def __init__(self, repo_path: str, embedding: EmbeddingService) -> None:
+    def __init__(
+        self,
+        repo_path: str,
+        embedding: EmbeddingService,
+        chunk_lines: int | None = None,
+    ) -> None:
         """
         Create an indexing service.
 
         :param repo_path: Path to the repository to index.
         :param embedding: Service used to generate chunk embeddings.
+        :param chunk_lines: Lines per chunk, or None to size chunks automatically.
         """
         self.repo_path = repo_path
         self.embedding = embedding
+        self.chunk_lines = clamp_chunk_lines(chunk_lines)
 
     async def index_repository(self, progress_callback: ProgressCallback | None = None) -> None:
         """
@@ -174,19 +216,30 @@ class IndexingService:
         are discarded, because they can no longer be compared against anything
         the model produces.
 
+        A change to the chunk size discards them for a weaker but sufficient
+        reason: the vectors are still comparable, but they describe a chunking
+        nobody asked for any more, so leaving them would make the setting appear
+        to have no effect on anything already indexed.
+
         :returns: The registry entry for the configured embedding model.
         :raises EmbeddingError: If the embedding backend is unreachable or misconfigured.
         """
         name: str = self.embedding.embedding_model
         dimensions: int = await self.embedding.detect_dimensions()
 
+        recorded_chunking: int = self.chunk_lines or 0
+
         model: EmbeddingModel | None = await EmbeddingModel.get_or_none(model_name=name)
         if model is None:
-            return await EmbeddingModel.create(model_name=name, dimensions=dimensions)
+            return await EmbeddingModel.create(
+                model_name=name, dimensions=dimensions, chunk_lines=recorded_chunking
+            )
 
-        if model.dimensions != dimensions:
+        if model.dimensions != dimensions or model.chunk_lines != recorded_chunking:
             await CodeEmbedding.filter(model=model).delete()
+            await File.all().update(hash='')
             model.dimensions = dimensions
+            model.chunk_lines = recorded_chunking
             await model.save()
 
         return model
@@ -213,15 +266,50 @@ class IndexingService:
             for symbol in await Symbol.filter(file=file_obj)
             if symbol.line_end >= symbol.line_start
         ]
-        chunks: list[Chunk] = build_chunks(lines, spans)
+        chunks: list[Chunk] = (
+            build_chunks(lines, spans, max_lines=self.chunk_lines)
+            if self.chunk_lines is not None
+            else build_chunks(lines, spans)
+        )
 
-        for chunk in chunks:
+        pending: list[Chunk] = list(chunks)
+        while pending:
+            chunk: Chunk = pending.pop(0)
             chunk_text: str = chunk.text(lines)
 
             if not chunk_text.strip():
                 continue
 
-            embedding: list[float] = await self.embedding.embed(chunk_text)
+            embedding: list[float]
+            try:
+                embedding = await self.embedding.embed(chunk_text)
+            except EmbeddingInputTooLong as error:
+                if self.chunk_lines is not None:
+                    raise ChunkTooLargeForModel(
+                        f'Chunks of {self.chunk_lines} lines from {file_obj.file_path} are too '
+                        f'large for the embedding model {model.model_name!r}. Lower the chunk '
+                        'size in Settings, or set it to Auto to have Loom size chunks itself.'
+                    ) from error
+
+                halves: list[Chunk] = chunk.halve()
+                if len(halves) > 1:
+                    # How many tokens a chunk costs depends on the model's
+                    # tokenizer, which this side cannot measure, so the chunk is
+                    # divided until the model accepts it.
+                    pending[:0] = halves
+                    continue
+
+                # A single line the model will not take. Skipping it costs this
+                # one line its semantic search; failing here would cost the
+                # whole repository its index.
+                logger.warning(
+                    'Skipping line %d of %s: %r will not accept it at any length.',
+                    chunk.start_line,
+                    file_obj.file_path,
+                    model.model_name,
+                )
+                continue
+
             if len(embedding) != model.dimensions:
                 raise EmbeddingError(
                     f'Model {model.model_name!r} returned a {len(embedding)}-dimension vector '

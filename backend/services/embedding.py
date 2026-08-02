@@ -1,11 +1,16 @@
 from __future__ import annotations
 
-from typing import Any
+from typing import Annotated, Any
 
 from httpx import AsyncClient, HTTPError, Response
+from pydantic import BaseModel, Field
 
 DEFAULT_EMBEDDING_MODEL: str = 'nomic-embed-text'
 DIMENSION_PROBE_TEXT: str = 'dimension probe'
+
+CONTEXT_LENGTH_SUFFIX: str = '.context_length'
+EMBEDDING_LENGTH_SUFFIX: str = '.embedding_length'
+ARCHITECTURE_KEY: str = 'general.architecture'
 
 
 class EmbeddingError(RuntimeError):
@@ -15,6 +20,40 @@ class EmbeddingError(RuntimeError):
     A failure to embed is always surfaced rather than being masked with a zero
     vector, because a zero vector silently poisons every downstream similarity
     search.
+    """
+
+
+class ModelDescription(BaseModel):
+    """
+    What a model reports about itself, for showing to the user.
+
+    Both values are optional because a model need not describe itself, and
+    neither is required for indexing to work. They exist so that a person
+    choosing between models can see what they are choosing.
+    """
+
+    dimensions: int | None = Field(default=None, description='Vector width the model reports, or None if it does not say.')
+    context_length: int | None = Field(default=None, description='Tokens the model accepts, or None if it does not say.')
+
+
+class EmbeddingInputTooLong(EmbeddingError):
+    """
+    Raised when the text sent to embed is longer than the model will accept.
+
+    Distinguished from other failures because the caller can do something about
+    it: a shorter piece of the same text will usually succeed, whereas an
+    unreachable service will not improve on retry.
+    """
+
+
+class ChunkTooLargeForModel(EmbeddingError):
+    """
+    Raised when a chosen chunk size does not fit the chosen embedding model.
+
+    Only reachable when the chunk size was set by hand. On automatic sizing an
+    over-long chunk is divided until it fits, but a chosen size is a decision,
+    and quietly overriding it would leave the setting appearing to work while
+    doing nothing.
     """
 
 
@@ -117,9 +156,15 @@ class EmbeddingService:
             ) from error
 
         if response.status_code != 200:
+            detail: str = response.text[:200]
+            if _is_length_complaint(detail):
+                raise EmbeddingInputTooLong(
+                    f'Model {self._embedding_model!r} rejected a {len(text)} character chunk as '
+                    f'longer than its context allows: {detail}'
+                )
             raise EmbeddingError(
                 f'Ollama returned HTTP {response.status_code} while embedding with model '
-                f'{self._embedding_model!r}: {response.text[:200]}'
+                f'{self._embedding_model!r}: {detail}'
             )
 
         payload: dict[str, Any]
@@ -150,6 +195,74 @@ class EmbeddingService:
         """
         return len(await self.embed(DIMENSION_PROBE_TEXT))
 
+    async def describe_model(self) -> ModelDescription:
+        """
+        Read what the configured model reports about itself.
+
+        One request answers both questions, and neither requires the model to be
+        loaded, so this is cheap enough to run when a user merely picks a model
+        from a list. Probing for the width by embedding a string would load it.
+
+        Keys are named for the model's architecture, so the architecture has to
+        be read first. Anything unexpected yields None for that value rather than
+        an error: these are for display and for avoiding futile work, and the
+        caller copes without them.
+
+        Note that the context length is in tokens while chunks are measured in
+        lines, and the ratio between them varies by tokenizer. Two models can
+        report the same context length and disagree about whether the same text
+        fits.
+
+        :returns: What the model reports, with None for anything it does not say.
+        """
+        info: dict[str, Any] | None = await self._model_info()
+        if info is None:
+            return ModelDescription()
+
+        architecture: Any = info.get(ARCHITECTURE_KEY)
+        if not isinstance(architecture, str) or not architecture:
+            return ModelDescription()
+
+        return ModelDescription(
+            dimensions=_positive_int(info.get(f'{architecture}{EMBEDDING_LENGTH_SUFFIX}')),
+            context_length=_positive_int(info.get(f'{architecture}{CONTEXT_LENGTH_SUFFIX}')),
+        )
+
+    async def detect_context_length(self) -> int | None:
+        """
+        Discover how many tokens the configured model will accept.
+
+        :returns: The context length in tokens, or None if it cannot be read.
+        """
+        return (await self.describe_model()).context_length
+
+    async def _model_info(self) -> dict[str, Any] | None:
+        """
+        Fetch the model's metadata block from Ollama.
+
+        :returns: The metadata, or None if it could not be read.
+        """
+        client: AsyncClient = self._get_client()
+        try:
+            response: Response = await client.post(
+                f'{self._ollama_url}/api/show',
+                json={'model': self._embedding_model},
+                timeout=self._timeout,
+            )
+        except HTTPError:
+            return None
+
+        if response.status_code != 200:
+            return None
+
+        try:
+            payload: dict[str, Any] = response.json()
+        except ValueError:
+            return None
+
+        info: Any = payload.get('model_info')
+        return info if isinstance(info, dict) else None
+
     async def aclose(self) -> None:
         """
         Release the HTTP client if this service owns it.
@@ -157,3 +270,29 @@ class EmbeddingService:
         if self._client is not None and self._owns_client:
             await self._client.aclose()
             self._client = None
+
+
+def _is_length_complaint(detail: str) -> bool:
+    """
+    Judge whether an error from Ollama is about the input being too long.
+
+    Matched on the message text because the API offers nothing better: the
+    status code is the same 500 it returns for anything else. Deliberately
+    forgiving about wording, and a false negative merely costs the caller the
+    chance to retry with something shorter.
+
+    :param detail: The response body Ollama returned.
+    :returns: True if the message describes an over-long input.
+    """
+    lowered: str = detail.lower()
+    return 'context' in lowered and ('exceed' in lowered or 'too long' in lowered)
+
+
+def _positive_int(value: Any) -> int | None:
+    """
+    Accept a value only if it is a usable positive whole number.
+
+    :param value: The value as the model reported it.
+    :returns: The number, or None if it is missing or unusable.
+    """
+    return value if isinstance(value, int) and not isinstance(value, bool) and value > 0 else None

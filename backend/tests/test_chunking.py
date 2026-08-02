@@ -237,3 +237,46 @@ def test_symbols_beyond_the_file_are_ignored() -> None:
     chunks: list[Chunk] = build_chunks(lines, spans((10, 20)), max_lines=10)
 
     assert covers(chunks, 3)
+
+
+def test_halving_divides_a_chunk_in_two() -> None:
+    """
+    A chunk a model refuses is retried as two smaller ones.
+    """
+    halves: list[Chunk] = Chunk(start_line=1, end_line=10).halve()
+
+    assert [(half.start_line, half.end_line) for half in halves] == [(1, 5), (6, 10)]
+
+
+def test_halving_covers_every_line_exactly_once() -> None:
+    """
+    Splitting must not drop a line or embed one twice.
+    """
+    for length in range(2, 40):
+        chunk: Chunk = Chunk(start_line=3, end_line=2 + length)
+        covered: list[int] = []
+        for half in chunk.halve():
+            covered.extend(range(half.start_line, half.end_line + 1))
+
+        assert covered == list(range(chunk.start_line, chunk.end_line + 1))
+
+
+def test_halving_a_two_line_chunk_gives_two_single_lines() -> None:
+    """
+    The smallest divisible chunk still divides.
+    """
+    halves: list[Chunk] = Chunk(start_line=5, end_line=6).halve()
+
+    assert [(half.start_line, half.end_line) for half in halves] == [(5, 5), (6, 6)]
+
+
+def test_halving_a_single_line_yields_itself() -> None:
+    """
+    A single line cannot be divided, and the caller must be able to tell.
+
+    Returning it unchanged is what stops the retry loop recursing forever on a
+    line the model will not take at any length.
+    """
+    only: Chunk = Chunk(start_line=7, end_line=7)
+
+    assert only.halve() == [only]

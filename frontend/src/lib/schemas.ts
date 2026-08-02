@@ -223,6 +223,19 @@ export const commandActionSchema = z.enum([
 
 export type CommandAction = z.infer<typeof commandActionSchema>;
 
+/**
+ * What an embedding model reports about itself.
+ *
+ * Either value may be absent: a model need not describe itself, and neither
+ * answer is required for indexing to work.
+ */
+export const modelDescriptionSchema = z.object({
+    dimensions: z.number().int().positive().nullable(),
+    context_length: z.number().int().positive().nullable()
+});
+
+export type ModelDescription = z.infer<typeof modelDescriptionSchema>;
+
 /** The verdict on whether a path is a usable git repository. */
 export const repoValidationSchema = z.object({
     valid: z.boolean()

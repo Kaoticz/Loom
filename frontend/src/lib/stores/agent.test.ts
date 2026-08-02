@@ -1044,3 +1044,29 @@ describe('after stopping', () => {
         expect(get(store).status).toBe('cancelled');
     });
 });
+
+describe('chunk size', () => {
+    it('starts on automatic sizing', async () => {
+        const { store } = await connected();
+
+        // The original vision: pick any embedding model and have it just work.
+        expect(get(store).config.chunkLines).toBeNull();
+    });
+
+    it('sends automatic sizing as null', async () => {
+        const { store, socket } = await connected();
+
+        store.sendPrompt('do the thing');
+
+        expect(socket.lastSent.chunk_lines).toBeNull();
+    });
+
+    it('sends a chosen size as the number', async () => {
+        const { store, socket } = await connected();
+
+        store.updateConfig({ chunkLines: 80 });
+        store.sendPrompt('do the thing');
+
+        expect(socket.lastSent.chunk_lines).toBe(80);
+    });
+});

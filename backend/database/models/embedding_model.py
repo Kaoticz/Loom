@@ -26,6 +26,15 @@ class EmbeddingModel(Model):
     The number of components in the vectors this model produces.
     """
 
+    chunk_lines: Field[int] = IntField(default=0)
+    """
+    Lines per chunk used when these embeddings were made, or 0 for automatic.
+
+    Recorded because a change to it invalidates every vector the model produced:
+    the vectors remain comparable with one another, but they no longer describe
+    the chunking that was asked for, so the setting would appear to do nothing.
+    """
+
     provider: Field[str] = CharField(max_length=64, default='ollama')
     """
     The service that hosts the model.

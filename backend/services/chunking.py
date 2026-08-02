@@ -67,6 +67,27 @@ class Chunk(BaseModel):
         """
         return '\n'.join(lines[self.start_line - 1 : self.end_line])
 
+    def halve(self) -> list[Chunk]:
+        """
+        Split this chunk into two roughly equal halves.
+
+        Used when a model refuses a chunk as too long. Halving rather than
+        recomputing a size is deliberate: the number of tokens a chunk costs
+        depends on the model's tokenizer, which is not something this side can
+        measure, so the only reliable approach is to keep dividing until the
+        model accepts what it is given.
+
+        :returns: Two chunks, or this one unchanged if it is a single line.
+        """
+        if self.length <= 1:
+            return [self]
+
+        middle: int = self.start_line + self.length // 2 - 1
+        return [
+            Chunk(start_line=self.start_line, end_line=middle),
+            Chunk(start_line=middle + 1, end_line=self.end_line),
+        ]
+
 
 def extend_over_decorators(span: SymbolSpan, lines: Sequence[str]) -> SymbolSpan:
     """

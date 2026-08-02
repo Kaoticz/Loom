@@ -5,6 +5,14 @@
     import { goto } from '$app/navigation';
     import DirectoryPicker from '$lib/components/DirectoryPicker.svelte';
     import {
+        DEFAULT_CHUNK_LINES,
+        MAX_CHUNK_LINES,
+        MIN_CHUNK_LINES,
+        readChunkLines
+    } from '$lib/chunkSize';
+    import {
+        modelDescriptionSchema,
+        type ModelDescription,
         ollamaModelsSchema,
         parseResponse,
         repoValidationSchema,
@@ -15,6 +23,35 @@
 
     let availableModels: string[] = $state([]);
     let modelsError = $state('');
+    let described: ModelDescription | null = $state(null);
+
+    /**
+     * Ask what the selected embedding model reports about itself.
+     *
+     * Both values come from the model's metadata rather than from using it, so
+     * this does not load the model.
+     */
+    async function describeEmbeddingModel(name: string) {
+        described = null;
+        if (!name) return;
+        try {
+            const response = await fetch(
+                `${apiBase}/api/v1/ollama/models/${encodeURIComponent(name)}/description`
+            );
+            described = parseResponse(
+                modelDescriptionSchema,
+                await response.json(),
+                'model description'
+            );
+        } catch (e) {
+            console.error('Failed to describe the embedding model', e);
+            described = { dimensions: null, context_length: null };
+        }
+    }
+
+    $effect(() => {
+        void describeEmbeddingModel(config.embeddingModel);
+    });
     let showPicker = $state(false);
     let repoError = $state('');
     let isValidating = $state(false);
@@ -179,6 +216,62 @@
                                 {/each}
                             {/if}
                         </select>
+                        <p
+                            data-testid="embedding-model-description"
+                            class="mt-1 text-xs text-gray-500 dark:text-gray-400"
+                        >
+                            {#if described === null}
+                                Reading what this model reports about itself...
+                            {:else if described.dimensions === null && described.context_length === null}
+                                This model does not report its vector width or capacity.
+                            {:else}
+                                {described.dimensions ?? 'An unreported number of'} dimensions,
+                                {described.context_length ?? 'an unreported'} token capacity.
+                            {/if}
+                        </p>
+                    </div>
+
+                    <div>
+                        <label
+                            for="chunkLines"
+                            class="mb-1 block text-sm font-medium text-gray-700 dark:text-gray-300"
+                            >Chunk Size</label
+                        >
+                        <p class="mb-1 text-xs text-gray-500 dark:text-gray-400">
+                            How many lines of code each embedding covers. Larger chunks carry more
+                            context but match less precisely. Leave on Auto unless you are tuning
+                            search quality: Auto shrinks any chunk the model refuses, while a set
+                            size is used exactly and indexing fails if the model will not take it.
+                            Changing this re-indexes the repository.
+                        </p>
+                        <div class="flex items-center gap-3">
+                            <label class="flex items-center gap-2 text-sm dark:text-gray-300">
+                                <input
+                                    type="checkbox"
+                                    checked={config.chunkLines === null}
+                                    onchange={(event) => {
+                                        config.chunkLines = event.currentTarget.checked
+                                            ? null
+                                            : DEFAULT_CHUNK_LINES;
+                                    }}
+                                />
+                                Auto
+                            </label>
+                            <input
+                                id="chunkLines"
+                                type="number"
+                                min={MIN_CHUNK_LINES}
+                                max={MAX_CHUNK_LINES}
+                                step="10"
+                                disabled={config.chunkLines === null}
+                                value={config.chunkLines ?? DEFAULT_CHUNK_LINES}
+                                oninput={(event) => {
+                                    config.chunkLines = readChunkLines(event.currentTarget.value);
+                                }}
+                                class="w-32 rounded border border-gray-300 bg-white p-2 text-gray-900 disabled:cursor-not-allowed disabled:opacity-50 dark:border-gray-600 dark:bg-gray-700 dark:text-white"
+                            />
+                            <span class="text-xs text-gray-500 dark:text-gray-400">lines</span>
+                        </div>
                     </div>
                 </div>
             </section>
