@@ -16,6 +16,7 @@ from schemas.agent_messages import (
     ObservationMessage,
     PlanMessage,
     ReviewMessage,
+    SystemMessage,
     ThoughtMessage,
     to_message,
     truncate_diff_side,
@@ -27,7 +28,9 @@ from services.event_bus import (
     DoneEvent,
     ErrorEvent,
     PlanEvent,
+    INDEXING_PROGRESS_KEY,
     ReviewEvent,
+    SystemEvent,
     ThoughtEvent,
     ToolActionEvent,
     ToolObservationEvent,
@@ -39,13 +42,17 @@ ADAPTER: TypeAdapter[AgentMessage] = TypeAdapter(AgentMessage)
 
 def test_every_message_type_is_defined() -> None:
     """
-    The protocol covers exactly the nine documented message types.
+    The protocol covers exactly the documented message types.
     """
     assert {member.value for member in MessageType} == {
         'thought', 'plan', 'action', 'observation',
         'commit', 'diff', 'review', 'done', 'error',
         # Not produced from an event: sent directly when a connection is refused.
         'session_busy',
+        # Loom talking about the session, as opposed to the model reasoning.
+        'system',
+        # Shown as a banner rather than added to the feed.
+        'sandbox_unavailable',
     }
 
 
@@ -242,3 +249,108 @@ def test_event_itself_keeps_the_full_content() -> None:
     event: DiffEvent = DiffEvent(file_path='huge.lock', original='a\n' * 5000, modified='')
 
     assert len(event.original.splitlines()) == 5000
+
+
+def test_system_event_becomes_a_system_message() -> None:
+    """
+    A system event maps onto the new `system` wire type, carrying its slot key.
+
+    Requirement 1.1 and 1.2: the protocol gains a `system` type, and a system
+    message may carry a stable key naming a slot in the feed.
+    """
+    message: AgentMessage = to_message(
+        SystemEvent(content='Indexing complete.', key=INDEXING_PROGRESS_KEY)
+    )
+
+    assert isinstance(message, SystemMessage)
+    assert message.type is MessageType.system
+    assert message.content == 'Indexing complete.'
+    assert message.key == INDEXING_PROGRESS_KEY
+
+
+def test_system_message_carries_counts_separately_from_prose() -> None:
+    """
+    Progress counts travel as numbers, not embedded in the text.
+
+    Requirement 1.4: the client renders a counter from the counts rather than
+    parsing them back out of the descriptive text.
+    """
+    message: AgentMessage = to_message(
+        SystemEvent(
+            content='Indexed src/app.py',
+            key=INDEXING_PROGRESS_KEY,
+            processed=7,
+            total=42,
+        )
+    )
+
+    assert isinstance(message, SystemMessage)
+    assert message.processed == 7
+    assert message.total == 42
+    assert '7' not in message.content
+
+
+def test_system_message_without_a_key_is_valid() -> None:
+    """
+    A keyless system message is an ordinary appended announcement.
+
+    Requirement 1.2 and 1.3: the key is optional, and its absence means append.
+    """
+    message: AgentMessage = to_message(SystemEvent(content='Starting sandbox...'))
+
+    assert isinstance(message, SystemMessage)
+    assert message.key is None
+    assert message.processed is None
+    assert message.total is None
+
+
+def test_system_message_round_trips_through_the_union() -> None:
+    """
+    The discriminated union accepts and narrows a serialised system message.
+    """
+    adapter: TypeAdapter[AgentMessage] = TypeAdapter(AgentMessage)
+    payload: dict[str, object] = SystemMessage(
+        content='Indexed src/app.py',
+        key=INDEXING_PROGRESS_KEY,
+        processed=3,
+        total=9,
+    ).model_dump(mode='json')
+
+    parsed: AgentMessage = adapter.validate_python(payload)
+
+    assert isinstance(parsed, SystemMessage)
+    assert parsed.key == INDEXING_PROGRESS_KEY
+    assert parsed.processed == 3
+
+
+def test_negative_progress_counts_are_rejected() -> None:
+    """
+    Counts are non-negative, so a miscount cannot reach the client as one.
+    """
+    with pytest.raises(ValidationError):
+        SystemMessage(content='Indexing...', processed=-1, total=4)
+
+
+def test_thought_message_carries_its_stream_identifier() -> None:
+    """
+    The run of reasoning survives the trip to the wire format.
+
+    Requirement 2.1 and 2.2: the client needs the identifier to know which
+    message a further unit of reasoning belongs to.
+    """
+    message: AgentMessage = to_message(
+        ThoughtEvent(content='Considering the options.', stream_id='session:1')
+    )
+
+    assert isinstance(message, ThoughtMessage)
+    assert message.stream_id == 'session:1'
+
+
+def test_an_unlabelled_thought_stands_alone() -> None:
+    """
+    A thought with no identifier is its own message.
+    """
+    message: AgentMessage = to_message(ThoughtEvent(content='A single remark.'))
+
+    assert isinstance(message, ThoughtMessage)
+    assert message.stream_id is None

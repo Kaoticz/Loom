@@ -1,19 +1,31 @@
 from __future__ import annotations
 
 import json
+from collections.abc import Mapping
 import os
 from typing import Any, cast
 from unittest.mock import MagicMock
 
 import pytest
 
-from api.v1.agent_session import AgentSession, SessionServices
+from schemas.agent_commands import CommandAction, SessionCommand
+from api.v1.agent_session import AgentSession, SessionServices, StopRequested
 from agents.coder import AgentDeps
 from schemas.agent_messages import MessageType
 from services.code_search import CodeSearchService
 from services.conversation_history import ConversationHistory
 from services.docker_sandbox import DockerSandboxManager
-from services.event_bus import AgentEvent, ErrorEvent, EventBus, ThoughtEvent
+from services.event_bus import (
+    INDEXING_PROGRESS_KEY,
+    AgentEvent,
+    ErrorEvent,
+    EventBus,
+    SandboxUnavailableEvent,
+    SessionStatus,
+    SystemEvent,
+    ThoughtEvent,
+)
+from services.indexing_progress import ProgressReporter
 from services.file_editor import FileEditorService
 from services.git_manager import FileChange, GitManagerService
 from services.session_context import SessionContext
@@ -137,17 +149,39 @@ class FakeGit:
 
 class FakeIndexing:
     """
-    An indexer stand-in that reports no work.
+    An indexer stand-in that reports whatever work it was given.
+
+    `files` is empty by default, so a session that does not care about indexing
+    sees the same do-nothing behaviour as before. Setting it makes the fake drive
+    a real `ProgressReporter`, which is what lets a test check that progress
+    reaches the client the way the production indexer would send it.
     """
 
     repo_path: str = '/tmp/repo'
+    files: list[str]
+
+    def __init__(self) -> None:
+        """
+        Create an indexer that reports no work.
+        """
+        self.files = []
 
     async def index_repository(self, progress_callback: Any = None) -> None:
         """
-        Pretend to index the repository.
+        Pretend to index the repository, reporting progress for any configured files.
 
-        :param progress_callback: Ignored.
+        :param progress_callback: Where to report progress, if anywhere.
         """
+        if progress_callback is None or not self.files:
+            return None
+
+        reporter: ProgressReporter = ProgressReporter(
+            len(self.files), progress_callback, min_interval=0.0
+        )
+        await reporter.start(f'Indexing {len(self.files)} files...')
+        for path in self.files:
+            await reporter.file_completed(path)
+        await reporter.finish(f'Indexing complete: {reporter.completed} files processed.')
         return None
 
 
@@ -174,10 +208,31 @@ class FakeServices:
         self.editor = MagicMock()
         self.embedding = MagicMock()
 
-        async def spawn(session_id: str) -> None:
+        async def spawn(
+            session_id: str,
+            dockerfile: str = '',
+            environment: Mapping[str, str] | None = None,
+        ) -> None:
+            """
+            Pretend to start a sandbox.
+
+            The signature mirrors `DockerSandboxManager.spawn_sandbox` exactly. It
+            previously took only the session id, so the real call raised a
+            TypeError that the session swallowed as a warning, and every test ran
+            against a sandbox that had silently failed to start.
+            """
+            return None
+
+        async def reachable() -> str | None:
+            """
+            Report the sandbox as usable.
+
+            Tests that care about it being unusable override this.
+            """
             return None
 
         self.docker.spawn_sandbox = spawn
+        self.docker.check_reachable = reachable
 
 
 def build_session(
@@ -408,13 +463,20 @@ async def test_plan_retry_cap_pauses_for_the_user(monkeypatch: pytest.MonkeyPatc
         limits=IterationLimits(max_plan_retries=2),
     )
 
-    from services.event_bus import ThoughtEvent
-
-    assert await session.run() is SessionState.failed
-    thoughts: str = ' '.join(
-        event.content for event in events if isinstance(event, ThoughtEvent)
+    # Aborting is the user stopping, not the work breaking, so it is recorded
+    # the same way the stop button is.
+    assert await session.run() is SessionState.cancelled
+    announced: str = ' '.join(
+        event.content for event in events if isinstance(event, SystemEvent)
     )
-    assert 'rejected 2 times' in thoughts
+    assert 'rejected 2 times' in announced
+    # Requirement 3.3: this is Loom talking about the session, so it must not
+    # arrive labelled as the model's reasoning.
+    assert not any(
+        'rejected 2 times' in event.content
+        for event in events
+        if isinstance(event, ThoughtEvent)
+    )
 
 
 async def test_auto_approve_stops_asking(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -474,7 +536,8 @@ async def test_no_changes_is_reported_as_a_rejection(
 
     from services.event_bus import ReviewEvent
 
-    assert await session.run() is SessionState.failed
+    # The user aborted at the cap, which is a cancellation rather than a failure.
+    assert await session.run() is SessionState.cancelled
     reviews = [event for event in events if isinstance(event, ReviewEvent)]
     assert any('nothing to review' in review.comments for review in reviews)
 
@@ -661,7 +724,7 @@ async def test_empty_repository_stops_for_confirmation(
     assert await session.run() is SessionState.failed
 
     said: str = ' '.join(
-        event.content for event in events if isinstance(event, ThoughtEvent)
+        event.content for event in events if isinstance(event, SystemEvent)
     )
     assert 'repository looks' in said
     errors = [event for event in events if isinstance(event, ErrorEvent)]
@@ -761,3 +824,481 @@ async def test_losing_the_client_mid_execution_unwinds(
     session._machine.transition_to(SessionState.executing)
 
     assert await session.run() is SessionState.failed
+
+
+async def test_indexing_progress_reaches_the_client_as_one_keyed_slot(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """
+    The session reports indexing as keyed system events, not as thoughts.
+
+    Requirement 1: this covers the wiring between the indexer and the event bus,
+    which the reporter's own tests and the message mapping tests both stop short
+    of. Without it, a regression to one prose thought per file would go unnoticed.
+    """
+    stub_agents(monkeypatch, ['1. Do the thing'], [(True, 'Looks correct.')])
+    session, _, events, services = build_session([
+        opening(),
+        json.dumps({'approved': True}),
+        json.dumps({'approved': True}),
+    ])
+    services.indexing.files = ['a.py', 'b.py', 'c.py']
+
+    await session.run()
+
+    progress: list[SystemEvent] = [
+        event
+        for event in events
+        if isinstance(event, SystemEvent) and event.key == INDEXING_PROGRESS_KEY
+    ]
+
+    assert progress, 'indexing reported no progress at all'
+    assert all(event.total == 3 for event in progress)
+    assert progress[-1].processed == 3
+    # The counter must be carried as numbers, not narrated into a thought.
+    assert not any('Indexing [' in event.content for event in events if isinstance(event, ThoughtEvent))
+
+
+async def test_indexing_progress_shares_one_slot_across_updates(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """
+    Every progress update names the same slot, so the client replaces one message.
+    """
+    stub_agents(monkeypatch, ['1. Do the thing'], [(True, 'Looks correct.')])
+    session, _, events, services = build_session([
+        opening(),
+        json.dumps({'approved': True}),
+        json.dumps({'approved': True}),
+    ])
+    services.indexing.files = ['a.py', 'b.py']
+
+    await session.run()
+
+    keys: set[str | None] = {
+        event.key
+        for event in events
+        if isinstance(event, SystemEvent) and event.key is not None
+    }
+    assert keys == {INDEXING_PROGRESS_KEY}
+
+
+async def test_status_announcements_are_system_not_thought(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """
+    Loom talking about the session is labelled `SYSTEM`, not `THOUGHT`.
+
+    Requirement 3.1 and 3.3: the distinction is the point. The model's reasoning
+    is the only thing that should reach the client as a thought.
+    """
+    stub_agents(monkeypatch, ['1. Do the thing'], [(True, 'Looks correct.')])
+    session, _, events, _ = build_session([
+        opening(),
+        json.dumps({'approved': True}),
+        json.dumps({'approved': True}),
+    ])
+
+    await session.run()
+
+    announced: str = ' '.join(
+        event.content for event in events if isinstance(event, SystemEvent)
+    )
+    # 'Executing plan...' is absent here because this harness stubs out the
+    # executing state; test_execution_loop covers it against the real loop.
+    for phrase in (
+        'Indexing repository',
+        'Generating plan',
+        'Starting review',
+    ):
+        assert phrase in announced, f'{phrase!r} was not announced as a system message'
+
+    thoughts: str = ' '.join(
+        event.content for event in events if isinstance(event, ThoughtEvent)
+    )
+    for phrase in ('Indexing repository', 'Generating plan', 'Starting review'):
+        assert phrase not in thoughts, f'{phrase!r} still reaches the client as a thought'
+
+
+async def test_announcements_state_the_phase_they_enter(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """
+    The session states its phase rather than leaving it to be read out of prose.
+
+    The client previously matched announcement wording to derive the status,
+    which broke silently whenever the wording changed. The backend already holds
+    this information, so it sends it.
+    """
+    stub_agents(monkeypatch, ['1. Do the thing'], [(True, 'Looks correct.')])
+    session, _, events, _ = build_session([
+        opening(),
+        json.dumps({'approved': True}),
+        json.dumps({'approved': True}),
+    ])
+
+    await session.run()
+
+    announced: dict[SessionStatus, str] = {
+        event.status: event.content
+        for event in events
+        if isinstance(event, SystemEvent) and event.status is not None
+    }
+
+    # The executing phase is stubbed out in this harness; test_execution_loop
+    # covers its announcement against the real loop.
+    assert SessionStatus.indexing in announced
+    assert SessionStatus.planning in announced
+    assert SessionStatus.reviewing in announced
+    assert SessionStatus.merging in announced
+
+
+async def test_incidental_announcements_claim_no_phase(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """
+    An announcement that does not mark a phase leaves the status alone.
+
+    A warning about the sandbox, or a note about available secrets, says nothing
+    about where the session has got to, so it must not move the client's status.
+    """
+    stub_agents(monkeypatch, ['1. Do the thing'], [(True, 'Looks correct.')])
+    session, _, events, _ = build_session([
+        opening(),
+        json.dumps({'approved': True}),
+        json.dumps({'approved': True}),
+    ])
+
+    await session.run()
+
+    for event in events:
+        if isinstance(event, SystemEvent) and 'secrets are available' in event.content:
+            assert event.status is None
+
+
+async def test_unreachable_sandbox_is_reported_before_indexing(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """
+    The banner does not wait for indexing to finish.
+
+    Requirement 6.2: the reachability check runs when the connection is
+    established, so the user learns straight away that nothing will be verified.
+    """
+    stub_agents(monkeypatch, ['1. Do the thing'], [(True, 'Looks correct.')])
+    session, _, events, services = build_session([
+        opening(),
+        json.dumps({'approved': True}),
+        json.dumps({'approved': True}),
+    ])
+
+    async def unreachable() -> str | None:
+        return 'Cannot connect to the Docker daemon'
+
+    services.docker.check_reachable = unreachable
+    services.indexing.files = ['a.py']
+
+    await session.run()
+
+    notices = [event for event in events if isinstance(event, SandboxUnavailableEvent)]
+    assert len(notices) == 1
+    assert 'Docker daemon' in notices[0].reason
+
+    # It must arrive before any indexing progress.
+    first_notice = next(
+        index for index, event in enumerate(events) if isinstance(event, SandboxUnavailableEvent)
+    )
+    first_progress = next(
+        index
+        for index, event in enumerate(events)
+        if isinstance(event, SystemEvent) and event.key == INDEXING_PROGRESS_KEY
+    )
+    assert first_notice < first_progress
+
+
+async def test_sandbox_failure_is_not_announced_in_the_feed(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """
+    The warning is a banner, not a chat message.
+
+    Requirement 6.1 and 6.7: the announcement that used to carry this was removed.
+    """
+    stub_agents(monkeypatch, ['1. Do the thing'], [(True, 'Looks correct.')])
+    session, _, events, services = build_session([
+        opening(),
+        json.dumps({'approved': True}),
+        json.dumps({'approved': True}),
+    ])
+
+    async def unreachable() -> str | None:
+        return 'no docker here'
+
+    services.docker.check_reachable = unreachable
+
+    await session.run()
+
+    said = ' '.join(
+        event.content
+        for event in events
+        if isinstance(event, (SystemEvent, ThoughtEvent))
+    )
+    assert 'sandbox is unavailable' not in said
+
+
+async def test_the_sandbox_notice_is_sent_only_once(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """
+    An early failure and a later one describe the same predicament.
+
+    Requirement 6.5: a second notification must not stack another banner.
+    """
+    stub_agents(monkeypatch, ['1. Do the thing'], [(True, 'Looks correct.')])
+    session, _, events, services = build_session([
+        opening(),
+        json.dumps({'approved': True}),
+        json.dumps({'approved': True}),
+    ])
+
+    async def unreachable() -> str | None:
+        return 'unreachable'
+
+    async def failing_spawn(session_id: str) -> None:
+        raise RuntimeError('and it will not start either')
+
+    services.docker.check_reachable = unreachable
+    services.docker.spawn_sandbox = failing_spawn
+
+    await session.run()
+
+    notices = [event for event in events if isinstance(event, SandboxUnavailableEvent)]
+    assert len(notices) == 1
+
+
+async def test_a_usable_sandbox_reports_nothing(monkeypatch: pytest.MonkeyPatch) -> None:
+    """
+    A working sandbox produces no banner at all.
+    """
+    stub_agents(monkeypatch, ['1. Do the thing'], [(True, 'Looks correct.')])
+    session, _, events, _ = build_session([
+        opening(),
+        json.dumps({'approved': True}),
+        json.dumps({'approved': True}),
+    ])
+
+    await session.run()
+
+    assert not [event for event in events if isinstance(event, SandboxUnavailableEvent)]
+
+
+async def test_a_stop_ends_the_session_as_cancelled(monkeypatch: pytest.MonkeyPatch) -> None:
+    """
+    Stopping is recorded as cancelled, not failed.
+
+    Requirement 8.6: history has to show the difference between work the user
+    stopped and work that broke.
+    """
+    stub_agents(monkeypatch, ['1. Do the thing'], [(True, 'Looks correct.')])
+    session, _, events, _ = build_session([opening(), json.dumps({'action': 'stop'})])
+
+    assert await session.run() is SessionState.cancelled
+
+    said = ' '.join(event.content for event in events if isinstance(event, SystemEvent))
+    assert 'Stopped at your request' in said
+
+
+async def test_a_stop_kills_work_already_running(monkeypatch: pytest.MonkeyPatch) -> None:
+    """
+    The sandbox is torn down the moment a stop arrives.
+
+    Requirement 8.4: a running command is killed outright rather than waited for.
+    A command blocked inside the container runtime has no cancellation of its
+    own, so removing the container is what ends it.
+    """
+    stub_agents(monkeypatch, ['1. Do the thing'], [(True, 'Looks correct.')])
+    session, _, _, services = build_session([opening(), json.dumps({'action': 'stop'})])
+
+    stopped: list[bool] = []
+
+    async def stop_sandbox() -> None:
+        stopped.append(True)
+
+    services.docker.stop_sandbox = stop_sandbox
+
+    await session.run()
+
+    assert stopped, 'the sandbox was never interrupted'
+
+
+async def test_a_stop_leaves_the_branch_alone(monkeypatch: pytest.MonkeyPatch) -> None:
+    """
+    Nothing already written is undone.
+
+    Requirement 8.5: files, commits and the task branch all survive a stop.
+    """
+    stub_agents(monkeypatch, ['1. Do the thing'], [(True, 'Looks correct.')])
+    session, _, _, services = build_session([opening(), json.dumps({'action': 'stop'})])
+
+    await session.run()
+
+    assert not getattr(services.git, 'deleted_branches', []), 'the branch was removed'
+    assert not getattr(services.git, 'reverted', []), 'work was reverted'
+
+
+class StubInbox:
+    """
+    An inbox whose behaviour a test controls exactly.
+
+    Lets each of the three places a stop is honoured be exercised on its own.
+    The real inbox reads a socket, and with fast fakes the session reaches a
+    waiting state so quickly that any one of the three would cover for the
+    others, which tells us nothing about whether each is needed.
+    """
+
+    stop_requested: bool
+    asked: int
+    _commands: list[Any]
+
+    def __init__(self, stop_requested: bool = False, commands: list[Any] | None = None) -> None:
+        """
+        Create a stub inbox.
+
+        :param stop_requested: Whether a stop has already been received.
+        :param commands: Commands to hand out, in order.
+        """
+        self.stop_requested = stop_requested
+        self._commands = list(commands or [])
+        self.asked = 0
+
+    def start(self) -> None:
+        """
+        Begin reading, which a stub need not do.
+        """
+
+    async def next_command(self) -> Any:
+        """
+        Hand out the next scripted command.
+
+        :returns: The next command.
+        """
+        self.asked += 1
+        if self._commands:
+            return self._commands.pop(0)
+        return SessionCommand(action=CommandAction.stop)
+
+    async def close(self) -> None:
+        """
+        Release the stub, which holds nothing.
+        """
+
+
+async def test_a_stop_while_waiting_unwinds_rather_than_rejecting(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """
+    A stop received while the session waits for an answer stops it.
+
+    Isolates the check in `_receive_command`. Returned as an ordinary command a
+    stop resolves to a rejection, which would send the agent round again instead
+    of stopping it.
+    """
+    stub_agents(monkeypatch, ['1. Do the thing'], [(True, 'Looks correct.')])
+    session, _, _, _ = build_session([opening()])
+    session._inbox = StubInbox(commands=[SessionCommand(action=CommandAction.stop)])  # type: ignore[assignment]
+
+    with pytest.raises(StopRequested):
+        await session._receive_command()
+
+
+async def test_a_stop_between_states_is_noticed_without_waiting_for_a_command(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """
+    A stop during a state that neither streams nor waits still takes effect.
+
+    Isolates the run loop's check. Indexing and merging ask the user nothing and
+    stream nothing, so without this the stop would go unnoticed until the session
+    happened to reach a state that does one or the other.
+    """
+    stub_agents(monkeypatch, ['1. Do the thing'], [(True, 'Looks correct.')])
+    session, _, _, _ = build_session([opening()])
+    inbox: StubInbox = StubInbox(stop_requested=True)
+    session._inbox = inbox  # type: ignore[assignment]
+
+    assert await session.run() is SessionState.cancelled
+    assert inbox.asked == 0, 'the stop should have been seen without awaiting a command'
+
+
+async def test_cancellation_tells_the_client_the_agent_has_stopped(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """
+    The stop announcement states the phase, so the interface can leave it.
+
+    Requirement 8.7. Without the status the client has no way to know the agent
+    has stopped: the socket simply closes, and its last known phase is whatever
+    it was working on, so the prompt box goes on offering to stop work that
+    already has.
+    """
+    stub_agents(monkeypatch, ['1. Do the thing'], [(True, 'Looks correct.')])
+    session, _, events, _ = build_session([opening(), json.dumps({'action': 'stop'})])
+
+    await session.run()
+
+    cancelled = [
+        event
+        for event in events
+        if isinstance(event, SystemEvent) and event.status is SessionStatus.cancelled
+    ]
+    assert cancelled, 'the client was never told the session had stopped'
+    assert 'Stopped at your request' in cancelled[0].content
+
+
+async def test_the_banner_and_the_completion_gate_agree(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """
+    Sandbox availability is recorded once and read by both.
+
+    Requirement 11.4. Held separately, the interface could show the banner while
+    the gate went on demanding a verification that could never be run, and the
+    agent would loop while the user was looking at a notice saying why it could
+    not possibly succeed.
+    """
+    stub_agents(monkeypatch, ['1. Do the thing'], [(True, 'Looks correct.')])
+    session, _, events, services = build_session([
+        opening(),
+        json.dumps({'approved': True}),
+        json.dumps({'approved': True}),
+    ])
+
+    async def unreachable() -> str | None:
+        return 'no docker here'
+
+    services.docker.check_reachable = unreachable
+    context: SessionContext = session._session
+
+    assert context.sandbox_available is True
+    await session.run()
+
+    assert context.sandbox_available is False
+    assert [event for event in events if isinstance(event, SandboxUnavailableEvent)]
+
+
+async def test_a_working_sandbox_leaves_the_gate_armed(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """
+    Requirement 11.3: nothing is waived while the sandbox works.
+    """
+    stub_agents(monkeypatch, ['1. Do the thing'], [(True, 'Looks correct.')])
+    session, _, _, _ = build_session([
+        opening(),
+        json.dumps({'approved': True}),
+        json.dumps({'approved': True}),
+    ])
+
+    await session.run()
+
+    assert session._session.sandbox_available is True

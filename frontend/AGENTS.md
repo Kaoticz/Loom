@@ -84,7 +84,7 @@ Prefer **single quotes** (`'`) for strings over double quotes (`"`), except in t
 const name: string = 'Alice';
 
 // Bad
-const name: string = "Alice";
+const name: string = 'Alice';
 ```
 
 ### API Contracts — Request & Response Types
@@ -115,8 +115,8 @@ Use **Zod** to validate all data that crosses a trust boundary — API responses
 ```typescript
 // Good
 const AgentMessageSchema = z.object({
-  type: z.enum(['token', 'error', 'done']),
-  content: z.string(),
+    type: z.enum(['token', 'error', 'done']),
+    content: z.string()
 });
 
 const message: AgentMessage = AgentMessageSchema.parse(raw);
@@ -132,17 +132,17 @@ When a variable or type field can take **3 or more** named literal values, defin
 ```typescript
 // Good
 const RunStatus = {
-  pending: 'pending',
-  running: 'running',
-  completed: 'completed',
-  failed: 'failed',
+    pending: 'pending',
+    running: 'running',
+    completed: 'completed',
+    failed: 'failed'
 } as const;
 
 type RunStatus = (typeof RunStatus)[keyof typeof RunStatus];
 
 // Bad
 type Run = {
-  status: 'pending' | 'running' | 'completed' | 'failed';
+    status: 'pending' | 'running' | 'completed' | 'failed';
 };
 ```
 
@@ -153,25 +153,25 @@ Prefer early returns to reduce nesting and clarify intent.
 ```typescript
 // Good
 function processMessage(message: AgentMessage): void {
-  if (message.type === 'error') {
-    handleError(message.content);
-    return;
-  }
-  if (!message.content) {
-    return;
-  }
-  appendToken(message.content);
+    if (message.type === 'error') {
+        handleError(message.content);
+        return;
+    }
+    if (!message.content) {
+        return;
+    }
+    appendToken(message.content);
 }
 
 // Bad
 function processMessage(message: AgentMessage): void {
-  if (message.type !== 'error') {
-    if (message.content) {
-      appendToken(message.content);
+    if (message.type !== 'error') {
+        if (message.content) {
+            appendToken(message.content);
+        }
+    } else {
+        handleError(message.content);
     }
-  } else {
-    handleError(message.content);
-  }
 }
 ```
 
@@ -182,12 +182,12 @@ Functions should return values rather than mutating external state silently. Sve
 ```typescript
 // Good
 function withStatus(run: Run, status: RunStatus): Run {
-  return { ...run, status };
+    return { ...run, status };
 }
 
 // Bad
 function setStatus(run: Run, status: RunStatus): void {
-  run.status = status;
+    run.status = status;
 }
 ```
 

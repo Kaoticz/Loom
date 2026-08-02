@@ -1,104 +1,46 @@
 <script lang="ts">
-    import { onMount, onDestroy } from 'svelte';
-    import { agentStore } from '$lib/stores/agent';
-    
-    let editorContainer: HTMLElement;
-    let diffEditor: any;
-    let monaco: any;
+    import type { FileDiff } from '$lib/stores/agent';
+    import { orderFilePaths, retainExpanded, toggleExpanded } from '$lib/diffSections';
+    import DiffSection from './DiffSection.svelte';
 
-    async function initMonaco() {
-        if (typeof window !== 'undefined') {
-            monaco = await import('monaco-editor');
-            
-            const isDark = document.documentElement.classList.contains('dark');
-            diffEditor = monaco.editor.createDiffEditor(editorContainer, {
-                originalEditable: false,
-                readOnly: true,
-                automaticLayout: true,
-                theme: isDark ? 'vs-dark' : 'vs',
-                renderSideBySide: true
-            });
+    let {
+        diffs,
+        dark = false
+    }: {
+        diffs: Record<string, FileDiff>;
+        dark?: boolean;
+    } = $props();
 
-            updateDiff();
-        }
-    }
+    let expanded = $state(new Set<string>());
 
-    function updateDiff() {
-        if (!diffEditor || !monaco || !$agentStore.selectedFile) return;
+    const paths = $derived(orderFilePaths(Object.keys(diffs)));
 
-        const fileDiff = $agentStore.fileDiffs[$agentStore.selectedFile];
-        if (!fileDiff) return;
-
-        // Get extension to determine language
-        const extension = $agentStore.selectedFile.split('.').pop();
-        let language = 'plaintext';
-        if (extension === 'ts' || extension === 'js') language = 'javascript';
-        else if (extension === 'svelte') language = 'html';
-        else if (extension === 'py') language = 'python';
-        else if (extension === 'css') language = 'css';
-        else if (extension === 'json') language = 'json';
-
-        const originalModel = monaco.editor.createModel(fileDiff.original, language);
-        const modifiedModel = monaco.editor.createModel(fileDiff.modified, language);
-
-        diffEditor.setModel({
-            original: originalModel,
-            modified: modifiedModel
-        });
-    }
-
-    $: if ($agentStore.selectedFile || $agentStore.fileDiffs) {
-        updateDiff();
-    }
-
-    $: if (monaco && diffEditor && $agentStore.config.theme) {
-        const isDark = document.documentElement.classList.contains('dark');
-        monaco.editor.setTheme(isDark ? 'vs-dark' : 'vs');
-    }
-
-    onMount(() => {
-        initMonaco();
+    // A file the reader opened stays open as further diffs arrive; one that has
+    // just appeared starts collapsed.
+    $effect(() => {
+        const retained = retainExpanded(expanded, paths);
+        if (retained.size !== expanded.size) expanded = retained;
     });
 
-    onDestroy(() => {
-        if (diffEditor) {
-            diffEditor.dispose();
-        }
-    });
+    function toggle(path: string) {
+        expanded = toggleExpanded(expanded, path);
+    }
 </script>
 
-<div class="flex flex-col h-full bg-white dark:bg-[#1e1e1e] transition-colors duration-200">
-    <!-- File Selector -->
-    <div class="flex bg-gray-50 dark:bg-[#252526] border-b border-gray-200 dark:border-[#333] overflow-x-auto no-scrollbar">
-        {#each $agentStore.files as file}
-            <button
-                on:click={() => agentStore.selectFile(file)}
-                class="px-4 py-2 text-sm border-r border-gray-200 dark:border-[#333] whitespace-nowrap transition-colors {$agentStore.selectedFile === file ? 'bg-white dark:bg-[#1e1e1e] text-blue-600 dark:text-blue-400 font-medium' : 'text-gray-500 dark:text-gray-400 hover:bg-gray-100 dark:hover:bg-[#2a2d2e]'}"
-            >
-                {file.split('/').pop()}
-            </button>
-        {/each}
-        {#if $agentStore.files.length === 0}
-            <div class="px-4 py-2 text-sm text-gray-400 dark:text-gray-500 italic">No files modified yet</div>
-        {/if}
-    </div>
-
-    {#if $agentStore.selectedFile && $agentStore.fileDiffs[$agentStore.selectedFile]?.truncated}
-        <div class="px-4 py-2 text-xs bg-amber-50 dark:bg-amber-900/20 text-amber-800 dark:text-amber-300 border-b border-amber-200 dark:border-amber-800">
-            This file is too large to show in full. The diff below is truncated.
+<div class="flex h-full flex-col overflow-y-auto bg-white transition-colors dark:bg-[#1e1e1e]">
+    {#if paths.length === 0}
+        <div class="px-4 py-2 text-sm italic text-gray-400 dark:text-gray-500">
+            No files modified yet
         </div>
+    {:else}
+        {#each paths as path (path)}
+            <DiffSection
+                {path}
+                diff={diffs[path]}
+                expanded={expanded.has(path)}
+                {dark}
+                ontoggle={toggle}
+            />
+        {/each}
     {/if}
-
-    <!-- Editor -->
-    <div bind:this={editorContainer} class="flex-1"></div>
 </div>
-
-<style>
-    .no-scrollbar::-webkit-scrollbar {
-        display: none;
-    }
-    .no-scrollbar {
-        -ms-overflow-style: none;
-        scrollbar-width: none;
-    }
-</style>

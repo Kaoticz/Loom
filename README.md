@@ -59,7 +59,8 @@ Compose brings up Postgres with pgvector, SearXNG, the backend and the frontend.
 Ollama at `http://ollama:11434`; change `OLLAMA_BASE_URL` in `docker-compose.yml` if yours runs
 elsewhere.
 
-Put the repository you want Loom to work on in `./data/repo`, or point `HOST_REPO_PATH` at it.
+Put the repository you want Loom to work on in `./data/repo`, then pick it with the directory
+picker in the interface. Anything beneath a directory mounted into the Loom container will do.
 
 ### If you use Podman
 
@@ -152,7 +153,6 @@ services are reachable by name rather than on `localhost`.
 | `OLLAMA_BASE_URL` | `http://localhost:11434` | Where Ollama is listening |
 | `SEARXNG_URL` | `http://localhost:8080` | Where SearXNG is listening |
 | `REPO_PATH` | `/tmp/repo` | The repository, as this process sees it |
-| `HOST_REPO_PATH` | *(empty)* | The same directory as the container runtime's **host** sees it. Only needed when Loom itself runs in a container. Must be absolute. |
 | `EMBEDDING_MODEL` | `nomic-embed-text` | Must be an embedding model |
 | `LOOM_MAX_FILE_SIZE_BYTES` | `1048576` | Largest file indexed. `0` or negative means unlimited |
 | `LOOM_MAX_PLAN_RETRIES` | `10` | Plan rejections before Loom asks how to proceed |
@@ -161,11 +161,12 @@ services are reachable by name rather than on `localhost`.
 | `LOOM_CORS_ORIGINS` | `http://localhost:5173,http://127.0.0.1:5173` | Browser origins allowed to call the API |
 | `AST_GREP_BIN` | `ast-grep` | Path to ast-grep, if not on `PATH` |
 
-`HOST_REPO_PATH` deserves a note. Bind mount sources are resolved by the container runtime's
-daemon, which runs on the host, so a containerised Loom asking for `/tmp/repo` would mount the
-*host's* `/tmp/repo` rather than the project. This variable supplies the host's view of the
-same directory. It must be absolute: a relative path is silently treated as a named volume, and
-the sandbox would start with an empty tree.
+Bind mount sources are resolved by the container runtime's daemon, which runs on the host, so a
+containerised Loom asking for `/tmp/repo` would mount the *host's* `/tmp/repo` rather than the
+project. Loom discovers the host's view of the repository by inspecting its own container's mounts,
+so nothing needs configuring. If it cannot — because the repository is not under anything mounted
+in from the host — the sandbox is reported as unavailable and the session continues without being
+able to verify its work.
 
 ### Frontend, `frontend/.env`
 
@@ -181,7 +182,6 @@ repository root, beside `docker-compose.yml`. All are optional.
 
 | Variable | Default | Purpose |
 |---|---|---|
-| `HOST_REPO_PATH` | `${PWD}/data/repo` | The repository on the host |
 | `DOCKER_GID` | `999` | Group that owns the container socket |
 | `UID` / `GID` | `1000` | Your user, for file ownership on bind mounts |
 | `CONTAINER_SOCKET` | `/var/run/docker.sock` | Path to the container runtime socket |

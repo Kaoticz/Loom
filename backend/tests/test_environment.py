@@ -107,13 +107,13 @@ def test_loading_is_idempotent() -> None:
 
 def test_the_example_file_documents_every_variable() -> None:
     """
-    Every variable the backend reads appears in .env.example.
+    Every variable the backend reads appears in env.example.
 
     An undocumented variable is one nobody knows they can set.
     """
     import re
 
-    example: str = (BACKEND_ROOT / '.env.example').read_text()
+    example: str = (BACKEND_ROOT / 'env.example').read_text()
     documented: set[str] = set(re.findall(r'^([A-Z_]+)=', example, flags=re.M))
 
     referenced: set[str] = set()

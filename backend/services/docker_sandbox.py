@@ -2,15 +2,18 @@ from __future__ import annotations
 
 import asyncio
 import os
+import socket
 import shutil
 import tempfile
-from collections.abc import Mapping
+from collections.abc import Iterable, Mapping
 from logging import Logger, getLogger
 from typing import Annotated, Any
 
 import docker
 from docker.errors import NotFound
 from pydantic import BaseModel, Field
+
+from services.event_bus import SandboxStage
 
 logger: Logger = getLogger(__name__)
 
@@ -21,10 +24,67 @@ REDACTION: str = '***'
 GRACE_SECONDS: float = 5.0
 
 
+def mount_covering(
+    mounts: Iterable[Mapping[str, Any]], container_path: str
+) -> tuple[str, str] | None:
+    """
+    Find the bind mount that a path inside this container falls under.
+
+    Where several mounts could apply, the most specific wins: a repository at
+    `/data/repo` under mounts of both `/data` and `/data/repo` belongs to the
+    latter, and using the former would translate to the wrong host path.
+
+    :param mounts: The mount records as the container runtime reports them.
+    :param container_path: An absolute path inside this container.
+    :returns: The matching source and destination, or None if nothing covers it.
+    """
+    best: tuple[str, str] | None = None
+    for mount in mounts:
+        destination: str = str(mount.get('Destination') or '')
+        source: str = str(mount.get('Source') or '')
+        if not destination or not source:
+            continue
+        covers: bool = container_path == destination or container_path.startswith(
+            destination.rstrip('/') + '/'
+        )
+        if covers and (best is None or len(destination) > len(best[1])):
+            best = (source, destination)
+    return best
+
+
+def host_path_within(source: str, destination: str, container_path: str) -> str:
+    """
+    Translate a path inside this container to the host path for the same file.
+
+    :param source: The mount's source, as the host sees it.
+    :param destination: Where that source is mounted inside this container.
+    :param container_path: An absolute path inside this container, under the mount.
+    :returns: The host path for the same location.
+    """
+    if container_path == destination:
+        return source
+    return os.path.join(source, os.path.relpath(container_path, destination))
+
+
 class SandboxError(RuntimeError):
     """
     Raised when the sandbox cannot be prepared or is not usable.
+
+    Carries the step that failed, so that callers can tell the causes apart
+    rather than presenting every one of them as the same sentence.
     """
+
+    stage: SandboxStage
+
+    def __init__(self, stage: SandboxStage, message: str) -> None:
+        """
+        Describe a sandbox failure.
+
+        :param stage: Which step of preparing the sandbox failed.
+        :param message: What went wrong, in terms the reader can act on.
+        """
+        super().__init__(message)
+        self.stage = stage
 
 
 class CommandResult(BaseModel):
@@ -56,8 +116,6 @@ class DockerSandboxManager:
 
     _client: Any | None
     _repo_path: str
-    _container_repo_root: str
-    _host_repo_root: str
     _default_image: str
     _command_timeout: float
     _container_name: str
@@ -68,7 +126,6 @@ class DockerSandboxManager:
     def __init__(
         self,
         repo_path: str,
-        host_repo_root: str = '',
         default_image: str = DEFAULT_SANDBOX_IMAGE,
         command_timeout: float = DEFAULT_COMMAND_TIMEOUT,
     ) -> None:
@@ -76,14 +133,11 @@ class DockerSandboxManager:
         Create a sandbox manager.
 
         :param repo_path: Path to the repository as this process sees it.
-        :param host_repo_root: The same directory as the container runtime's host sees it. Required when this process is itself containerised.
         :param default_image: Image used when the user supplies no Dockerfile.
         :param command_timeout: How long a single command may run, in seconds.
         """
         self._client = None
         self._repo_path = repo_path
-        self._container_repo_root = repo_path
-        self._host_repo_root = host_repo_root
         self._default_image = default_image
         self._command_timeout = command_timeout
         self._container_name = 'loom-sandbox'
@@ -153,6 +207,37 @@ class DockerSandboxManager:
                 raise
         return self._client
 
+    def _own_container(self) -> Any | None:
+        """
+        Find this process's own container, if it is running inside one.
+
+        The runtime sets a container's hostname to its identifier, so asking the
+        runtime about our own hostname either returns us or tells us there is no
+        such container. That answer is the detection: nothing has to be
+        configured to say whether Loom is containerised.
+
+        :returns: This process's container, or None if it is not in one.
+        :raises SandboxError: If the container runtime cannot be reached.
+        """
+        try:
+            client: Any = self.client
+        except Exception as error:
+            raise SandboxError(
+                SandboxStage.runtime_connectivity,
+                f'The container runtime could not be reached: {error}',
+            ) from error
+
+        try:
+            return client.containers.get(socket.gethostname())
+        except NotFound:
+            # Not containerised: this process and the runtime share a filesystem.
+            return None
+        except Exception as error:
+            raise SandboxError(
+                SandboxStage.runtime_connectivity,
+                f'The container runtime could not be asked about this container: {error}',
+            ) from error
+
     def host_mount_source(self) -> str:
         """
         Resolve the path to bind mount into the sandbox, as the host sees it.
@@ -160,36 +245,44 @@ class DockerSandboxManager:
         Bind mount sources are resolved by the container runtime's daemon, which
         runs on the host. When this process is itself in a container, its own
         view of the repository is meaningless to that daemon: asking for
-        `/tmp/repo` mounts the host's `/tmp/repo`, not the project. The host's
-        path for the same directory therefore has to be supplied separately.
+        `/tmp/repo` would mount the host's `/tmp/repo`, not the project. The host
+        path is therefore discovered by inspecting this container's own mounts,
+        rather than being supplied as configuration nobody can verify.
 
         :returns: An absolute host path to mount.
-        :raises SandboxError: If the path cannot be resolved or is not absolute.
+        :raises SandboxError: If the host path cannot be discovered.
         """
-        if not self._host_repo_root:
-            # Not containerised: this process and the daemon share a filesystem.
-            return os.path.abspath(self._repo_path)
+        container_path: str = os.path.abspath(self._repo_path)
 
-        current: str = os.path.abspath(self._repo_path)
-        root: str = os.path.abspath(self._container_repo_root)
+        own: Any | None = self._own_container()
+        if own is None:
+            # Not containerised, so the path is already a host path.
+            return container_path
 
-        if current == root:
-            resolved: str = self._host_repo_root
-        elif current.startswith(root + os.sep):
-            resolved = os.path.join(self._host_repo_root, os.path.relpath(current, root))
-        else:
+        mounts: list[Mapping[str, Any]] = list(own.attrs.get('Mounts') or [])
+        covering: tuple[str, str] | None = mount_covering(mounts, container_path)
+        if covering is None:
+            visible: str = ', '.join(
+                sorted(str(mount.get('Destination') or '') for mount in mounts if mount.get('Destination'))
+            )
             raise SandboxError(
-                f'The repository at {current} is outside {root}, which is the only directory '
-                'mounted into this container. The sandbox can only reach paths beneath it. '
-                'Mount the repository you want to work on there, or point HOST_REPO_PATH at it.'
+                SandboxStage.path_discovery,
+                f'The repository at {container_path} inside this container is not under any '
+                'directory mounted from the host, so the sandbox cannot be given the same files. '
+                f'Mounted here: {visible or "nothing"}. Mount the repository into this container '
+                'and choose a path beneath it.',
             )
 
+        source, destination = covering
+        resolved: str = host_path_within(source, destination, container_path)
         if not os.path.isabs(resolved):
-            # A relative source is silently interpreted as a named volume rather
-            # than a bind mount, so the sandbox would start with an empty tree.
+            # A relative source is silently treated as a named volume rather than
+            # a bind mount, so the sandbox would start with an empty tree.
             raise SandboxError(
-                f'HOST_REPO_PATH must be an absolute path, got {resolved!r}. A relative path '
-                'is treated as a named volume and the sandbox would see nothing.'
+                SandboxStage.path_discovery,
+                f'The host path discovered for {container_path} is {resolved!r}, which is not '
+                f'absolute. It came from the mount of {source!r} at {destination!r}. A relative '
+                'source is treated as a named volume and the sandbox would see nothing.',
             )
         return resolved
 
@@ -227,13 +320,36 @@ class DockerSandboxManager:
             self.client.images.build(path=context, tag=tag, rm=True)
         except Exception as error:
             raise SandboxError(
-                f'The sandbox image could not be built from the supplied Dockerfile: {error}'
+                SandboxStage.image_build,
+                f'The sandbox image could not be built from the supplied Dockerfile: {error}',
             ) from error
         finally:
             shutil.rmtree(context, ignore_errors=True)
 
         self._built_image = tag
         return tag
+
+    async def check_reachable(self) -> str | None:
+        """
+        Ask whether the container runtime can be reached at all.
+
+        Cheap enough to run before indexing: it opens the client and pings, doing
+        no image build and starting no container. Knowing early means the
+        interface can say straight away that nothing will be verifiable, rather
+        than letting the user wait through indexing to find out.
+
+        :returns: None if the runtime is reachable, otherwise why it is not.
+        """
+
+        def _probe() -> str | None:
+            try:
+                # Constructing the client pings the daemon.
+                _ = self.client
+            except Exception as error:
+                return str(error)
+            return None
+
+        return await asyncio.to_thread(_probe)
 
     async def spawn_sandbox(
         self,
@@ -260,23 +376,47 @@ class DockerSandboxManager:
                 else self._default_image
             )
 
+            # Pulled explicitly rather than letting `run` do it implicitly, so a
+            # download failure is reported as a download failure. Implicitly, it
+            # surfaces from `run` and reads as a container that would not start,
+            # which sends the reader looking in the wrong place.
+            try:
+                self.client.images.get(image)
+            except NotFound:
+                try:
+                    self.client.images.pull(image)
+                except Exception as error:
+                    raise SandboxError(
+                        SandboxStage.image_pull,
+                        f'The sandbox image {image!r} is not present locally and could not be '
+                        f'downloaded: {error}',
+                    ) from error
+
             try:
                 existing: Any = self.client.containers.get(self._container_name)
                 existing.remove(force=True)
             except NotFound:
                 pass
 
-            return self.client.containers.run(
-                image,
-                command='tail -f /dev/null',  # Keep it running for the session.
-                detach=True,
-                name=self._container_name,
-                environment=dict(self._secrets),
-                volumes={
-                    self.host_mount_source(): {'bind': '/workspace', 'mode': 'rw'}
-                },
-                working_dir='/workspace'
-            )
+            # `host_mount_source` raises its own staged error, which must not be
+            # relabelled as a start failure, so it is resolved before the attempt.
+            mount_source: str = self.host_mount_source()
+
+            try:
+                return self.client.containers.run(
+                    image,
+                    command='tail -f /dev/null',  # Keep it running for the session.
+                    detach=True,
+                    name=self._container_name,
+                    environment=dict(self._secrets),
+                    volumes={mount_source: {'bind': '/workspace', 'mode': 'rw'}},
+                    working_dir='/workspace',
+                )
+            except Exception as error:
+                raise SandboxError(
+                    SandboxStage.container_start,
+                    f'The sandbox container could not be started from image {image!r}: {error}',
+                ) from error
 
         container: Any = await asyncio.to_thread(_spawn)
         await self._verify_ready()
@@ -305,13 +445,15 @@ class DockerSandboxManager:
             exit_code, output, has_timeout = await asyncio.to_thread(_probe)
         except Exception as error:
             raise SandboxError(
-                f'The sandbox container started but could not be reached: {error}'
+                SandboxStage.readiness_probe,
+                f'The sandbox container started but could not be reached: {error}',
             ) from error
 
         if exit_code != 0 or 'ok' not in output:
             raise SandboxError(
+                SandboxStage.readiness_probe,
                 'The sandbox container started but did not respond to a test command. '
-                f'It exited with status {exit_code}. Check that the image provides /bin/sh.'
+                f'It exited with status {exit_code}. Check that the image provides /bin/sh.',
             )
 
         self._supports_shell_timeout = has_timeout

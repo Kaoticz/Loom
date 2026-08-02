@@ -21,20 +21,27 @@ from schemas.agent_commands import CommandAction, SessionCommand, parse_command
 from services.conversation_history import ConversationHistory, TurnRole
 from services.embedding import DEFAULT_EMBEDDING_MODEL, EmbeddingService
 from services.event_bus import (
+    INDEXING_PROGRESS_KEY,
     DoneEvent,
     ErrorEvent,
     EventBus,
     PlanEvent,
     ReviewEvent,
+    SandboxStage,
+    SandboxUnavailableEvent,
+    SessionStatus,
+    SystemEvent,
     ThoughtEvent,
 )
-from services.docker_sandbox import DockerSandboxManager
+from services.docker_sandbox import DockerSandboxManager, SandboxError
 from services.file_editor import FileEditorService
 from services.git_manager import FileChange, GitManagerService
 from services.indexing import IndexingService
 from services.plan_parser import NO_STEPS_CORRECTION, ParsedPlan, parse_plan, render_plan
 from services.review_context import build_review_prompt, collect_review_diffs
+from services.model_resolution import resolve_model
 from services.session_context import SessionContext
+from services.session_inbox import SessionInbox
 from services.session_fsm import SessionState, SessionStateMachine
 from services.session_limits import IterationLimits
 from services.task_recorder import TaskRecorder
@@ -53,6 +60,12 @@ logger = logging.getLogger(__name__)
 class ClientGone(Exception):
     """
     Raised to unwind out of a long running state once the client has left.
+    """
+
+
+class StopRequested(Exception):
+    """
+    Raised to unwind out of a long running state once the user has pressed stop.
     """
 
 
@@ -128,6 +141,7 @@ class AgentSession:
     _auto_approve: bool
     _last_review: ReviewResult | None
     _dockerfile: str
+    _inbox: SessionInbox
     _secrets: dict[str, str]
     _task_id: str
     _recorder: TaskRecorder | None
@@ -161,6 +175,7 @@ class AgentSession:
         :param connection_lost: Set when the client can no longer be reached.
         """
         self._websocket = websocket
+        self._inbox = SessionInbox(websocket.receive_text, on_stop=self._interrupt_work)
         self._services = services
         self._session_id = session_id
         self._events = events
@@ -185,6 +200,37 @@ class AgentSession:
         self._secrets = {}
         self._task_id = ''
         self._recorder = None
+
+    async def _interrupt_work(self) -> None:
+        """
+        Cut short anything already running, so stopping does not mean waiting.
+
+        A command running in the sandbox has no cancellation of its own: the call
+        is blocked inside the container runtime. Removing the container ends it
+        outright, which is what requirement 8.4 asks for. The repository is a
+        bind mount, so nothing the agent has written is lost with it.
+        """
+        await self._services.docker.stop_sandbox()
+
+    async def _cancel(self) -> SessionState:
+        """
+        Stop because the user asked to.
+
+        Reached only between states or from the execution stream, so no tool call
+        is part way through and no commit is interrupted. Everything already
+        written stays: files on disk, commits, and the task branch.
+
+        :returns: The cancelled state.
+        """
+        logger.info('Cancelling session %s at the user request.', self._session_id)
+        if not self._machine.is_terminal:
+            self._machine.cancel()
+        await self._record_status(TaskStatus.cancelled)
+        await self._announce(
+            'Stopped at your request. Everything done so far has been kept.',
+            SessionStatus.cancelled,
+        )
+        return SessionState.cancelled
 
     async def _abandon(self) -> SessionState:
         """
@@ -228,15 +274,20 @@ class AgentSession:
         :returns: The terminal state the session ended in.
         """
         await self._receive_task()
+        self._inbox.start()
 
         while not self._machine.is_terminal:
             if self._connection_lost.is_set():
                 return await self._abandon()
+            if self._inbox.stop_requested:
+                return await self._cancel()
 
             try:
                 next_state: SessionState = await self._advance(self._machine.current)
             except ClientGone:
                 return await self._abandon()
+            except StopRequested:
+                return await self._cancel()
             except Exception:
                 # The machine has to record the failure itself. Letting the
                 # exception escape while the state still reads `executing` leaves
@@ -292,6 +343,9 @@ class AgentSession:
 
         self._coder_model = str(message.get('coder_model', DEFAULT_MODEL))
         self._reviewer_model = str(message.get('reviewer_model', DEFAULT_MODEL))
+        # Carried on the context because the adjudicating subagent runs inside a
+        # tool call, where the session is out of reach.
+        self._session.configure(self._task, self._reviewer_model)
         self._services.embedding.embedding_model = str(
             message.get('embedding_model', DEFAULT_EMBEDDING_MODEL)
         )
@@ -313,29 +367,48 @@ class AgentSession:
 
         self._history.add(TurnRole.user, self._task)
 
-    def _model_for(self, model_name: str) -> OpenAIChatModel | str:
-        """
-        Resolve a model name into something the agent can run.
-
-        :param model_name: The configured model identifier.
-        :returns: An Ollama-backed model, or the name itself for other providers.
-        """
-        if not model_name.startswith('ollama:'):
-            return model_name
-
-        base_url: str = os.getenv('OLLAMA_BASE_URL', 'http://ollama:11434')
-        return OpenAIChatModel(
-            model_name=model_name.split(':', 1)[1],
-            provider=OpenAIProvider(base_url=f'{base_url}/v1', api_key='ollama')
-        )
-
     async def _say(self, content: str) -> None:
         """
-        Send a thought to the client.
+        Relay a unit of the model's reasoning to the client.
 
-        :param content: The text to send.
+        Reserved for the model's own words. Anything Loom says about the session
+        goes through `_announce` instead, so the two remain distinguishable in
+        the feed.
+
+        :param content: The reasoning to send.
         """
         await self._events.emit(ThoughtEvent(content=content))
+
+    async def _announce(self, content: str, status: SessionStatus | None = None) -> None:
+        """
+        Tell the client something about the session itself.
+
+        This is Loom talking, not the model thinking, and it is labelled
+        accordingly. Where the announcement marks entry into a phase of work, the
+        phase is stated outright rather than left to be inferred from the wording.
+
+        :param content: The text to send.
+        :param status: The phase being entered, if this announcement marks one.
+        """
+        await self._events.emit(SystemEvent(content=content, status=status))
+
+    async def _report_sandbox_unusable(self, reason: str | None, stage: SandboxStage) -> None:
+        """
+        Tell the client the sandbox cannot be used, once per session.
+
+        Reported at most once: the early reachability check and a later failure
+        to start describe the same predicament, and the client should not have to
+        work out that two notices mean one problem. Availability is recorded on
+        the session context, which is also what the completion gate reads, so the
+        banner and the gate cannot disagree.
+
+        :param reason: Why the sandbox is unusable, or None if it is fine.
+        :param stage: Which step of preparing the sandbox failed.
+        """
+        if reason is None or not self._session.sandbox_available:
+            return
+        self._session.mark_sandbox_unavailable()
+        await self._events.emit(SandboxUnavailableEvent(stage=stage, reason=reason))
 
     async def _handle_initializing(self) -> SessionState:
         """
@@ -344,22 +417,37 @@ class AgentSession:
         :returns: The next state.
         """
         await self._start_recording()
-        await self._say('Indexing repository...')
+        await self._report_sandbox_unusable(
+            await self._services.docker.check_reachable(), SandboxStage.runtime_connectivity
+        )
+        await self._announce('Indexing repository...', SessionStatus.indexing)
 
         async def progress(current: int, total: int, message: str) -> None:
             """
             Report indexing progress to the client.
 
+            Every update carries the same slot key, so the client replaces one
+            message rather than accumulating one per file. The counts travel as
+            numbers so the client need not parse them back out of the text.
+
             :param current: Files processed so far.
             :param total: Total files to process.
             :param message: The file just processed.
             """
-            await self._say(f'Indexing [{current}/{total}]: {message}')
+            await self._events.emit(
+                SystemEvent(
+                    content=message,
+                    key=INDEXING_PROGRESS_KEY,
+                    processed=current,
+                    total=total,
+                )
+            )
 
         await self._services.indexing.index_repository(progress_callback=progress)
 
-        await self._say(
-            'Building sandbox image...' if self._dockerfile.strip() else 'Starting sandbox...'
+        await self._announce(
+            'Building sandbox image...' if self._dockerfile.strip() else 'Starting sandbox...',
+            SessionStatus.indexing,
         )
         try:
             await self._services.docker.spawn_sandbox(
@@ -367,14 +455,18 @@ class AgentSession:
             )
         except Exception as error:
             # Editing still works without a sandbox, but nothing can be verified,
-            # and the completion gate requires a passing verification.
-            await self._say(
-                f'Warning: the sandbox is unavailable ({error}). Files can still be '
-                'edited, but no command can be run to verify them.'
+            # and the completion gate requires a passing verification. Reported as
+            # a banner rather than a chat line, which would scroll away from a
+            # constraint that lasts the whole session.
+            stage: SandboxStage = (
+                error.stage
+                if isinstance(error, SandboxError)
+                else SandboxStage.container_start
             )
+            await self._report_sandbox_unusable(str(error), stage)
 
         if self._secrets:
-            await self._say(
+            await self._announce(
                 'The following secrets are available inside the sandbox as environment '
                 f'variables: {", ".join(sorted(self._secrets))}. Their values are hidden.'
             )
@@ -409,7 +501,7 @@ class AgentSession:
 
         :returns: The next state.
         """
-        await self._say(
+        await self._announce(
             f'No files were indexed in {self._services.git.repo_path}. The repository looks '
             'empty, or everything in it was excluded. Approve to continue anyway, or reject '
             'to stop and point Loom at a different repository.'
@@ -481,7 +573,7 @@ class AgentSession:
             )
             return SessionState.failed
 
-        await self._say('Generating plan...')
+        await self._announce('Generating plan...', SessionStatus.planning)
         self._history.advance_iteration()
 
         prompt: str = self._build_planning_prompt()
@@ -509,7 +601,7 @@ class AgentSession:
         :returns: The agent's output.
         """
         result: AgentRunResult[str] = await coder_agent.run(
-            prompt, deps=self._deps, model=self._model_for(self._coder_model)
+            prompt, deps=self._deps, model=resolve_model(self._coder_model)
         )
         return result.output
 
@@ -575,7 +667,7 @@ class AgentSession:
 
         :returns: The next state.
         """
-        await self._say('Executing plan...')
+        await self._announce('Executing plan...', SessionStatus.executing)
 
         prompt: str = (
             f'Task: {self._task}\n\n'
@@ -607,6 +699,11 @@ class AgentSession:
             :param stream: The events produced while the agent runs.
             """
             async for event in stream:
+                if self._inbox.stop_requested:
+                    # Checked per streamed event, which is what makes stopping
+                    # feel immediate rather than waiting out the current step.
+                    raise StopRequested()
+
                 if self._connection_lost.is_set():
                     # Checked here as well as between states: execution is the
                     # expensive phase, and waiting for it to finish would keep
@@ -623,7 +720,7 @@ class AgentSession:
         result: AgentRunResult[str] = await coder_agent.run(
             prompt,
             deps=self._deps,
-            model=self._model_for(self._coder_model),
+            model=resolve_model(self._coder_model),
             event_stream_handler=stream_thoughts,
         )
 
@@ -634,10 +731,17 @@ class AgentSession:
         output: str = result.output
         self._history.add(TurnRole.agent, output)
 
+        if self._session.completed_without_changes:
+            # Nothing was changed, and a subagent has confirmed the task never
+            # called for a change. There is no diff, so review would have nothing
+            # to judge and would reject the task for producing nothing.
+            await self._announce('The task needed no file changes. Presenting the answer.')
+            return SessionState.completed
+
         if not self._session.completion_requested:
             # Stopping without signalling completion usually means the agent lost
             # track of the loop rather than finished, so the reviewer decides.
-            await self._say(
+            await self._announce(
                 'The agent stopped without calling complete_task. '
                 'Reviewing whatever has changed so far.'
             )
@@ -650,7 +754,7 @@ class AgentSession:
 
         :returns: The next state.
         """
-        await self._say('Starting review...')
+        await self._announce('Starting review...', SessionStatus.reviewing)
 
         changes: list[FileChange] = await self._services.git.get_changed_files()
         if not changes:
@@ -679,7 +783,7 @@ class AgentSession:
             build_review_prompt(
                 self._task, changes, diffs, omitted=omitted, previous_feedback=previous
             ),
-            model=self._model_for(self._reviewer_model)
+            model=resolve_model(self._reviewer_model)
         )
         self._last_review = review.output
         return SessionState.waiting_review_approval
@@ -717,7 +821,7 @@ class AgentSession:
 
         :returns: The next state.
         """
-        await self._say('Reworking based on the feedback received.')
+        await self._announce('Reworking based on the feedback received.', SessionStatus.re_working)
         return SessionState.planning
 
     async def _handle_completed(self) -> SessionState:
@@ -755,7 +859,7 @@ class AgentSession:
 
         :returns: The next state.
         """
-        await self._say(f'Merging {self._branch_name}...')
+        await self._announce(f'Merging {self._branch_name}...', SessionStatus.merging)
 
         try:
             target: str = await self._services.git.merge_branch(self._branch_name)
@@ -812,9 +916,18 @@ class AgentSession:
         """
         Wait for the user's next instruction.
 
+        A stop unwinds rather than being returned. Every caller is waiting for an
+        answer to a question, and a stop answers none of them: returned as an
+        ordinary command it would resolve to a rejection and send the agent round
+        again, which is the opposite of what was asked.
+
         :returns: The parsed command.
+        :raises StopRequested: If the user asked to stop.
         """
-        return parse_command(await self._websocket.receive_text())
+        command: SessionCommand = await self._inbox.next_command()
+        if command.resolved_action is CommandAction.stop:
+            raise StopRequested()
+        return command
 
     async def _ask_how_to_proceed(
         self,
@@ -828,7 +941,7 @@ class AgentSession:
         :param retry_state: The state to return to if the user wants to keep going.
         :returns: The state to move to next.
         """
-        await self._say(
+        await self._announce(
             f'{situation} Reply with "continue" to keep going, "auto_approve" to accept the '
             'agent\'s work from here on, or "abort" to stop.'
         )
@@ -837,8 +950,9 @@ class AgentSession:
         action: CommandAction = command.resolved_action
 
         if action is CommandAction.abort:
-            await self._say('Stopping at your request.')
-            return SessionState.failed
+            # Recorded the same way as the stop button: both are the user
+            # deciding to stop, and history should not tell them apart.
+            raise StopRequested()
 
         if action is CommandAction.auto_approve:
             self._auto_approve = True

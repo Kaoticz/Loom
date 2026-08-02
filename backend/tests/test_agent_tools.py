@@ -10,6 +10,7 @@ from httpx import AsyncClient, MockTransport, Request, Response
 import agents.coder as coder_module
 from agents.coder import AgentDeps, coder_agent
 from database.models.file import File
+from database.models.symbol import Symbol
 from services.code_search import CodeSearchService
 from services.docker_sandbox import DockerSandboxManager
 from services.event_bus import (
@@ -52,6 +53,55 @@ async def invoke(tool_name: str, deps: AgentDeps, **kwargs: Any) -> str:
     context.deps = deps
     result: Any = await coder_agent._function_toolset.tools[tool_name].function(context, **kwargs)
     return str(result)
+
+
+class Adjudications:
+    """
+    A scripted stand-in for the adjudicating subagent.
+
+    Holds the verdicts to hand out in order and records the prompts it was
+    given, so a test can check the adjudicator was asked the right question as
+    well as what it answered.
+    """
+
+    verdicts: list[tuple[bool, str]]
+    prompts: list[str]
+    models: list[Any]
+
+    def __init__(self) -> None:
+        """
+        Create an adjudicator that has been asked nothing.
+        """
+        self.verdicts = []
+        self.prompts = []
+        self.models = []
+
+
+@pytest.fixture
+def adjudicator(monkeypatch: pytest.MonkeyPatch) -> Adjudications:
+    """
+    Replace the adjudicating subagent with a scripted stand-in.
+
+    :param monkeypatch: Fixture used to swap the agent out.
+    :returns: The recorder, whose verdicts a test appends to.
+    """
+    import agents.adjudicator as adjudicator_module
+    from agents.adjudicator import AdjudicationResult
+
+    scripted: Adjudications = Adjudications()
+
+    async def fake_run(prompt: str, **kwargs: Any) -> Any:
+        scripted.prompts.append(prompt)
+        scripted.models.append(kwargs.get('model'))
+        if not scripted.verdicts:
+            raise AssertionError('the adjudicator was consulted without a scripted verdict')
+        required, reason = scripted.verdicts.pop(0)
+        result: Any = MagicMock()
+        result.output = AdjudicationResult(changes_were_required=required, reason=reason)
+        return result
+
+    monkeypatch.setattr(adjudicator_module.adjudicator_agent, 'run', fake_run)
+    return scripted
 
 
 @pytest.fixture
@@ -135,10 +185,14 @@ async def test_edit_file_records_the_modification(deps: AgentDeps) -> None:
     assert 'return 2' in Path(deps.git.repo_path, 'm.py').read_text()
 
 
-async def test_complete_task_gate(deps: AgentDeps) -> None:
+async def test_complete_task_gate(deps: AgentDeps, adjudicator: Adjudications) -> None:
     """
     Completion is refused until a change has been made and verified green.
+
+    The first refusal now comes from the adjudicator rather than from counting
+    files: with nothing modified, whether that is a problem depends on the task.
     """
+    adjudicator.verdicts.append((True, 'The task asked for a new module.'))
     assert 'rejected' in (await invoke('complete_task', deps, summary='done')).lower()
 
     await invoke('create_file', deps, path='m.py', content='x\n')
@@ -318,11 +372,17 @@ def collect(events: EventBus) -> list[AgentEvent]:
 )
 @pytest.mark.usefixtures('sqlite_db')
 async def test_every_tool_self_reports(
-    deps: AgentDeps, events: EventBus, tool_name: str, kwargs: dict[str, Any]
+    deps: AgentDeps,
+    events: EventBus,
+    adjudicator: Adjudications,
+    tool_name: str,
+    kwargs: dict[str, Any],
 ) -> None:
     """
     Tools announce themselves through the bus rather than being parsed for.
     """
+    # `complete_task` with nothing modified consults the adjudicator.
+    adjudicator.verdicts.append((True, 'The task called for changes.'))
     seen: list[AgentEvent] = collect(events)
     await invoke(tool_name, deps, **kwargs)
 
@@ -523,3 +583,294 @@ async def test_missing_sandbox_tells_the_agent_not_to_retry(deps: AgentDeps) -> 
     assert 'sandbox is not available' in result
     assert 'Do not retry' in result
     assert 'could not be verified' in result
+
+
+async def test_a_task_needing_no_changes_completes(
+    deps: AgentDeps, adjudicator: Adjudications
+) -> None:
+    """
+    A task that only ever called for an answer is allowed to finish.
+
+    Requirement 10.1 and 10.5: refusing here is the defect, since summarising or
+    explaining changes nothing by nature.
+    """
+    deps.session.configure('Summarise how the session state machine works.', 'reviewer')
+    adjudicator.verdicts.append((False, 'The task asked for an explanation, not a change.'))
+
+    result: str = await invoke('complete_task', deps, summary='It is a finite state machine.')
+
+    assert 'complete' in result.lower()
+    assert deps.session.completion_requested is True
+    assert deps.session.completed_without_changes is True
+
+
+async def test_a_task_needing_changes_is_still_refused(
+    deps: AgentDeps, adjudicator: Adjudications
+) -> None:
+    """
+    Requirement 10.6: the existing refusal stands where it should.
+    """
+    deps.session.configure('Add a health endpoint.', 'reviewer')
+    adjudicator.verdicts.append((True, 'The task asked for a new endpoint, which needs code.'))
+
+    result: str = await invoke('complete_task', deps, summary='Looks fine to me.')
+
+    assert 'rejected' in result.lower()
+    assert 'new endpoint' in result
+    assert deps.session.completion_requested is False
+    assert deps.session.completed_without_changes is False
+
+
+async def test_the_adjudicator_is_asked_about_the_task_and_the_summary(
+    deps: AgentDeps, adjudicator: Adjudications
+) -> None:
+    """
+    Requirement 10.2: it receives the task description and the proposed summary.
+    """
+    deps.session.configure('Explain the retry policy.', 'reviewer')
+    adjudicator.verdicts.append((False, 'Explaining changes nothing.'))
+
+    await invoke('complete_task', deps, summary='It retries three times.')
+
+    assert 'Explain the retry policy.' in adjudicator.prompts[0]
+    assert 'It retries three times.' in adjudicator.prompts[0]
+
+
+async def test_the_adjudicator_runs_on_the_reviewer_model(
+    deps: AgentDeps, adjudicator: Adjudications
+) -> None:
+    """
+    Requirement 10.3: judging the work is the reviewer's business, not the coder's.
+    """
+    deps.session.configure('Explain something.', 'some-reviewer-model')
+    adjudicator.verdicts.append((False, 'Nothing to change.'))
+
+    await invoke('complete_task', deps, summary='Explained.')
+
+    assert adjudicator.models[0] == 'some-reviewer-model'
+
+
+async def test_the_adjudicator_is_not_consulted_once_files_have_changed(
+    deps: AgentDeps, adjudicator: Adjudications
+) -> None:
+    """
+    Requirement 10.8: with changes present, the existing path is untouched.
+    """
+    await invoke('create_file', deps, path='m.py', content='x\n')
+    deps.session.record_verification(True)
+
+    result: str = await invoke('complete_task', deps, summary='Added m.py.')
+
+    assert 'Task marked complete' in result
+    assert adjudicator.prompts == [], 'the adjudicator should not have been asked'
+    assert deps.session.completed_without_changes is False
+
+
+async def test_an_unreachable_adjudicator_fails_rather_than_guessing(
+    deps: AgentDeps, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """
+    Requirements 10.9 and 10.10: the error escapes the tool.
+
+    Swallowing it would either let a task finish that should not have, or send
+    the agent round a loop it cannot escape. Escaping reaches the state machine's
+    own failure handling, which fails the session.
+    """
+    import agents.adjudicator as adjudicator_module
+
+    async def unreachable(prompt: str, **kwargs: Any) -> Any:
+        raise ConnectionError('the reviewer model is unreachable')
+
+    monkeypatch.setattr(adjudicator_module.adjudicator_agent, 'run', unreachable)
+    deps.session.configure('Explain something.', 'reviewer')
+
+    with pytest.raises(ConnectionError):
+        await invoke('complete_task', deps, summary='Explained.')
+
+    assert deps.session.completion_requested is False
+
+
+async def test_a_failing_adjudicator_still_reports_the_tool_failure(
+    deps: AgentDeps, events: EventBus, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """
+    Requirement 10.10: the user still sees which tool failed on the way out.
+    """
+    import agents.adjudicator as adjudicator_module
+
+    async def unreachable(prompt: str, **kwargs: Any) -> Any:
+        raise ConnectionError('the reviewer model is unreachable')
+
+    monkeypatch.setattr(adjudicator_module.adjudicator_agent, 'run', unreachable)
+    seen: list[AgentEvent] = collect(events)
+
+    with pytest.raises(ConnectionError):
+        await invoke('complete_task', deps, summary='Explained.')
+
+    failures = [
+        event
+        for event in seen
+        if isinstance(event, ToolObservationEvent) and event.status is ToolStatus.failure
+    ]
+    assert [event.tool_name for event in failures] == ['complete_task']
+
+
+async def test_an_empty_answer_is_refused_even_when_no_changes_were_needed(
+    deps: AgentDeps, adjudicator: Adjudications
+) -> None:
+    """
+    A task that produced no answer has not been completed, whatever the verdict.
+    """
+    deps.session.configure('Explain something.', 'reviewer')
+    adjudicator.verdicts.append((False, 'Nothing to change.'))
+
+    with pytest.raises(ValueError):
+        await invoke('complete_task', deps, summary='   ')
+
+
+async def test_a_file_read_is_reported_as_one_line(
+    deps: AgentDeps, events: EventBus, git_repo: GitManagerService
+) -> None:
+    """
+    Requirement 13.1: the observation names the file rather than repeating it.
+    """
+    Path(git_repo.repo_path, 'big.py').write_text(
+        '\n'.join(f'secret line {index}' for index in range(300)) + '\n'
+    )
+    seen: list[AgentEvent] = collect(events)
+
+    await invoke('read_file', deps, path='big.py')
+
+    observations = [event for event in seen if isinstance(event, ToolObservationEvent)]
+    assert len(observations) == 1
+    assert observations[0].result == 'Read big.py (300 lines).'
+    assert 'secret line' not in observations[0].result
+
+
+async def test_the_agent_still_receives_the_file(
+    deps: AgentDeps, git_repo: GitManagerService
+) -> None:
+    """
+    Requirement 13.2: shortening the observation must not shorten the tool.
+
+    Handing the agent a one-line confirmation instead of the file would make the
+    tool useless while looking, from the outside, exactly the same.
+    """
+    Path(git_repo.repo_path, 'a.py').write_text('first\nsecond\nthird\n')
+
+    returned: str = await invoke('read_file', deps, path='a.py')
+
+    assert 'first' in returned
+    assert 'second' in returned
+    assert 'third' in returned
+
+
+async def test_a_partial_read_reports_its_range(
+    deps: AgentDeps, events: EventBus, git_repo: GitManagerService
+) -> None:
+    """
+    Reading part of a file is a different act from reading all of it.
+    """
+    Path(git_repo.repo_path, 'a.py').write_text('one\ntwo\nthree\nfour\n')
+    seen: list[AgentEvent] = collect(events)
+
+    await invoke('read_file', deps, path='a.py', start_line=2, end_line=3)
+
+    observations = [event for event in seen if isinstance(event, ToolObservationEvent)]
+    assert 'lines 2 to 3' in observations[0].result
+
+
+async def test_a_failed_read_still_says_why(deps: AgentDeps, events: EventBus) -> None:
+    """
+    Requirement 13.3: a failure reports the reason, not a bare confirmation.
+    """
+    seen: list[AgentEvent] = collect(events)
+
+    await invoke('read_file', deps, path='nowhere.py')
+
+    observations = [event for event in seen if isinstance(event, ToolObservationEvent)]
+    assert observations[0].status is ToolStatus.failure
+    assert 'does not exist' in observations[0].result
+
+
+@pytest.mark.usefixtures('sqlite_db')
+async def test_get_symbol_returns_the_definition_itself(deps: AgentDeps) -> None:
+    """
+    The agent asks for a definition and must receive one.
+
+    This previously returned `str(results)` on a list of database rows, which
+    renders as their default representation, so the agent learned the primary
+    keys and nothing else. The tool advertised something it did not do, and
+    failed silently: the agent would simply find it useless.
+    """
+    file_obj = await File.create(
+        file_path='repo/users.py',
+        raw_content='import os\n\n\ndef find_user(name):\n    return name\n',
+        hash='h',
+    )
+    await Symbol.create(
+        file=file_obj, symbol_name='find_user', kind='function', line_start=4, line_end=5
+    )
+
+    returned: str = await invoke('get_symbol', deps, symbol='find_user')
+
+    assert 'def find_user(name):' in returned
+    assert 'return name' in returned
+    assert 'repo/users.py:4-5' in returned
+    # The shape of the old defect: an object repr rather than source.
+    assert '<Symbol' not in returned
+    assert 'object at 0x' not in returned
+
+
+@pytest.mark.usefixtures('sqlite_db')
+async def test_get_symbol_reports_every_declaration(deps: AgentDeps) -> None:
+    """
+    A name declared twice is worth seeing twice, not resolved arbitrarily.
+    """
+    for path in ('repo/a.py', 'repo/b.py'):
+        file_obj = await File.create(
+            file_path=path, raw_content='def handler():\n    pass\n', hash='h'
+        )
+        await Symbol.create(
+            file=file_obj, symbol_name='handler', kind='function', line_start=1, line_end=2
+        )
+
+    returned: str = await invoke('get_symbol', deps, symbol='handler')
+
+    assert 'repo/a.py:1-2' in returned
+    assert 'repo/b.py:1-2' in returned
+
+
+@pytest.mark.usefixtures('sqlite_db')
+async def test_get_symbol_says_plainly_when_nothing_is_indexed(deps: AgentDeps) -> None:
+    """
+    An empty result must read as an answer, not as a malfunction.
+    """
+    returned: str = await invoke('get_symbol', deps, symbol='nowhere')
+
+    assert 'No definition' in returned
+    assert 'nowhere' in returned
+
+
+@pytest.mark.usefixtures('sqlite_db')
+async def test_get_symbol_reports_a_count_rather_than_the_source(
+    deps: AgentDeps, events: EventBus
+) -> None:
+    """
+    The definitions are for the agent; the reader wants to know it was found.
+    """
+    file_obj = await File.create(
+        file_path='repo/users.py',
+        raw_content='def find_user(name):\n    return name\n',
+        hash='h',
+    )
+    await Symbol.create(
+        file=file_obj, symbol_name='find_user', kind='function', line_start=1, line_end=2
+    )
+    seen: list[AgentEvent] = collect(events)
+
+    await invoke('get_symbol', deps, symbol='find_user')
+
+    observations = [event for event in seen if isinstance(event, ToolObservationEvent)]
+    assert observations[0].result == 'Found the definition of find_user.'
+    assert 'def find_user' not in observations[0].result

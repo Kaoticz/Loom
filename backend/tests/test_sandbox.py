@@ -1,16 +1,22 @@
 from __future__ import annotations
 
+import socket
+from pathlib import Path
 from typing import Any
 from unittest.mock import MagicMock
 
 import pytest
+from docker.errors import NotFound
 
+from services.event_bus import SandboxStage
 from services.docker_sandbox import (
     DEFAULT_SANDBOX_IMAGE,
     TIMEOUT_EXIT_CODE,
     CommandResult,
     DockerSandboxManager,
     SandboxError,
+    host_path_within,
+    mount_covering,
 )
 
 
@@ -54,10 +60,45 @@ def attach_fake_container(
     container: Any = MagicMock()
     container.exec_run = exec_run
     client: Any = MagicMock()
-    client.containers.get.return_value = container
+
+    def get(name: str) -> Any:
+        """
+        Look up a container by name.
+
+        Asking for this process's own hostname raises `NotFound`, which is how
+        the manager detects that it is not itself containerised. Tests that want
+        the containerised path use `attach_own_container`.
+        """
+        if name == socket.gethostname():
+            raise NotFound('no such container')
+        return container
+
+    client.containers.get.side_effect = get
     client.containers.run.return_value = container
     manager._client = client
     return captured, client
+
+
+def attach_own_container(
+    manager: DockerSandboxManager, client: Any, mounts: list[dict[str, str]]
+) -> None:
+    """
+    Make the manager appear to be running inside a container with given mounts.
+
+    :param manager: The sandbox manager being tested.
+    :param client: The fake Docker client already attached to it.
+    :param mounts: Mount records as the container runtime would report them.
+    """
+    own: Any = MagicMock()
+    own.attrs = {'Mounts': mounts}
+    sandbox_container: Any = client.containers.run.return_value
+
+    def get(name: str) -> Any:
+        if name == socket.gethostname():
+            return own
+        return sandbox_container
+
+    client.containers.get.side_effect = get
 
 
 async def test_container_name_is_per_session(sandbox: DockerSandboxManager) -> None:
@@ -301,63 +342,98 @@ async def test_teardown_closes_the_docker_client(sandbox: DockerSandboxManager) 
     assert sandbox._client is None
 
 
-def test_host_path_is_used_when_containerised() -> None:
+def test_a_path_outside_any_mount_is_refused() -> None:
     """
-    The sandbox is mounted from the host's path, not this process's view of it.
+    A repository the host cannot see is reported rather than mounted wrongly.
 
-    Bind mount sources are resolved by the daemon on the host, so mounting
-    `/tmp/repo` from inside a container mounts the host's `/tmp/repo` rather
-    than the project, and the sandbox operates on the wrong tree.
+    Requirement 7.5 and 7.6: the message names the container path and what is
+    actually mounted, so the reader can see why discovery failed.
     """
-    manager: DockerSandboxManager = DockerSandboxManager(
-        repo_path='/tmp/repo', host_repo_root='/srv/loom/data/repo'
+    manager: DockerSandboxManager = DockerSandboxManager(repo_path='/home/user/elsewhere')
+    _, client = attach_fake_container(manager)
+    attach_own_container(
+        manager, client, [{'Source': '/srv/loom/data/repo', 'Destination': '/tmp/repo'}]
     )
+
+    with pytest.raises(SandboxError) as raised:
+        manager.host_mount_source()
+
+    assert raised.value.stage is SandboxStage.path_discovery
+    assert '/home/user/elsewhere' in str(raised.value)
+    assert '/tmp/repo' in str(raised.value)
+
+
+def test_a_relative_mount_source_is_refused() -> None:
+    """
+    A relative source would become a named volume, leaving the sandbox empty.
+    """
+    manager: DockerSandboxManager = DockerSandboxManager(repo_path='/tmp/repo')
+    _, client = attach_fake_container(manager)
+    attach_own_container(manager, client, [{'Source': 'data/repo', 'Destination': '/tmp/repo'}])
+
+    with pytest.raises(SandboxError) as raised:
+        manager.host_mount_source()
+
+    assert raised.value.stage is SandboxStage.path_discovery
+    assert 'not' in str(raised.value) and 'absolute' in str(raised.value)
+
+
+def test_the_host_path_is_discovered_from_this_container() -> None:
+    """
+    The host path comes from inspecting our own mounts, not from configuration.
+
+    Requirement 7.2.
+    """
+    manager: DockerSandboxManager = DockerSandboxManager(repo_path='/tmp/repo')
+    _, client = attach_fake_container(manager)
+    attach_own_container(
+        manager, client, [{'Source': '/srv/loom/data/repo', 'Destination': '/tmp/repo'}]
+    )
+
     assert manager.host_mount_source() == '/srv/loom/data/repo'
 
 
-def test_subdirectories_are_translated() -> None:
+def test_a_subdirectory_is_translated() -> None:
     """
-    A repository beneath the mount root maps onto the matching host path.
+    A repository beneath the mount maps onto the matching host path.
     """
-    manager: DockerSandboxManager = DockerSandboxManager(
-        repo_path='/tmp/repo', host_repo_root='/srv/loom/data/repo'
+    manager: DockerSandboxManager = DockerSandboxManager(repo_path='/tmp/repo/project-a')
+    _, client = attach_fake_container(manager)
+    attach_own_container(
+        manager, client, [{'Source': '/srv/loom/data/repo', 'Destination': '/tmp/repo'}]
     )
-    manager.repo_path = '/tmp/repo/project-a'
 
     assert manager.host_mount_source() == '/srv/loom/data/repo/project-a'
 
 
-def test_path_outside_the_mount_is_refused() -> None:
+def test_outside_a_container_no_translation_happens() -> None:
     """
-    A repository the container cannot see is reported rather than mounted wrongly.
-    """
-    manager: DockerSandboxManager = DockerSandboxManager(
-        repo_path='/tmp/repo', host_repo_root='/srv/loom/data/repo'
-    )
-    manager.repo_path = '/home/user/elsewhere'
+    Running outside a container needs no translation, and detects that itself.
 
-    with pytest.raises(SandboxError, match='only directory mounted'):
-        manager.host_mount_source()
-
-
-def test_relative_host_path_is_refused() -> None:
-    """
-    A relative source would become a named volume, leaving the sandbox empty.
-    """
-    manager: DockerSandboxManager = DockerSandboxManager(
-        repo_path='/tmp/repo', host_repo_root='data/repo'
-    )
-
-    with pytest.raises(SandboxError, match='absolute path'):
-        manager.host_mount_source()
-
-
-def test_without_a_host_root_the_local_path_is_used() -> None:
-    """
-    Running outside a container needs no translation.
+    Requirement 7.4: detected, not configured. The runtime reports no container
+    matching our hostname, and that answer is the detection.
     """
     manager: DockerSandboxManager = DockerSandboxManager(repo_path='/srv/project')
+    attach_fake_container(manager)
+
     assert manager.host_mount_source() == '/srv/project'
+
+
+def test_an_unreachable_runtime_is_named_as_such() -> None:
+    """
+    Failing to reach the runtime is a different failure from failing to translate.
+
+    Requirement 7.7.
+    """
+    manager: DockerSandboxManager = DockerSandboxManager(repo_path='/srv/project')
+    client: Any = MagicMock()
+    client.containers.get.side_effect = RuntimeError('daemon is not listening')
+    manager._client = client
+
+    with pytest.raises(SandboxError) as raised:
+        manager.host_mount_source()
+
+    assert raised.value.stage is SandboxStage.runtime_connectivity
 
 
 async def test_spawn_mounts_the_host_path(sandbox: DockerSandboxManager) -> None:
@@ -365,11 +441,171 @@ async def test_spawn_mounts_the_host_path(sandbox: DockerSandboxManager) -> None
     The resolved host path is what actually reaches the container runtime.
     """
     _, client = attach_fake_container(sandbox)
-    sandbox._host_repo_root = '/srv/loom/data/repo'
-    sandbox._container_repo_root = sandbox.repo_path
+    attach_own_container(
+        sandbox, client, [{'Source': '/srv/loom/data/repo', 'Destination': sandbox.repo_path}]
+    )
 
     await sandbox.spawn_sandbox('abc123')
 
     volumes = client.containers.run.call_args.kwargs['volumes']
     assert list(volumes) == ['/srv/loom/data/repo']
     assert volumes['/srv/loom/data/repo']['bind'] == '/workspace'
+
+
+def test_mount_covering_picks_the_most_specific_mount() -> None:
+    """
+    Nested mounts resolve to the innermost one that covers the path.
+
+    Translating through the outer mount would produce a host path pointing at a
+    different directory that happens to have the same name.
+    """
+    mounts: list[dict[str, str]] = [
+        {'Source': '/host/data', 'Destination': '/data'},
+        {'Source': '/host/elsewhere/repo', 'Destination': '/data/repo'},
+    ]
+
+    assert mount_covering(mounts, '/data/repo/src') == ('/host/elsewhere/repo', '/data/repo')
+
+
+def test_mount_covering_matches_the_mount_point_itself() -> None:
+    """
+    The mount point counts as covered by its own mount.
+    """
+    mounts: list[dict[str, str]] = [{'Source': '/host/repo', 'Destination': '/data/repo'}]
+
+    assert mount_covering(mounts, '/data/repo') == ('/host/repo', '/data/repo')
+
+
+def test_mount_covering_does_not_match_a_sibling_by_prefix() -> None:
+    """
+    `/data/repository` is not inside `/data/repo`, despite sharing a prefix.
+    """
+    mounts: list[dict[str, str]] = [{'Source': '/host/repo', 'Destination': '/data/repo'}]
+
+    assert mount_covering(mounts, '/data/repository') is None
+
+
+def test_mount_covering_tolerates_a_trailing_slash() -> None:
+    """
+    Runtimes differ on whether a destination carries a trailing slash.
+    """
+    mounts: list[dict[str, str]] = [{'Source': '/host/repo', 'Destination': '/data/repo/'}]
+
+    assert mount_covering(mounts, '/data/repo/src') == ('/host/repo', '/data/repo/')
+
+
+def test_mount_covering_ignores_incomplete_records() -> None:
+    """
+    A mount with no source cannot be translated through.
+    """
+    mounts: list[dict[str, str]] = [
+        {'Destination': '/data/repo'},
+        {'Source': '', 'Destination': '/data'},
+    ]
+
+    assert mount_covering(mounts, '/data/repo/src') is None
+
+
+def test_mount_covering_returns_nothing_for_an_empty_list() -> None:
+    """
+    A container with no mounts covers nothing.
+    """
+    assert mount_covering([], '/data/repo') is None
+
+
+def test_host_path_within_returns_the_source_for_the_mount_point() -> None:
+    """
+    The mount point maps to the source itself, with nothing appended.
+    """
+    assert host_path_within('/host/repo', '/data/repo', '/data/repo') == '/host/repo'
+
+
+def test_host_path_within_appends_the_relative_remainder() -> None:
+    """
+    A path beneath the mount keeps its position relative to the source.
+    """
+    assert (
+        host_path_within('/host/repo', '/data/repo', '/data/repo/src/app.py')
+        == '/host/repo/src/app.py'
+    )
+
+
+async def test_an_undownloadable_image_is_named_as_a_pull_failure(
+    sandbox: DockerSandboxManager,
+) -> None:
+    """
+    A missing image that cannot be fetched reads as a download failure.
+
+    Requirement 7.7. Letting `run` pull implicitly would surface this as a
+    container that would not start, sending the reader to the wrong problem.
+    """
+    _, client = attach_fake_container(sandbox)
+    client.images.get.side_effect = NotFound('absent')
+    client.images.pull.side_effect = RuntimeError('registry unreachable')
+
+    with pytest.raises(SandboxError) as raised:
+        await sandbox.spawn_sandbox('abc123')
+
+    assert raised.value.stage is SandboxStage.image_pull
+    assert 'registry unreachable' in str(raised.value)
+
+
+async def test_a_container_that_will_not_start_is_named_as_such(
+    sandbox: DockerSandboxManager,
+) -> None:
+    """
+    A failure to start is distinct from a failure to download.
+    """
+    _, client = attach_fake_container(sandbox)
+    client.containers.run.side_effect = RuntimeError('no such device')
+
+    with pytest.raises(SandboxError) as raised:
+        await sandbox.spawn_sandbox('abc123')
+
+    assert raised.value.stage is SandboxStage.container_start
+
+
+async def test_a_path_failure_is_not_relabelled_as_a_start_failure(
+    sandbox: DockerSandboxManager,
+) -> None:
+    """
+    Path discovery keeps its own stage through the spawn path.
+
+    The mount source is resolved before the container is attempted precisely so
+    that its staged error is not swallowed by the start failure handler.
+    """
+    _, client = attach_fake_container(sandbox)
+    attach_own_container(
+        sandbox, client, [{'Source': '/srv/elsewhere', 'Destination': '/not/the/repo'}]
+    )
+
+    with pytest.raises(SandboxError) as raised:
+        await sandbox.spawn_sandbox('abc123')
+
+    assert raised.value.stage is SandboxStage.path_discovery
+
+
+async def test_a_present_image_is_not_pulled(sandbox: DockerSandboxManager) -> None:
+    """
+    An image already present locally is used without contacting a registry.
+    """
+    _, client = attach_fake_container(sandbox)
+
+    await sandbox.spawn_sandbox('abc123')
+
+    client.images.pull.assert_not_called()
+
+
+def test_every_stage_can_actually_occur() -> None:
+    """
+    No stage is defined that nothing produces.
+
+    A stage with no producer is worse than a missing one: it suggests the cause
+    is distinguishable when in practice it is reported as something else.
+    """
+    source: str = Path(__file__).resolve().parent.parent.joinpath(
+        'services', 'docker_sandbox.py'
+    ).read_text()
+
+    for stage in SandboxStage:
+        assert f'SandboxStage.{stage.name}' in source, f'nothing raises {stage.name}'

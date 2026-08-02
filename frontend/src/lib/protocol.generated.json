@@ -1,0 +1,65 @@
+{
+    "_comment": "Generated from the backend enums by scripts/export_protocol.py. Do not edit by hand; run the script and commit the result.",
+    "message_type": [
+        "thought",
+        "plan",
+        "action",
+        "observation",
+        "commit",
+        "diff",
+        "review",
+        "done",
+        "error",
+        "session_busy",
+        "system",
+        "sandbox_unavailable"
+    ],
+    "session_status": [
+        "indexing",
+        "planning",
+        "executing",
+        "reviewing",
+        "re_working",
+        "merging",
+        "cancelled"
+    ],
+    "sandbox_stage": [
+        "runtime_connectivity",
+        "path_discovery",
+        "image_build",
+        "image_pull",
+        "container_start",
+        "readiness_probe"
+    ],
+    "tool_status": [
+        "running",
+        "success",
+        "failure"
+    ],
+    "task_status": [
+        "initialized",
+        "running",
+        "cancelled",
+        "completed",
+        "merged",
+        "failed"
+    ],
+    "task_log_entry_type": [
+        "tool_call",
+        "commit",
+        "review",
+        "plan",
+        "rejection",
+        "status_change",
+        "summary"
+    ],
+    "command_action": [
+        "approve",
+        "reject",
+        "merge",
+        "abort",
+        "stop",
+        "continue",
+        "auto_approve"
+    ]
+}

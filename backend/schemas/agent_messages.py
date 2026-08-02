@@ -13,6 +13,10 @@ from services.event_bus import (
     ErrorEvent,
     PlanEvent,
     ReviewEvent,
+    SandboxStage,
+    SandboxUnavailableEvent,
+    SessionStatus,
+    SystemEvent,
     ThoughtEvent,
     ToolActionEvent,
     ToolObservationEvent,
@@ -75,6 +79,8 @@ class MessageType(str, Enum):
     done = 'done'
     error = 'error'
     session_busy = 'session_busy'
+    system = 'system'
+    sandbox_unavailable = 'sandbox_unavailable'
 
 
 class BaseAgentMessage(BaseModel):
@@ -91,10 +97,15 @@ class BaseAgentMessage(BaseModel):
 class ThoughtMessage(BaseAgentMessage):
     """
     A unit of the agent's reasoning, ready to display in the chat feed.
+
+    Units sharing a `stream_id` belong to one continuous run of reasoning and are
+    joined into a single growing message by the client, so that streamed
+    reasoning does not arrive as one bubble per sentence.
     """
 
     type: Annotated[Literal[MessageType.thought], Field()] = MessageType.thought
     content: Annotated[str, Field()]
+    stream_id: Annotated[str | None, Field(description='The run of reasoning this unit continues, or None if it stands alone.')] = None
 
 
 class PlanMessage(BaseAgentMessage):
@@ -195,6 +206,39 @@ class SessionBusyMessage(BaseAgentMessage):
     active_session_id: Annotated[str, Field(description='The session currently holding the slot.')] = ''
 
 
+class SystemMessage(BaseAgentMessage):
+    """
+    A statement by Loom about the session, rather than the model's reasoning.
+
+    When `key` is set, the client replaces the message already occupying that
+    slot instead of appending a new one, which is how a long running activity
+    reports progress without filling the feed. `processed` and `total` let the
+    client render a counter directly rather than parsing it back out of `content`.
+    """
+
+    type: Annotated[Literal[MessageType.system], Field()] = MessageType.system
+    content: Annotated[str, Field()]
+    key: Annotated[str | None, Field(description='The feed slot to replace, or None to append a new message.')] = None
+    status: Annotated[SessionStatus | None, Field(description='The phase the session has entered, when this message announces one.')] = None
+    processed: Annotated[int | None, Field(ge=0, description='Units of work finished, when this message reports progress.')] = None
+    total: Annotated[int | None, Field(ge=0, description='Units of work expected, when this message reports progress.')] = None
+
+
+class SandboxUnavailableMessage(BaseAgentMessage):
+    """
+    Notice that the sandbox is unusable for the rest of the session.
+
+    Shown as a banner rather than added to the chat feed, so it stays visible
+    while the constraint holds instead of scrolling away.
+    """
+
+    type: Annotated[Literal[MessageType.sandbox_unavailable], Field()] = (
+        MessageType.sandbox_unavailable
+    )
+    stage: Annotated[SandboxStage, Field(description='Which step of preparing the sandbox failed.')]
+    reason: Annotated[str, Field(description='Why the sandbox could not be used.')]
+
+
 AgentMessage = Annotated[
     ThoughtMessage
     | PlanMessage
@@ -205,7 +249,9 @@ AgentMessage = Annotated[
     | ReviewMessage
     | DoneMessage
     | ErrorMessage
-    | SessionBusyMessage,
+    | SessionBusyMessage
+    | SystemMessage
+    | SandboxUnavailableMessage,
     Field(discriminator='type'),
 ]
 
@@ -223,7 +269,7 @@ def to_message(event: BaseAgentEvent) -> AgentMessage:
     :raises TypeError: If the event has no corresponding message type.
     """
     if isinstance(event, ThoughtEvent):
-        return ThoughtMessage(content=event.content)
+        return ThoughtMessage(content=event.content, stream_id=event.stream_id)
     if isinstance(event, PlanEvent):
         return PlanMessage(steps=list(event.steps), requires_approval=event.requires_approval)
     if isinstance(event, ToolActionEvent):
@@ -265,5 +311,15 @@ def to_message(event: BaseAgentEvent) -> AgentMessage:
         )
     if isinstance(event, ErrorEvent):
         return ErrorMessage(content=event.content)
+    if isinstance(event, SandboxUnavailableEvent):
+        return SandboxUnavailableMessage(stage=event.stage, reason=event.reason)
+    if isinstance(event, SystemEvent):
+        return SystemMessage(
+            content=event.content,
+            key=event.key,
+            status=event.status,
+            processed=event.processed,
+            total=event.total,
+        )
 
     raise TypeError(f'No WebSocket message is defined for {type(event).__name__}.')

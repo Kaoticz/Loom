@@ -85,11 +85,6 @@ services:
       - path: ./backend/.env
         required: false
     environment:
-      # Bind mount sources are resolved by the container runtime on the host, so
-      # the sandbox needs the host's path for the repository, not this
-      # container's. Must be absolute: a relative path is silently treated as a
-      # named volume and the sandbox would start with an empty tree.
-      - HOST_REPO_PATH=${HOST_REPO_PATH:-${PWD}/data/repo}
       - DATABASE_URL=postgres://loom:loom_password@postgres:5432/loom
       - OLLAMA_BASE_URL=http://ollama:11434
       - SEARXNG_URL=http://searxng:8080

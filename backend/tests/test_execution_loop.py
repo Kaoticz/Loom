@@ -10,8 +10,9 @@ from collections.abc import AsyncIterator
 from pydantic_ai.messages import ModelMessage, ModelResponse, TextPart, ToolCallPart
 from pydantic_ai.models.function import AgentInfo, DeltaToolCall, FunctionModel
 
+import api.v1.agent_session as agent_session_module
 from api.v1.agent_session import AgentSession
-from services.event_bus import AgentEvent, ThoughtEvent, ToolActionEvent
+from services.event_bus import AgentEvent, SystemEvent, ThoughtEvent, ToolActionEvent
 from services.git_manager import GitManagerService
 from services.session_fsm import SessionState
 from tests.test_agent_session import FakeGit, build_session, opening
@@ -65,7 +66,9 @@ def install_model(
     :param responses: The responses the model should return in order.
     """
     model: FunctionModel = scripted_model(responses)
-    monkeypatch.setattr(AgentSession, '_model_for', lambda self, name: model)
+    # The resolver is a module level function now, so it is patched where the
+    # session looks it up rather than on the class.
+    monkeypatch.setattr(agent_session_module, 'resolve_model', lambda name: model)
 
 
 def prepare(
@@ -243,7 +246,109 @@ async def test_agent_that_never_completes_is_still_reviewed(
     state, events = await run_execution(monkeypatch, responses, git_repo)
 
     assert state is SessionState.reviewing
-    thoughts: str = ' '.join(
-        event.content for event in events if isinstance(event, ThoughtEvent)
+    announced: str = ' '.join(
+        event.content for event in events if isinstance(event, SystemEvent)
     )
-    assert 'without calling complete_task' in thoughts
+    assert 'without calling complete_task' in announced
+
+
+async def test_executing_phase_is_announced_with_its_status(
+    monkeypatch: pytest.MonkeyPatch, git_repo: GitManagerService
+) -> None:
+    """
+    Entering execution is announced as a system message stating the phase.
+
+    Requirement 3.1: the announcement is `SYSTEM`, and it names the phase rather
+    than leaving the client to recognise the wording.
+    """
+    from services.event_bus import SessionStatus
+
+    responses: list[ModelResponse] = [
+        ModelResponse(parts=[TextPart(content='All done.')]),
+    ]
+
+    _, events = await run_execution(monkeypatch, responses, git_repo)
+
+    executing = [
+        event
+        for event in events
+        if isinstance(event, SystemEvent) and event.status is SessionStatus.executing
+    ]
+    assert executing, 'entering execution was not announced with its status'
+    assert 'Executing plan' in executing[0].content
+
+
+async def test_a_stop_during_streaming_unwinds_immediately(
+    monkeypatch: pytest.MonkeyPatch, git_repo: GitManagerService
+) -> None:
+    """
+    A stop is honoured per streamed event, not after the step completes.
+
+    Isolates the check inside the stream handler. Requirement 8.4 calls for this
+    to be effectively immediate; without it a stop would wait out the whole
+    execution step, which is the longest thing the session does.
+    """
+    from api.v1.agent_session import StopRequested
+
+    class AlreadyStopped:
+        """An inbox reporting a stop that arrived before streaming began."""
+
+        stop_requested: bool = True
+
+        def start(self) -> None:
+            """Begin reading, which this stub need not do."""
+
+        async def next_command(self) -> Any:
+            """Never asked, because the stream unwinds first."""
+            raise AssertionError('the stream should have unwound before asking')
+
+        async def close(self) -> None:
+            """Release nothing."""
+
+    responses: list[ModelResponse] = [
+        ModelResponse(parts=[TextPart(content='Thinking about it.')]),
+    ]
+    session, _ = prepare(monkeypatch, responses, git_repo)
+    session._inbox = AlreadyStopped()  # type: ignore[assignment]
+
+    with pytest.raises(StopRequested):
+        await session._handle_executing()
+
+
+async def test_a_task_needing_no_changes_skips_review(
+    monkeypatch: pytest.MonkeyPatch, git_repo: GitManagerService
+) -> None:
+    """
+    With nothing changed and nothing to review, the session goes straight on.
+
+    Requirement 10.5 and 10.7: review would have no diff to judge, and the
+    reviewing state would reject the task for having produced nothing.
+    """
+    responses: list[ModelResponse] = [
+        ModelResponse(parts=[TextPart(content='Nothing needed changing.')]),
+    ]
+    session, events = prepare(monkeypatch, responses, git_repo)
+    session._session.accept_completion_without_changes('The retry policy tries three times.')
+
+    state: SessionState = await session._handle_executing()
+
+    assert state is SessionState.completed
+
+
+async def test_a_task_that_changed_files_still_goes_to_review(
+    monkeypatch: pytest.MonkeyPatch, git_repo: GitManagerService
+) -> None:
+    """
+    Requirement 10.8: the ordinary path is untouched.
+    """
+    responses: list[ModelResponse] = [
+        ModelResponse(parts=[TextPart(content='Done.')]),
+    ]
+    session, _ = prepare(monkeypatch, responses, git_repo)
+    session._session.record_modification('a.py')
+    session._session.record_verification(True)
+    session._session.request_completion('Changed a.py.')
+
+    state: SessionState = await session._handle_executing()
+
+    assert state is SessionState.reviewing

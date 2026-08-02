@@ -52,10 +52,7 @@ class MainProvider(Provider):
         Provide an instance of DockerSandboxManager.
         """
         repo_path: str = os.getenv('REPO_PATH', '/tmp/repo')
-        # The path the container runtime's host uses for the same directory.
-        # Empty when Loom runs outside a container and the two agree.
-        host_repo_root: str = os.getenv('HOST_REPO_PATH', '')
-        return DockerSandboxManager(repo_path=repo_path, host_repo_root=host_repo_root)
+        return DockerSandboxManager(repo_path=repo_path)
 
     @provide
     def get_code_search_service(self) -> CodeSearchService:

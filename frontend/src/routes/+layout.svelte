@@ -1,40 +1,18 @@
 <script lang="ts">
-  import { onMount } from 'svelte';
-  import { agentStore } from '$lib/stores/agent';
-  import "../app.css";
-  
-  let { children } = $props();
+    import { agentStore } from '$lib/stores/agent';
+    import { isDarkTheme, prefersDark } from '$lib/theme';
+    import '../app.css';
 
-  function updateTheme() {
-    const theme = $agentStore.config.theme;
-    const isDark = theme === 'dark' || (theme === 'system' && window.matchMedia('(prefers-color-scheme: dark)').matches);
-    
-    if (isDark) {
-      document.documentElement.classList.add('dark');
-    } else {
-      document.documentElement.classList.remove('dark');
-    }
-  }
+    let { children } = $props();
 
-  onMount(() => {
-    updateTheme();
-    
-    const mediaQuery = window.matchMedia('(prefers-color-scheme: dark)');
-    const handler = () => {
-      if ($agentStore.config.theme === 'system') {
-        updateTheme();
-      }
-    };
-    
-    mediaQuery.addEventListener('change', handler);
-    return () => mediaQuery.removeEventListener('change', handler);
-  });
+    const dark = $derived(isDarkTheme($agentStore.config.theme, $prefersDark));
 
-  // Watch for theme changes in store
-  $effect(() => {
-    $agentStore.config.theme;
-    updateTheme();
-  });
+    // The class Tailwind keys its dark variants off. Following `dark` rather
+    // than the setting means a change of operating system appearance is picked
+    // up too, without a media query listener of its own here.
+    $effect(() => {
+        document.documentElement.classList.toggle('dark', dark);
+    });
 </script>
 
 {@render children()}

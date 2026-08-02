@@ -112,3 +112,29 @@ def test_terminal_set() -> None:
     assert is_terminal(SessionState.merged) is True
     assert is_terminal(SessionState.failed) is True
     assert is_terminal(SessionState.completed) is False
+
+
+def test_execution_may_complete_without_review() -> None:
+    """
+    A task adjudicated as needing no file changes has no diff to review.
+
+    Requirement 10.5.
+    """
+    machine: SessionStateMachine = SessionStateMachine()
+    machine.transition_to(SessionState.planning)
+    machine.transition_to(SessionState.waiting_plan_approval)
+    machine.transition_to(SessionState.executing)
+
+    assert machine.transition_to(SessionState.completed) is SessionState.completed
+
+
+def test_execution_still_reaches_review() -> None:
+    """
+    Adding the shortcut must not remove the ordinary route.
+    """
+    machine: SessionStateMachine = SessionStateMachine()
+    machine.transition_to(SessionState.planning)
+    machine.transition_to(SessionState.waiting_plan_approval)
+    machine.transition_to(SessionState.executing)
+
+    assert machine.transition_to(SessionState.reviewing) is SessionState.reviewing

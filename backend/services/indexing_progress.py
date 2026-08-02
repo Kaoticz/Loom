@@ -6,7 +6,18 @@ from time import monotonic
 
 ProgressCallback = Callable[[int, int, str], Awaitable[None]]
 
-DEFAULT_MIN_INTERVAL_SECONDS: float = 0.25
+MAX_UPDATES_PER_SECOND: float = 10.0
+"""
+The ceiling on throttled progress updates per second.
+
+Progress now replaces a single message rather than appending one, so the old
+quarter-second gap was needlessly coarse: it made the counter appear to jump
+from the first file straight to the total. Ten updates a second reads as a
+steadily advancing counter while still bounding traffic to a fixed rate, so a
+repository of ten files and one of ten thousand cost the same per second.
+"""
+
+DEFAULT_MIN_INTERVAL_SECONDS: float = 1.0 / MAX_UPDATES_PER_SECOND
 
 
 class ProgressReporter:
@@ -19,8 +30,11 @@ class ProgressReporter:
     running. A shared counter behind a lock reports how many files have actually
     finished.
 
-    Messages are also throttled, because a phase update per file would send
-    thousands of messages for a large repository.
+    Messages are also throttled, because an update per file would send thousands
+    of messages for a large repository. Throttling bounds the rate, not the
+    destination: the client folds every update into one slot in the feed, and the
+    first and last updates are always sent so the counter starts at zero and
+    finishes at the total.
     """
 
     _callback: ProgressCallback | None

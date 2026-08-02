@@ -7,14 +7,26 @@ from typing import Any, ClassVar
 from httpx import AsyncClient, HTTPError, Response
 from pydantic import BaseModel, ConfigDict
 from pydantic_ai import Agent, RunContext
+from pydantic_ai.agent import AgentRunResult
 
-from services.code_search import CodeSearchService, LexicalMatch
+from services.code_search import CodeSearchService, LexicalMatch, SymbolDefinition
 from services.docker_sandbox import CommandResult, DockerSandboxManager
 from services.embedding import EmbeddingService
 from services.event_bus import CommitEvent, DiffEvent, EventBus
 from services.git_manager import CommitInfo, GitManagerService
-from services.tool_reporting import ToolReport, report_tool
+from services.tool_reporting import (
+    ToolReport,
+    describe_file_read,
+    describe_symbol_lookup,
+    report_tool,
+)
 from services.file_editor import EditResult, FileEditorService
+from agents.adjudicator import (
+    AdjudicationResult,
+    adjudicator_agent,
+    build_adjudication_prompt,
+)
+from services.model_resolution import resolve_model
 from services.session_context import SessionContext
 
 logger: Logger = getLogger(__name__)
@@ -79,13 +91,31 @@ command you just ran is still failing.
 
 # 5. Finishing
 
-When, and only when, all the work is genuinely done, call the `complete_task` tool with a
-summary of everything you changed.
+When, and only when, the task is genuinely done, call the `complete_task` tool.
 
-- You must not call `complete_task` before you have made at least one file modification
-  and verified it with a passing `run_test_command`.
-- `complete_task` is the final action of your execution phase. After calling it, stop.
-  Do not produce another plan, do not call more tools, and do not keep reasoning.
+Most tasks require changing files. For those:
+
+- Pass a summary of everything you changed.
+- You must not call `complete_task` before you have made at least one file modification and
+  verified it with a passing `run_test_command`.
+- The exception is a session with no sandbox. If `run_test_command` reports that the sandbox is
+  unavailable, no command can be run and none will become runnable later. Do not keep retrying
+  it and do not treat the missing verification as a reason to carry on working. Finish the task,
+  then complete it, saying plainly in your summary that the changes are unverified.
+
+Some tasks require changing nothing at all: summarising code, explaining how something works,
+assessing a design, or investigating whether a problem exists where the answer turns out to be
+no. For those:
+
+- Pass your answer itself as the summary. It is the whole product of the task, so make it
+  complete: the reader sees this and nothing else.
+- Do not invent a file change to satisfy the rule above. A task that asked a question is
+  finished when the question is answered.
+- Do not use this to escape work you found difficult. Whether the task genuinely required no
+  changes is checked, and if it did require them you will be told to carry on.
+
+In both cases, `complete_task` is the final action of your execution phase. After calling it,
+stop. Do not produce another plan, do not call more tools, and do not keep reasoning.
 
 # 6. Style
 
@@ -199,8 +229,19 @@ async def get_symbol(ctx: RunContext[AgentDeps], symbol: str) -> str:
     Get the definition of a symbol (class, function).
     """
     async with report_tool(ctx.deps.events, 'get_symbol', {'symbol': symbol}) as report:
-        results: list[Any] = await ctx.deps.search.get_symbol_definition(symbol)
-        return report.succeed(str(results))
+        found: list[SymbolDefinition] = await ctx.deps.search.get_symbol_definition(symbol)
+
+        if not found:
+            return report.succeed(
+                f'No definition of {symbol!r} is in the index. It may be spelled differently, '
+                'declared in a file that was not indexed, or not exist.'
+            )
+
+        # The agent gets the definitions; the reader gets a line saying how many.
+        return report.succeed(
+            '\n\n'.join(definition.render() for definition in found),
+            observation=describe_symbol_lookup(symbol, len(found)),
+        )
 
 
 @coder_agent.tool
@@ -225,7 +266,12 @@ async def read_file(
 
     async with report_tool(ctx.deps.events, 'read_file', arguments) as report:
         try:
-            return report.succeed(await ctx.deps.editor.read_file(path, start_line, end_line))
+            contents: str = await ctx.deps.editor.read_file(path, start_line, end_line)
+            # The agent gets the file; the reader gets a line saying it was read.
+            return report.succeed(
+                contents,
+                observation=describe_file_read(path, contents, start_line, end_line),
+            )
         except FileNotFoundError:
             return report.fail(f'File {path} does not exist.')
         except ValueError as error:
@@ -452,16 +498,60 @@ async def complete_task(ctx: RunContext[AgentDeps], summary: str) -> str:
     Signal that all the work for the task is finished.
 
     Call this exactly once, as the final action of your execution phase, with a
-    summary of everything you changed. Do not call it before you have modified at
-    least one file and verified the change with run_test_command.
+    summary of what you did. If the task required changing files, do not call it
+    before you have modified at least one and verified the change with
+    run_test_command. If the task only ever called for an answer — a summary, an
+    explanation, an assessment — call it with that answer as the summary.
     """
+    session: SessionContext = ctx.deps.session
+
     async with report_tool(ctx.deps.events, 'complete_task', {}) as report:
+        if not session.has_modified_files:
+            # Some tasks legitimately change nothing. Whether this was one of
+            # them is not a judgment the gate can make from counting files, so
+            # it is put to a subagent. A failure here is deliberately allowed to
+            # escape: guessing either way is worse than stopping.
+            decision: AdjudicationResult = await adjudicate_completion(session, summary)
+
+            if decision.changes_were_required:
+                return report.fail(
+                    f'complete_task was rejected: {decision.reason} '
+                    'Make the changes the task requires, verify them with run_test_command, '
+                    'and only then call complete_task.'
+                )
+
+            recorded_answer: str = session.accept_completion_without_changes(summary)
+            return report.succeed(
+                f'Task marked complete with no file changes. {decision.reason} '
+                f'Answer recorded: {recorded_answer}'
+            )
+
         try:
-            recorded: str = ctx.deps.session.request_completion(summary)
+            recorded: str = session.request_completion(summary)
         except ValueError as error:
             return report.fail(f'complete_task was rejected: {error}')
 
-        modified: str = ', '.join(ctx.deps.session.modified_files)
+        modified: str = ', '.join(session.modified_files)
         return report.succeed(
             f'Task marked complete. Summary recorded: {recorded} (files modified: {modified})'
         )
+
+
+async def adjudicate_completion(
+    session: SessionContext, summary: str
+) -> AdjudicationResult:
+    """
+    Ask whether the task could have been completed without changing any file.
+
+    Consulted only when nothing was modified. Runs on the reviewer's model, since
+    this is a judgment about the work rather than part of doing it.
+
+    :param session: The session context, carrying the task and reviewer model.
+    :param summary: The agent's account of what it did.
+    :returns: The adjudicator's verdict.
+    """
+    verdict: AgentRunResult[AdjudicationResult] = await adjudicator_agent.run(
+        build_adjudication_prompt(session.task, summary),
+        model=resolve_model(session.reviewer_model),
+    )
+    return verdict.output

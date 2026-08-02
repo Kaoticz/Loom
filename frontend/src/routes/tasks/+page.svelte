@@ -1,41 +1,27 @@
 <script lang="ts">
     import { onMount } from 'svelte';
+    import { parseResponse, taskListSchema, type Task } from '$lib/schemas';
+    import { taskStatusStyle } from '$lib/taskPresentation';
 
     const apiBase = import.meta.env.VITE_API_BASE_URL || 'http://localhost:8000';
 
-    interface TaskSummary {
-        id: string;
-        status: string;
-        prompt: string;
-        repo_path: string;
-        branch_name: string;
-        summary: string;
-        created_at: string;
-    }
-
-    let tasks: TaskSummary[] = [];
-    let total = 0;
-    let offset = 0;
-    let loading = true;
-    let error = '';
+    let tasks: Task[] = $state([]);
+    let total = $state(0);
+    let offset = $state(0);
+    let loading = $state(true);
+    let error = $state('');
 
     const LIMIT = 20;
-
-    const statusStyles: Record<string, string> = {
-        initialized: 'bg-gray-100 text-gray-700 dark:bg-gray-700 dark:text-gray-200',
-        running: 'bg-blue-100 text-blue-800 dark:bg-blue-900/40 dark:text-blue-200',
-        completed: 'bg-green-100 text-green-800 dark:bg-green-900/40 dark:text-green-200',
-        merged: 'bg-emerald-100 text-emerald-800 dark:bg-emerald-900/40 dark:text-emerald-200',
-        failed: 'bg-red-100 text-red-800 dark:bg-red-900/40 dark:text-red-200'
-    };
 
     async function load(nextOffset: number) {
         loading = true;
         error = '';
         try {
-            const response = await fetch(`${apiBase}/api/v1/tasks?offset=${nextOffset}&limit=${LIMIT}`);
+            const response = await fetch(
+                `${apiBase}/api/v1/tasks?offset=${nextOffset}&limit=${LIMIT}`
+            );
             if (!response.ok) throw new Error(`Server returned ${response.status}`);
-            const data = await response.json();
+            const data = parseResponse(taskListSchema, await response.json(), 'task list');
             tasks = data.items;
             total = data.total;
             offset = data.offset;
@@ -49,10 +35,12 @@
     onMount(() => load(0));
 </script>
 
-<div class="p-6 max-w-4xl mx-auto">
-    <div class="flex items-center justify-between mb-6">
+<div class="mx-auto max-w-4xl p-6">
+    <div class="mb-6 flex items-center justify-between">
         <h1 class="text-2xl font-bold dark:text-white">Task History</h1>
-        <a href="/" class="text-sm text-blue-600 dark:text-blue-400 hover:underline">Back to agent</a>
+        <a href="/" class="text-sm text-blue-600 hover:underline dark:text-blue-400"
+            >Back to agent</a
+        >
     </div>
 
     {#if loading}
@@ -67,28 +55,35 @@
                 <li>
                     <a
                         href="/tasks/{task.id}"
-                        class="block p-4 rounded-xl border border-gray-200 dark:border-gray-700 hover:border-blue-400 dark:hover:border-blue-500 bg-white dark:bg-gray-800 transition-colors"
+                        class="block rounded-xl border border-gray-200 bg-white p-4 transition-colors hover:border-blue-400 dark:border-gray-700 dark:bg-gray-800 dark:hover:border-blue-500"
                     >
                         <div class="flex items-center justify-between gap-4">
-                            <span class="font-medium dark:text-gray-100 truncate">{task.prompt}</span>
-                            <span class="text-xs px-2 py-1 rounded shrink-0 {statusStyles[task.status] ?? statusStyles.initialized}">
+                            <span class="truncate font-medium dark:text-gray-100"
+                                >{task.prompt}</span
+                            >
+                            <span
+                                class="shrink-0 rounded px-2 py-1 text-xs {taskStatusStyle(
+                                    task.status
+                                )}"
+                            >
                                 {task.status}
                             </span>
                         </div>
-                        <div class="text-xs text-gray-500 dark:text-gray-400 mt-1">
+                        <div class="mt-1 text-xs text-gray-500 dark:text-gray-400">
                             {new Date(task.created_at).toLocaleString()}
-                            {#if task.branch_name} &middot; {task.branch_name}{/if}
+                            {#if task.branch_name}
+                                &middot; {task.branch_name}{/if}
                         </div>
                     </a>
                 </li>
             {/each}
         </ul>
 
-        <div class="flex items-center justify-between mt-6 text-sm">
+        <div class="mt-6 flex items-center justify-between text-sm">
             <button
                 disabled={offset === 0}
-                on:click={() => load(Math.max(0, offset - LIMIT))}
-                class="px-3 py-1 rounded border border-gray-300 dark:border-gray-600 disabled:opacity-40 dark:text-gray-200"
+                onclick={() => load(Math.max(0, offset - LIMIT))}
+                class="rounded border border-gray-300 px-3 py-1 disabled:opacity-40 dark:border-gray-600 dark:text-gray-200"
             >
                 Previous
             </button>
@@ -97,8 +92,8 @@
             </span>
             <button
                 disabled={offset + LIMIT >= total}
-                on:click={() => load(offset + LIMIT)}
-                class="px-3 py-1 rounded border border-gray-300 dark:border-gray-600 disabled:opacity-40 dark:text-gray-200"
+                onclick={() => load(offset + LIMIT)}
+                class="rounded border border-gray-300 px-3 py-1 disabled:opacity-40 dark:border-gray-600 dark:text-gray-200"
             >
                 Next
             </button>

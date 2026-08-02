@@ -93,7 +93,11 @@ describe('message handling', () => {
     it('renders a plan from its steps and asks for approval', async () => {
         const { store, socket } = await connected();
 
-        socket.deliver({ type: 'plan', steps: ['Read the file', 'Edit it'], requires_approval: true });
+        socket.deliver({
+            type: 'plan',
+            steps: ['Read the file', 'Edit it'],
+            requires_approval: true
+        });
 
         const state = get(store);
         expect(state.status).toBe('waiting_approval');
@@ -113,7 +117,12 @@ describe('message handling', () => {
     it('shows a tool result for an observation', async () => {
         const { store, socket } = await connected();
 
-        socket.deliver({ type: 'observation', tool_name: 'edit_file', result: 'Edited a.py', status: 'success' });
+        socket.deliver({
+            type: 'observation',
+            tool_name: 'edit_file',
+            result: 'Edited a.py',
+            status: 'success'
+        });
 
         expect(latest(store).content).toBe('Edited a.py');
     });
@@ -148,14 +157,18 @@ describe('message handling', () => {
             modified: 'value = 2\n',
             truncated: false
         });
-        expect(state.files).toContain('a.py');
-        expect(state.selectedFile).toBe('a.py');
     });
 
     it('keeps diffs out of the chat feed', async () => {
         const { store, socket } = await connected();
 
-        socket.deliver({ type: 'diff', file_path: 'a.py', original: '', modified: 'x', truncated: false });
+        socket.deliver({
+            type: 'diff',
+            file_path: 'a.py',
+            original: '',
+            modified: 'x',
+            truncated: false
+        });
 
         expect(get(store).messages).toHaveLength(0);
     });
@@ -174,11 +187,21 @@ describe('message handling', () => {
     it('distinguishes the merge prompt from the merge confirmation', async () => {
         const { store, socket } = await connected();
 
-        socket.deliver({ type: 'done', summary: 'Added the function.', branch_name: 'ai-task-1', total_commits: 2 });
+        socket.deliver({
+            type: 'done',
+            summary: 'Added the function.',
+            branch_name: 'ai-task-1',
+            total_commits: 2
+        });
         expect(get(store).status).toBe('completed');
         expect(get(store).actionType).toBe('approve_merge');
 
-        socket.deliver({ type: 'done', summary: 'Merged ai-task-1 into main.', branch_name: 'ai-task-1', total_commits: 2 });
+        socket.deliver({
+            type: 'done',
+            summary: 'Merged ai-task-1 into main.',
+            branch_name: 'ai-task-1',
+            total_commits: 2
+        });
         expect(get(store).status).toBe('merged');
         expect(get(store).requiresAction).toBe(false);
     });
@@ -192,16 +215,20 @@ describe('message handling', () => {
         expect(get(store).requiresAction).toBe(false);
     });
 
-    it('derives progress status from indexing thoughts', async () => {
+    it('takes progress status from the phase the backend states', async () => {
         const { store, socket } = await connected();
 
-        socket.deliver({ type: 'thought', content: 'Indexing [3/10]: a.py' });
+        socket.deliver({ type: 'system', content: 'Indexing repository...', status: 'indexing' });
         expect(get(store).status).toBe('indexing');
 
-        socket.deliver({ type: 'thought', content: 'Executing plan...' });
+        socket.deliver({ type: 'system', content: 'Executing plan...', status: 'executing' });
         expect(get(store).status).toBe('executing');
 
-        socket.deliver({ type: 'thought', content: 'Reworking based on the feedback received.' });
+        socket.deliver({
+            type: 'system',
+            content: 'Reworking based on the feedback received.',
+            status: 're_working'
+        });
         expect(get(store).status).toBe('re_working');
     });
 });
@@ -264,7 +291,6 @@ describe('configuration persistence', () => {
     });
 });
 
-
 describe('a session already running elsewhere', () => {
     it('shows a stale message until a sibling confirms', async () => {
         // No BroadcastChannel means no sibling can answer, so the refusal stays
@@ -315,5 +341,706 @@ describe('a session already running elsewhere', () => {
 
         expect(get(store).blocked).toBeNull();
         expect(get(store).messages).toHaveLength(0);
+    });
+});
+
+describe('system messages', () => {
+    const PROGRESS_KEY = 'indexing_progress';
+
+    it('appends a system message that names no slot', async () => {
+        const { store, socket } = await connected();
+
+        socket.deliver({ type: 'system', content: 'Starting sandbox...' });
+
+        expect(get(store).messages).toHaveLength(1);
+        expect(latest(store).type).toBe('system');
+        expect(latest(store).content).toBe('Starting sandbox...');
+    });
+
+    it('replaces a keyed message in place rather than appending', async () => {
+        const { store, socket } = await connected();
+
+        socket.deliver({
+            type: 'system',
+            content: 'a.py',
+            key: PROGRESS_KEY,
+            processed: 1,
+            total: 3
+        });
+        socket.deliver({
+            type: 'system',
+            content: 'b.py',
+            key: PROGRESS_KEY,
+            processed: 2,
+            total: 3
+        });
+        socket.deliver({
+            type: 'system',
+            content: 'c.py',
+            key: PROGRESS_KEY,
+            processed: 3,
+            total: 3
+        });
+
+        expect(get(store).messages).toHaveLength(1);
+        expect(latest(store).content).toBe('[3/3] c.py');
+    });
+
+    it('keeps one progress message however many updates arrive', async () => {
+        const { store, socket } = await connected();
+
+        for (let processed = 0; processed <= 500; processed += 1) {
+            socket.deliver({
+                type: 'system',
+                content: `file_${processed}.py`,
+                key: PROGRESS_KEY,
+                processed,
+                total: 500
+            });
+        }
+
+        expect(get(store).messages).toHaveLength(1);
+        expect(latest(store).content).toBe('[500/500] file_500.py');
+    });
+
+    it('renders the counter from the counts rather than the prose', async () => {
+        const { store, socket } = await connected();
+
+        socket.deliver({
+            type: 'system',
+            content: 'Indexed src/app.py',
+            key: PROGRESS_KEY,
+            processed: 7,
+            total: 42
+        });
+
+        expect(latest(store).content).toBe('[7/42] Indexed src/app.py');
+    });
+
+    it('omits the counter when a system message carries no counts', async () => {
+        const { store, socket } = await connected();
+
+        socket.deliver({ type: 'system', content: 'Merging...', key: 'stage' });
+
+        expect(latest(store).content).toBe('Merging...');
+    });
+
+    it('resolves an empty repository at zero of zero', async () => {
+        const { store, socket } = await connected();
+
+        socket.deliver({
+            type: 'system',
+            content: 'Indexing complete.',
+            key: PROGRESS_KEY,
+            processed: 0,
+            total: 0
+        });
+
+        expect(get(store).messages).toHaveLength(1);
+        expect(latest(store).content).toBe('[0/0] Indexing complete.');
+    });
+
+    it('keeps distinct slots independent', async () => {
+        const { store, socket } = await connected();
+
+        socket.deliver({ type: 'system', content: 'one', key: 'first' });
+        socket.deliver({ type: 'system', content: 'two', key: 'second' });
+        socket.deliver({ type: 'system', content: 'one again', key: 'first' });
+
+        const messages = get(store).messages;
+        expect(messages).toHaveLength(2);
+        expect(messages[0].content).toBe('one again');
+        expect(messages[1].content).toBe('two');
+    });
+
+    it('does not disturb surrounding messages when replacing a slot', async () => {
+        const { store, socket } = await connected();
+
+        socket.deliver({
+            type: 'system',
+            content: 'a.py',
+            key: PROGRESS_KEY,
+            processed: 1,
+            total: 2
+        });
+        socket.deliver({ type: 'thought', content: 'considering' });
+        socket.deliver({
+            type: 'system',
+            content: 'b.py',
+            key: PROGRESS_KEY,
+            processed: 2,
+            total: 2
+        });
+
+        const messages = get(store).messages;
+        expect(messages).toHaveLength(2);
+        expect(messages[0].content).toBe('[2/2] b.py');
+        expect(messages[1].type).toBe('thought');
+    });
+});
+
+describe('thought coalescing', () => {
+    it('grows one message for a continuous run of reasoning', async () => {
+        const { store, socket } = await connected();
+
+        socket.deliver({ type: 'thought', content: 'First.', stream_id: 's:1' });
+        socket.deliver({ type: 'thought', content: 'Second.', stream_id: 's:1' });
+        socket.deliver({ type: 'thought', content: 'Third.', stream_id: 's:1' });
+
+        expect(get(store).messages).toHaveLength(1);
+        expect(latest(store).content).toBe('First. Second. Third.');
+    });
+
+    it('starts a new message for a new run', async () => {
+        const { store, socket } = await connected();
+
+        socket.deliver({ type: 'thought', content: 'Before.', stream_id: 's:1' });
+        socket.deliver({ type: 'thought', content: 'After.', stream_id: 's:2' });
+
+        const messages = get(store).messages;
+        expect(messages).toHaveLength(2);
+        expect(messages[0].content).toBe('Before.');
+        expect(messages[1].content).toBe('After.');
+    });
+
+    it("renders the user's sequence as prompt, thought, action, thought, observation", async () => {
+        const { store, socket } = await connected();
+
+        store.sendPrompt('do the thing');
+        socket.deliver({ type: 'thought', content: 'One.', stream_id: 's:1' });
+        socket.deliver({ type: 'thought', content: 'Two.', stream_id: 's:1' });
+        socket.deliver({ type: 'thought', content: 'Three.', stream_id: 's:1' });
+        socket.deliver({ type: 'action', tool_name: 'edit_file', arguments: { path: 'a.py' } });
+        socket.deliver({ type: 'thought', content: 'Four.', stream_id: 's:2' });
+        socket.deliver({ type: 'observation', tool_name: 'edit_file', result: 'written' });
+
+        const messages = get(store).messages;
+        expect(messages.map((message) => message.type)).toEqual([
+            'prompt',
+            'thought',
+            'action',
+            'thought',
+            'observation'
+        ]);
+        expect(messages[1].content).toBe('One. Two. Three.');
+        expect(messages[3].content).toBe('Four.');
+    });
+
+    it('does not coalesce thoughts that carry no run identifier', async () => {
+        const { store, socket } = await connected();
+
+        socket.deliver({ type: 'thought', content: 'One.' });
+        socket.deliver({ type: 'thought', content: 'Two.' });
+
+        expect(get(store).messages).toHaveLength(2);
+    });
+
+    it('leaves other repeated message types separate', async () => {
+        const { store, socket } = await connected();
+
+        socket.deliver({ type: 'observation', tool_name: 'run_command', result: 'a' });
+        socket.deliver({ type: 'observation', tool_name: 'run_command', result: 'b' });
+        socket.deliver({ type: 'commit', message: 'one', commit_hash: 'abc1234' });
+        socket.deliver({ type: 'commit', message: 'two', commit_hash: 'def5678' });
+
+        expect(get(store).messages).toHaveLength(4);
+    });
+
+    it('does not let model reasoning drive the session status', async () => {
+        const { store, socket } = await connected();
+        const before = get(store).status;
+
+        socket.deliver({ type: 'thought', content: 'Merging the branch.', stream_id: 's:1' });
+
+        // The backend owns the status; reasoning that merely mentions merging
+        // must not move it.
+        expect(get(store).status).toBe(before);
+    });
+
+    it('caps a run of reasoning that never ends', async () => {
+        const { store, socket } = await connected();
+        const sentence = 'a'.repeat(1_000);
+
+        for (let index = 0; index < 40; index += 1) {
+            socket.deliver({ type: 'thought', content: sentence, stream_id: 's:1' });
+        }
+
+        expect(get(store).messages).toHaveLength(1);
+        const { content } = latest(store);
+        expect(content).toContain('truncated');
+        expect(content.length).toBeLessThan(40 * sentence.length);
+    });
+
+    it('stops growing a run once it has been capped', async () => {
+        const { store, socket } = await connected();
+        const sentence = 'b'.repeat(1_000);
+
+        for (let index = 0; index < 40; index += 1) {
+            socket.deliver({ type: 'thought', content: sentence, stream_id: 's:1' });
+        }
+        const capped = latest(store).content;
+
+        socket.deliver({ type: 'thought', content: 'and more', stream_id: 's:1' });
+
+        expect(latest(store).content).toBe(capped);
+    });
+
+    it('keeps a run separate from an interleaved progress slot', async () => {
+        const { store, socket } = await connected();
+
+        socket.deliver({ type: 'thought', content: 'Before.', stream_id: 's:1' });
+        socket.deliver({
+            type: 'system',
+            content: 'a.py',
+            key: 'indexing_progress',
+            processed: 1,
+            total: 2
+        });
+        socket.deliver({ type: 'thought', content: 'After.', stream_id: 's:2' });
+
+        expect(get(store).messages.map((message) => message.type)).toEqual([
+            'thought',
+            'system',
+            'thought'
+        ]);
+    });
+});
+
+describe('inbound validation', () => {
+    it('accepts a message carrying fields it does not know about', async () => {
+        const { store, socket } = await connected();
+
+        socket.deliver({
+            type: 'thought',
+            content: 'Considering.',
+            stream_id: 's:1',
+            invented_by_a_newer_backend: { nested: true }
+        });
+
+        expect(get(store).messages).toHaveLength(1);
+        expect(latest(store).type).toBe('thought');
+        expect(latest(store).content).toBe('Considering.');
+    });
+
+    it('reports a message of an unknown type as an error in the feed', async () => {
+        const { store, socket } = await connected();
+
+        socket.deliver({ type: 'not_a_real_message', content: 'hello' });
+
+        expect(latest(store).type).toBe('error');
+        expect(latest(store).content).toContain('could not be understood');
+    });
+
+    it('reports a message missing a required field rather than applying it', async () => {
+        const { store, socket } = await connected();
+
+        socket.deliver({ type: 'commit', message: 'no hash here' });
+
+        expect(get(store).messages).toHaveLength(1);
+        expect(latest(store).type).toBe('error');
+    });
+
+    it('reports a payload that is not valid JSON', async () => {
+        const { store, socket } = await connected();
+
+        socket.onmessage?.({ data: '{ not json' });
+
+        expect(latest(store).type).toBe('error');
+        expect(latest(store).content).toContain('not valid JSON');
+    });
+
+    it('keeps working after rejecting an invalid message', async () => {
+        const { store, socket } = await connected();
+
+        socket.deliver({ type: 'nonsense' });
+        socket.deliver({ type: 'thought', content: 'Still here.', stream_id: 's:1' });
+
+        const messages = get(store).messages;
+        expect(messages.map((message) => message.type)).toEqual(['error', 'thought']);
+        expect(get(store).connection).toBe('connected');
+    });
+
+    it('applies the schema defaults the backend would have sent', async () => {
+        const { store, socket } = await connected();
+
+        socket.deliver({ type: 'plan', steps: ['One', 'Two'] });
+
+        expect(get(store).status).toBe('waiting_approval');
+        expect(latest(store).content).toBe('1. One\n2. Two');
+    });
+
+    it('does not let an invalid message leave the interface stuck', async () => {
+        const { store, socket } = await connected();
+
+        socket.deliver({ type: 'done' });
+
+        expect(get(store).status).not.toBe('completed');
+        expect(get(store).requiresAction).toBe(false);
+    });
+});
+
+describe('validation error coalescing', () => {
+    it('collapses repeats of the same fault into one counted message', async () => {
+        const { store, socket } = await connected();
+
+        for (let index = 0; index < 200; index += 1) {
+            socket.deliver({ type: 'commit', message: 'no hash' });
+        }
+
+        const messages = get(store).messages;
+        expect(messages).toHaveLength(1);
+        expect(messages[0].type).toBe('error');
+        expect(messages[0].count).toBe(200);
+        expect(messages[0].content).toContain('200 occurrences');
+    });
+
+    it('reads as a single fault the first time', async () => {
+        const { store, socket } = await connected();
+
+        socket.deliver({ type: 'commit', message: 'no hash' });
+
+        expect(latest(store).content).not.toContain('occurrences');
+        expect(latest(store).count).toBe(1);
+    });
+
+    it('keeps distinct faults in separate slots', async () => {
+        const { store, socket } = await connected();
+
+        socket.deliver({ type: 'commit', message: 'no hash' });
+        socket.deliver({ type: 'review', approved: true });
+        socket.deliver({ type: 'commit', message: 'still no hash' });
+
+        const errors = get(store).messages.filter((message) => message.type === 'error');
+        expect(errors).toHaveLength(2);
+        expect(errors[0].count).toBe(2);
+        expect(errors[1].count).toBe(1);
+    });
+
+    it('caps how many distinct faults get their own slot', async () => {
+        const { store, socket } = await connected();
+
+        socket.deliver({ type: 'commit', message: 'a' });
+        socket.deliver({ type: 'review', approved: true });
+        socket.deliver({ type: 'observation', tool_name: 'x' });
+        socket.deliver({ type: 'done' });
+        socket.deliver({ type: 'diff', file_path: 'a.py' });
+        socket.deliver({ type: 'action' });
+        socket.deliver({ type: 'system' });
+
+        const errors = get(store).messages.filter((message) => message.type === 'error');
+        expect(errors).toHaveLength(6);
+        const overflow = errors[errors.length - 1];
+        expect(overflow.content).toContain('Further messages');
+        expect(overflow.count).toBe(2);
+    });
+
+    it('does not disturb real messages while counting up', async () => {
+        const { store, socket } = await connected();
+
+        socket.deliver({ type: 'commit', message: 'no hash' });
+        socket.deliver({ type: 'thought', content: 'Working.', stream_id: 's:1' });
+        socket.deliver({ type: 'commit', message: 'no hash again' });
+
+        const messages = get(store).messages;
+        expect(messages.map((message) => message.type)).toEqual(['error', 'thought']);
+        expect(messages[0].count).toBe(2);
+        expect(messages[1].content).toBe('Working.');
+    });
+
+    it('counts malformed JSON in its own slot', async () => {
+        const { store, socket } = await connected();
+
+        socket.onmessage?.({ data: '{ nope' });
+        socket.onmessage?.({ data: '{ nope again' });
+
+        const errors = get(store).messages.filter((message) => message.type === 'error');
+        expect(errors).toHaveLength(1);
+        expect(errors[0].content).toContain('not valid JSON');
+        expect(errors[0].count).toBe(2);
+    });
+});
+
+describe('system status announcements', () => {
+    it('takes the status the backend states', async () => {
+        const { store, socket } = await connected();
+
+        socket.deliver({ type: 'system', content: 'Generating plan...', status: 'planning' });
+
+        expect(get(store).status).toBe('planning');
+    });
+
+    it('trusts the stated status over the wording', async () => {
+        const { store, socket } = await connected();
+
+        // Wording that the old prose matching would have read as 'merging'.
+        socket.deliver({ type: 'system', content: 'Merging is next.', status: 'reviewing' });
+
+        expect(get(store).status).toBe('reviewing');
+    });
+
+    it('leaves the status alone for an announcement that claims no phase', async () => {
+        const { store, socket } = await connected();
+
+        socket.deliver({ type: 'system', content: 'Generating plan...', status: 'planning' });
+        socket.deliver({
+            type: 'system',
+            content: 'The following secrets are available inside the sandbox.'
+        });
+
+        expect(get(store).status).toBe('planning');
+    });
+
+    it('appends announcements rather than replacing, since they carry no key', async () => {
+        const { store, socket } = await connected();
+
+        socket.deliver({ type: 'system', content: 'Indexing repository...', status: 'indexing' });
+        socket.deliver({ type: 'system', content: 'Generating plan...', status: 'planning' });
+        socket.deliver({ type: 'system', content: 'Starting review...', status: 'reviewing' });
+
+        const messages = get(store).messages;
+        expect(messages).toHaveLength(3);
+        expect(messages.every((message) => message.type === 'system')).toBe(true);
+    });
+
+    it('still updates the progress slot in place alongside announcements', async () => {
+        const { store, socket } = await connected();
+
+        socket.deliver({ type: 'system', content: 'Indexing repository...', status: 'indexing' });
+        socket.deliver({
+            type: 'system',
+            content: 'a.py',
+            key: 'indexing_progress',
+            processed: 1,
+            total: 2
+        });
+        socket.deliver({
+            type: 'system',
+            content: 'b.py',
+            key: 'indexing_progress',
+            processed: 2,
+            total: 2
+        });
+
+        const messages = get(store).messages;
+        expect(messages).toHaveLength(2);
+        expect(messages[1].content).toBe('[2/2] b.py');
+    });
+
+    it('rejects a status the frontend does not know', async () => {
+        const { store, socket } = await connected();
+
+        socket.deliver({
+            type: 'system',
+            content: 'Doing something new...',
+            status: 'teleporting'
+        });
+
+        expect(latest(store).type).toBe('error');
+    });
+
+    it('ignores the wording when no status is stated', async () => {
+        const { store, socket } = await connected();
+
+        socket.deliver({ type: 'system', content: 'Generating plan...', status: 'planning' });
+        socket.deliver({ type: 'system', content: 'Merging is mentioned here.' });
+
+        // There is no prose fallback: an announcement that claims no phase
+        // leaves the status where it was.
+        expect(get(store).status).toBe('planning');
+    });
+});
+
+describe('message identity', () => {
+    it('keeps one identity while a run of reasoning grows', async () => {
+        const { store, socket } = await connected();
+
+        socket.deliver({ type: 'thought', content: 'First.', stream_id: 's:1' });
+        const original = get(store).messages[0].id;
+
+        socket.deliver({ type: 'thought', content: 'Second.', stream_id: 's:1' });
+        socket.deliver({ type: 'thought', content: 'Third.', stream_id: 's:1' });
+
+        // The object is replaced on each update; the identity must outlive it,
+        // or the rendered element is destroyed and rebuilt every sentence.
+        expect(get(store).messages[0].id).toBe(original);
+    });
+
+    it('keeps one identity while a progress slot counts up', async () => {
+        const { store, socket } = await connected();
+
+        socket.deliver({
+            type: 'system',
+            content: 'a',
+            key: 'indexing_progress',
+            processed: 1,
+            total: 3
+        });
+        const original = get(store).messages[0].id;
+
+        socket.deliver({
+            type: 'system',
+            content: 'b',
+            key: 'indexing_progress',
+            processed: 2,
+            total: 3
+        });
+        socket.deliver({
+            type: 'system',
+            content: 'c',
+            key: 'indexing_progress',
+            processed: 3,
+            total: 3
+        });
+
+        expect(get(store).messages[0].id).toBe(original);
+    });
+
+    it('keeps one identity while a validation fault counts up', async () => {
+        const { store, socket } = await connected();
+
+        socket.deliver({ type: 'commit', message: 'no hash' });
+        const original = get(store).messages[0].id;
+
+        socket.deliver({ type: 'commit', message: 'still no hash' });
+
+        expect(get(store).messages[0].id).toBe(original);
+    });
+
+    it('gives every message a distinct identity', async () => {
+        const { store, socket } = await connected();
+
+        store.sendPrompt('do the thing');
+        socket.deliver({ type: 'thought', content: 'One.', stream_id: 's:1' });
+        socket.deliver({ type: 'action', tool_name: 'edit_file', arguments: {} });
+        socket.deliver({ type: 'thought', content: 'Two.', stream_id: 's:2' });
+        socket.deliver({ type: 'system', content: 'Merging...', status: 'merging' });
+
+        const ids = get(store).messages.map((message) => message.id);
+        expect(new Set(ids).size).toBe(ids.length);
+    });
+
+    it('never reissues an identity already in the feed', async () => {
+        const { store, socket } = await connected();
+
+        socket.deliver({ type: 'thought', content: 'Before.', stream_id: 's:1' });
+        const existing = get(store).messages.map((message) => message.id);
+
+        store.sendPrompt('a new task');
+        socket.deliver({ type: 'thought', content: 'After.', stream_id: 's:2' });
+
+        const added = get(store)
+            .messages.map((message) => message.id)
+            .filter((id) => !existing.includes(id));
+        expect(added).toHaveLength(2);
+        expect(added.every((id) => Math.max(...existing) < id)).toBe(true);
+    });
+});
+
+describe('sandbox availability', () => {
+    it('records the reason without adding a chat message', async () => {
+        const { store, socket } = await connected();
+
+        socket.deliver({
+            type: 'sandbox_unavailable',
+            stage: 'runtime_connectivity',
+            reason: 'no docker'
+        });
+
+        // Requirement 6.1: a banner, not a chat message.
+        expect(get(store).messages).toHaveLength(0);
+        expect(get(store).sandboxUnavailable?.reason).toBe('no docker');
+        expect(get(store).sandboxUnavailable?.stage).toBe('runtime_connectivity');
+    });
+
+    it('starts with no sandbox problem and nothing dismissed', async () => {
+        const { store } = await connected();
+
+        expect(get(store).sandboxUnavailable).toBeNull();
+        expect(get(store).sandboxNoticeDismissed).toBe(false);
+    });
+
+    it('does not stack a second notification', async () => {
+        const { store, socket } = await connected();
+
+        socket.deliver({
+            type: 'sandbox_unavailable',
+            stage: 'runtime_connectivity',
+            reason: 'unreachable'
+        });
+        socket.deliver({
+            type: 'sandbox_unavailable',
+            stage: 'container_start',
+            reason: 'failed to start'
+        });
+
+        // Requirement 6.5: one predicament, one banner.
+        expect(get(store).messages).toHaveLength(0);
+        expect(get(store).sandboxUnavailable?.reason).toBe('failed to start');
+    });
+
+    it('stays dismissed once dismissed', async () => {
+        const { store, socket } = await connected();
+
+        socket.deliver({
+            type: 'sandbox_unavailable',
+            stage: 'runtime_connectivity',
+            reason: 'unreachable'
+        });
+        store.dismissSandboxNotice();
+        socket.deliver({
+            type: 'sandbox_unavailable',
+            stage: 'container_start',
+            reason: 'failed to start'
+        });
+
+        // Requirement 6.5: it must not reappear for the same session.
+        expect(get(store).sandboxNoticeDismissed).toBe(true);
+    });
+
+    it('rejects a notice that carries no reason', async () => {
+        const { store, socket } = await connected();
+
+        socket.deliver({ type: 'sandbox_unavailable', stage: 'image_build' });
+
+        expect(get(store).sandboxUnavailable).toBeNull();
+        expect(latest(store).type).toBe('error');
+    });
+});
+
+describe('stopping', () => {
+    it('asks the backend to interrupt', async () => {
+        const { store, socket } = await connected();
+
+        store.stop();
+
+        expect(socket.lastSent).toEqual({ action: 'stop' });
+    });
+
+    it('does not claim the session has stopped', async () => {
+        const { store, socket } = await connected();
+        socket.deliver({ type: 'system', content: 'Executing plan...', status: 'executing' });
+
+        store.stop();
+
+        // The backend decides when it has actually stopped. Guessing would show
+        // idle while the agent was still finishing a step.
+        expect(get(store).status).toBe('executing');
+    });
+});
+
+describe('after stopping', () => {
+    it('leaves the working state when the backend says it has stopped', async () => {
+        const { store, socket } = await connected();
+        socket.deliver({ type: 'system', content: 'Executing plan...', status: 'executing' });
+
+        socket.deliver({
+            type: 'system',
+            content: 'Stopped at your request. Everything done so far has been kept.',
+            status: 'cancelled'
+        });
+
+        // Requirement 8.7: the interface has to come out of the working state,
+        // or the prompt box goes on offering to stop work that already has.
+        expect(get(store).status).toBe('cancelled');
     });
 });

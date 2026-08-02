@@ -32,6 +32,58 @@ class LexicalMatch(BaseModel):
         return f'{self.file_path}:{self.line_number}\n{self.snippet}'
 
 
+def extract_lines(content: str, line_start: int, line_end: int) -> str:
+    """
+    Take an inclusive, 1-based range of lines out of a file's text.
+
+    The index records where a symbol was when the file was last read, and a file
+    edited since may be shorter, so a range running past the end is ordinary
+    rather than a fault; slicing yields what remains, or nothing.
+
+    The start is floored at 1 because that case is not benign: a zero or negative
+    start would index from the end of the list and silently return the wrong
+    lines rather than none.
+
+    :param content: The full text of the file.
+    :param line_start: The 1-based first line to take.
+    :param line_end: The 1-based last line to take, inclusive.
+    :returns: The selected lines, or an empty string if the range selects none.
+    """
+    lines: list[str] = content.splitlines()
+    first: int = max(line_start, 1)
+    return '\n'.join(lines[first - 1 : line_end])
+
+
+class SymbolDefinition(BaseModel):
+    """
+    A symbol's declaration, with the source that defines it.
+
+    The agent asks for a definition in order to read it, so the source is the
+    substance of the answer and the location is what makes it actionable.
+    """
+
+    symbol_name: Annotated[str, Field(description='The declared name of the symbol.')]
+    kind: Annotated[str, Field(description="What the symbol is, for example 'function' or 'class'.")]
+    file_path: Annotated[str, Field(description='Repository-relative path of the declaring file.')]
+    line_start: Annotated[int, Field(ge=1, description='1-based line where the definition begins.')]
+    line_end: Annotated[int, Field(ge=1, description='1-based line where the definition ends.')]
+    source: Annotated[str, Field(description='The source text of the definition.')]
+
+    def render(self) -> str:
+        """
+        Render this definition as a readable block for the agent.
+
+        :returns: The rendered definition.
+        """
+        header: str = (
+            f'{self.kind} {self.symbol_name} '
+            f'({self.file_path}:{self.line_start}-{self.line_end})'
+        )
+        if not self.source:
+            return f'{header}\nThe source is no longer at these lines; the file may have changed.'
+        return f'{header}\n{self.source}'
+
+
 class CodeSearchService:
     """
     Service for hybrid code retrieval (semantic + AST + lexical).
@@ -135,11 +187,30 @@ class CodeSearchService:
 
         return matches
 
-    async def get_symbol_definition(self, symbol_name: str) -> list[Symbol]:
+    async def get_symbol_definition(self, symbol_name: str) -> list[SymbolDefinition]:
         """
-        Lookup a symbol definition in the symbols table.
+        Look up a symbol's declarations, with the source that defines each.
+
+        Returns rendered definitions rather than rows so the database models stay
+        inside this service. Previously the rows themselves were handed to the
+        agent, which received their default representation and so learned nothing
+        but their primary keys.
 
         :param symbol_name: The name of the symbol (function, class) to find.
-        :returns: List of Symbol instances.
+        :returns: One definition per declaration found, in file order.
         """
-        return await Symbol.filter(symbol_name=symbol_name).prefetch_related('file')
+        rows: list[Symbol] = await Symbol.filter(
+            symbol_name=symbol_name
+        ).prefetch_related('file')
+
+        return [
+            SymbolDefinition(
+                symbol_name=row.symbol_name,
+                kind=row.kind,
+                file_path=row.file.file_path,
+                line_start=row.line_start,
+                line_end=row.line_end,
+                source=extract_lines(row.file.raw_content, row.line_start, row.line_end),
+            )
+            for row in rows
+        ]

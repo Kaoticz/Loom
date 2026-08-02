@@ -58,6 +58,7 @@ init_typed = true
 warn_required_dynamic_aliases = true
 
 [tool.pyright]
+pythonVersion = "3.14" # The only supported version; do not infer it from the interpreter in use
 typeCheckingMode = "standard"
 analyzeUnannotatedFunctions = true
 reportDeprecated = true

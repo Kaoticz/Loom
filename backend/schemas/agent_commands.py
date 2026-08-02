@@ -10,12 +10,17 @@ from pydantic import BaseModel, ConfigDict, Field
 class CommandAction(str, Enum):
     """
     What the user has asked the session to do next.
+
+    `stop` is unlike the rest: every other action answers a question the session
+    asked, and arrives while it waits. `stop` arrives unprompted, while the agent
+    is working and nothing is listening for an answer.
     """
 
     approve = 'approve'
     reject = 'reject'
     merge = 'merge'
     abort = 'abort'
+    stop = 'stop'
     proceed = 'continue'
     auto_approve = 'auto_approve'
 

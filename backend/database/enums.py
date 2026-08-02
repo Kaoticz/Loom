@@ -12,6 +12,7 @@ class TaskStatus(str, Enum):
 
     initialized = 'initialized'
     running = 'running'
+    cancelled = 'cancelled'
     completed = 'completed'
     merged = 'merged'
     failed = 'failed'

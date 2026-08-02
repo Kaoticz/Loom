@@ -4,7 +4,11 @@ import asyncio
 
 import pytest
 
-from services.indexing_progress import ProgressReporter
+from services.indexing_progress import (
+    DEFAULT_MIN_INTERVAL_SECONDS,
+    MAX_UPDATES_PER_SECOND,
+    ProgressReporter,
+)
 
 
 def collector() -> tuple[list[tuple[int, int, str]], object]:
@@ -151,3 +155,52 @@ def test_invalid_settings_are_rejected(total: int, interval: float) -> None:
     """
     with pytest.raises(ValueError):
         ProgressReporter(total, None, min_interval=interval)
+
+
+async def test_default_interval_allows_a_visibly_advancing_counter() -> None:
+    """
+    The default throttle admits several updates a second, not one every quarter second.
+
+    Requirement 1.5: because progress now updates one message in place rather
+    than appending, the old interval was needlessly coarse and made the count
+    appear to jump straight from the first file to the total.
+    """
+    assert DEFAULT_MIN_INTERVAL_SECONDS == 1.0 / MAX_UPDATES_PER_SECOND
+    assert MAX_UPDATES_PER_SECOND >= 5.0
+
+
+async def test_update_volume_stays_bounded_for_many_files() -> None:
+    """
+    A large repository must not produce one socket message per file.
+
+    Requirement 1.5 and the large-repository edge case: the counter advancing
+    visibly must not mean an update per file.
+    """
+    seen, callback = collector()
+    total: int = 5_000
+    reporter: ProgressReporter = ProgressReporter(total, callback, min_interval=60.0)  # type: ignore[arg-type]
+
+    for index in range(total):
+        await reporter.file_completed(f'file_{index}.py')
+
+    # One admitted immediately, one forced at the end. The rest are throttled.
+    assert len(seen) < total
+    assert len(seen) <= 3
+
+
+async def test_counter_reaches_the_total() -> None:
+    """
+    The last update carries the total, however aggressive the throttle.
+
+    Requirement 1.6: the final progress update is always sent, so the counter
+    finishes at the total rather than stopping wherever the throttle last let a
+    message through.
+    """
+    seen, callback = collector()
+    reporter: ProgressReporter = ProgressReporter(40, callback, min_interval=60.0)  # type: ignore[arg-type]
+
+    for index in range(40):
+        await reporter.file_completed(f'file_{index}.py')
+
+    assert seen[-1][0] == 40
+    assert seen[-1][1] == 40

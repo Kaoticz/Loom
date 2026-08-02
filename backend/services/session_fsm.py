@@ -10,7 +10,8 @@ class SessionState(str, Enum):
 
     `completed` means the reviewer approved the work and the session is waiting
     for the user's final merge decision; `merged` is the terminal state reached
-    once that merge has succeeded.
+    once that merge has succeeded. `cancelled` is distinct from `failed`: the
+    user stopped the work, rather than the work breaking.
     """
 
     initializing = 'initializing'
@@ -24,28 +25,66 @@ class SessionState(str, Enum):
     merging = 'merging'
     merged = 'merged'
     failed = 'failed'
+    cancelled = 'cancelled'
 
 
-TERMINAL_STATES: frozenset[SessionState] = frozenset({SessionState.merged, SessionState.failed})
+TERMINAL_STATES: frozenset[SessionState] = frozenset(
+    {SessionState.merged, SessionState.failed, SessionState.cancelled}
+)
 
 TRANSITIONS: Mapping[SessionState, frozenset[SessionState]] = {
-    SessionState.initializing: frozenset({SessionState.planning, SessionState.failed}),
-    SessionState.planning: frozenset({SessionState.waiting_plan_approval, SessionState.failed}),
+    SessionState.initializing: frozenset(
+        {SessionState.planning, SessionState.failed, SessionState.cancelled}
+    ),
+    SessionState.planning: frozenset(
+        {SessionState.waiting_plan_approval, SessionState.failed, SessionState.cancelled}
+    ),
     SessionState.waiting_plan_approval: frozenset(
-        {SessionState.executing, SessionState.planning, SessionState.failed}
+        {
+            SessionState.executing,
+            SessionState.planning,
+            SessionState.failed,
+            SessionState.cancelled,
+        }
     ),
-    SessionState.executing: frozenset({SessionState.reviewing, SessionState.failed}),
-    SessionState.reviewing: frozenset({SessionState.waiting_review_approval, SessionState.failed}),
+    SessionState.executing: frozenset(
+        {
+            SessionState.reviewing,
+            # A task adjudicated as needing no file changes has no diff, so there
+            # is nothing for review to judge.
+            SessionState.completed,
+            SessionState.failed,
+            SessionState.cancelled,
+        }
+    ),
+    SessionState.reviewing: frozenset(
+        {SessionState.waiting_review_approval, SessionState.failed, SessionState.cancelled}
+    ),
     SessionState.waiting_review_approval: frozenset(
-        {SessionState.completed, SessionState.re_working, SessionState.failed}
+        {
+            SessionState.completed,
+            SessionState.re_working,
+            SessionState.failed,
+            SessionState.cancelled,
+        }
     ),
-    SessionState.re_working: frozenset({SessionState.planning, SessionState.failed}),
+    SessionState.re_working: frozenset(
+        {SessionState.planning, SessionState.failed, SessionState.cancelled}
+    ),
     SessionState.completed: frozenset(
-        {SessionState.merging, SessionState.re_working, SessionState.failed}
+        {
+            SessionState.merging,
+            SessionState.re_working,
+            SessionState.failed,
+            SessionState.cancelled,
+        }
     ),
-    SessionState.merging: frozenset({SessionState.merged, SessionState.failed}),
+    SessionState.merging: frozenset(
+        {SessionState.merged, SessionState.failed, SessionState.cancelled}
+    ),
     SessionState.merged: frozenset(),
     SessionState.failed: frozenset(),
+    SessionState.cancelled: frozenset(),
 }
 
 
@@ -160,6 +199,18 @@ class SessionStateMachine:
         self._current = target
         self._history.append(target)
         return self._current
+
+    def cancel(self) -> SessionState:
+        """
+        Move the machine to the cancelled state from wherever it currently is.
+
+        Distinct from failing: the user stopped the work rather than the work
+        breaking, and history should be able to tell the two apart.
+
+        :returns: The new current state.
+        :raises InvalidStateTransitionError: If the machine has already terminated.
+        """
+        return self.transition_to(SessionState.cancelled)
 
     def fail(self) -> SessionState:
         """
