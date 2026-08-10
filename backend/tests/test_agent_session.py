@@ -11,6 +11,7 @@ import pytest
 from schemas.agent_commands import CommandAction, SessionCommand
 from api.v1.agent_session import AgentSession, SessionServices, StopRequested
 from agents.coder import AgentDeps
+from database.enums import TaskStatus
 from schemas.agent_messages import MessageType
 from services.code_search import CodeSearchService
 from services.conversation_history import ConversationHistory
@@ -18,6 +19,7 @@ from services.docker_sandbox import DockerSandboxManager
 from services.event_bus import (
     INDEXING_PROGRESS_KEY,
     AgentEvent,
+    DoneEvent,
     ErrorEvent,
     EventBus,
     SandboxUnavailableEvent,
@@ -290,23 +292,39 @@ def stub_agents(
     monkeypatch: pytest.MonkeyPatch,
     plan_outputs: list[str],
     review_results: list[tuple[bool, str]],
+    classifications: list[tuple[bool, str]] | None = None,
 ) -> dict[str, list[str]]:
     """
-    Replace the coder and reviewer agents with scripted stand-ins.
+    Replace the coder, reviewer and classifying agents with scripted stand-ins.
 
     :param monkeypatch: Fixture used to swap the agents out.
     :param plan_outputs: The successive outputs the coder should return.
     :param review_results: The successive verdicts the reviewer should return.
+    :param classifications: The successive classifier verdicts, defaulting to
+        "changes are required" so that a test not concerned with the read-only
+        path follows the ordinary route.
     :returns: A record of the prompts each agent received.
     """
+    import agents.classifier as classifier_module
     import agents.coder as coder_module
     import agents.reviewer as reviewer_module
     import api.v1.agent_session as module
+    from agents.classifier import ClassificationResult
     from agents.reviewer import ReviewResult
 
-    seen: dict[str, list[str]] = {'coder': [], 'reviewer': []}
+    seen: dict[str, list[str]] = {'coder': [], 'reviewer': [], 'classifier': []}
     plans: list[str] = list(plan_outputs)
     reviews: list[tuple[bool, str]] = list(review_results)
+    verdicts: list[tuple[bool, str]] = list(
+        classifications if classifications is not None else [(True, 'The task asks for a change.')]
+    )
+
+    async def fake_classify(prompt: str, **kwargs: Any) -> Any:
+        seen['classifier'].append(prompt)
+        required, reason = verdicts.pop(0) if verdicts else (True, 'The task asks for a change.')
+        result: Any = MagicMock()
+        result.output = ClassificationResult(changes_are_required=required, reason=reason)
+        return result
 
     async def fake_run(prompt: str, **kwargs: Any) -> Any:
         seen['coder'].append(prompt)
@@ -321,6 +339,7 @@ def stub_agents(
         result.output = ReviewResult(approved=approved, comments=comments)
         return result
 
+    monkeypatch.setattr(classifier_module.classifier_agent, 'run', fake_classify)
     monkeypatch.setattr(coder_module.coder_agent, 'run', fake_run)
     monkeypatch.setattr(reviewer_module.reviewer_agent, 'run', fake_review)
     monkeypatch.setattr(
@@ -821,6 +840,7 @@ async def test_losing_the_client_mid_execution_unwinds(
         raise ClientGone()
 
     monkeypatch.setattr(session, '_handle_executing', executing_that_notices)
+    session._machine.transition_to(SessionState.classifying)
     session._machine.transition_to(SessionState.planning)
     session._machine.transition_to(SessionState.waiting_plan_approval)
     session._machine.transition_to(SessionState.executing)
@@ -1362,3 +1382,279 @@ async def test_an_unusable_chunk_size_does_not_stop_the_session(
     await session.run()
 
     assert services.indexing.chunk_lines == expected
+
+
+async def _answer_instead_of_executing(self: AgentSession) -> SessionState:
+    """
+    Stand in for the answering phase, which streams a real model run.
+
+    :param self: The session being driven.
+    :returns: The state the answering phase reaches.
+    """
+    self._session.accept_completion_without_changes('It retries three times, then gives up.')
+    return await self._present_answer()
+
+
+async def test_a_task_needing_no_changes_is_never_planned(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """
+    Requirements 2.4 and 2.5, end to end.
+
+    The session runs to a close on the client's opening message alone: no plan
+    is offered, so no approval is asked for, and no merge decision is either.
+    Any of those would have blocked waiting for a reply that never comes.
+    """
+    import api.v1.agent_session as module
+
+    stub_agents(
+        monkeypatch,
+        [],
+        [],
+        classifications=[(False, 'The task asks how something works.')],
+    )
+    monkeypatch.setattr(
+        module.AgentSession, '_handle_answering', _answer_instead_of_executing, raising=True
+    )
+    session, _, events, _ = build_session([opening('How does the retry policy work?')])
+
+    assert await session.run() is SessionState.answered
+
+    assert 'plan' not in types_of(events)
+    done: list[DoneEvent] = [event for event in events if isinstance(event, DoneEvent)]
+    assert len(done) == 1
+    assert done[0].summary == 'It retries three times, then gives up.'
+    # No branch means no merge is on offer, which is what ends the session here.
+    assert done[0].branch_name == ''
+
+
+async def test_a_task_needing_no_changes_is_recorded_as_answered(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """
+    Requirement 2.8: not `completed`, which here promises a pending merge.
+    """
+    import api.v1.agent_session as module
+
+    stub_agents(monkeypatch, [], [], classifications=[(False, 'It is a question.')])
+    monkeypatch.setattr(
+        module.AgentSession, '_handle_answering', _answer_instead_of_executing, raising=True
+    )
+    session, _, _, _ = build_session([opening('Explain the retry policy.')])
+    recorded: list[TaskStatus] = []
+
+    async def capture(status: TaskStatus, summary: str | None = None) -> None:
+        recorded.append(status)
+
+    monkeypatch.setattr(session, '_record_status', capture)
+
+    await session.run()
+
+    assert TaskStatus.answered in recorded
+    assert TaskStatus.completed not in recorded
+    assert TaskStatus.merged not in recorded
+
+
+async def test_a_task_needing_changes_still_plans_and_merges(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """
+    Requirement 2.3: the ordinary route is untouched by the new one.
+    """
+    stub_agents(
+        monkeypatch,
+        ['1. Do the thing'],
+        [(True, 'Looks correct.')],
+        classifications=[(True, 'The task asks for a timeout to be added.')],
+    )
+    session, _, events, _ = build_session([
+        opening(),
+        json.dumps({'approved': True}),
+        json.dumps({'approved': True}),
+    ])
+
+    assert await session.run() is SessionState.merged
+    assert 'plan' in types_of(events)
+
+
+async def test_the_classifier_is_asked_about_the_task_alone(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """
+    Requirement 2.2: it judges the request, and is shown nothing else.
+    """
+    seen = stub_agents(
+        monkeypatch,
+        ['1. Do the thing'],
+        [(True, 'Fine.')],
+        classifications=[(True, 'The task asks for a change.')],
+    )
+    session, _, _, _ = build_session([
+        opening('Add a timeout to the HTTP client'),
+        json.dumps({'approved': True}),
+        json.dumps({'approved': True}),
+    ])
+
+    await session.run()
+
+    assert len(seen['classifier']) == 1
+    assert 'Add a timeout to the HTTP client' in seen['classifier'][0]
+
+
+async def test_the_classifier_is_asked_before_any_planning(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """
+    Requirement 2.1: the question is settled before a plan is produced.
+    """
+    order: list[str] = []
+    stub_agents(monkeypatch, ['1. Do the thing'], [(True, 'Fine.')])
+    session, _, _, _ = build_session([
+        opening(),
+        json.dumps({'approved': True}),
+        json.dumps({'approved': True}),
+    ])
+
+    original_classify = session._handle_classifying
+    original_plan = session._handle_planning
+
+    async def note_classify() -> SessionState:
+        order.append('classify')
+        return await original_classify()
+
+    async def note_plan() -> SessionState:
+        order.append('plan')
+        return await original_plan()
+
+    monkeypatch.setattr(session, '_handle_classifying', note_classify)
+    monkeypatch.setattr(session, '_handle_planning', note_plan)
+
+    await session.run()
+
+    assert order[:2] == ['classify', 'plan']
+
+
+async def test_an_unreachable_classifier_fails_the_session_with_the_reason(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """
+    A classifier that cannot be reached must not be guessed around.
+
+    Guessing "no changes" would end real work with an answer; guessing
+    "changes" would put a question through planning and a merge decision.
+    """
+    import agents.classifier as classifier_module
+
+    stub_agents(monkeypatch, ['1. Do the thing'], [(True, 'Fine.')])
+
+    async def unreachable(prompt: str, **kwargs: Any) -> Any:
+        raise ConnectionError('the model host refused the connection')
+
+    monkeypatch.setattr(classifier_module.classifier_agent, 'run', unreachable)
+    session, _, events, _ = build_session([opening()])
+
+    assert await session.run() is SessionState.failed
+
+    errors: list[ErrorEvent] = [event for event in events if isinstance(event, ErrorEvent)]
+    assert any('could not be classified' in event.content for event in errors)
+    assert any('refused the connection' in event.content for event in errors)
+    assert 'plan' not in types_of(events)
+
+
+async def test_a_task_needing_no_changes_creates_no_branch(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """
+    A task that changes nothing must leave nothing behind.
+
+    Creating the branch while initialising left an empty one in the repository
+    for every question anyone asked, and a branch name on a history record for
+    a task that never touched the tree.
+    """
+    import api.v1.agent_session as module
+
+    stub_agents(monkeypatch, [], [], classifications=[(False, 'It is a question.')])
+    monkeypatch.setattr(
+        module.AgentSession, '_handle_answering', _answer_instead_of_executing, raising=True
+    )
+    session, _, _, services = build_session([opening('Explain the retry policy.')])
+
+    assert await session.run() is SessionState.answered
+
+    assert services.git.created_branches == []
+
+
+async def test_a_task_needing_changes_creates_its_branch(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """
+    Deferring branch creation must not lose it for work that does change files.
+    """
+    stub_agents(
+        monkeypatch,
+        ['1. Do the thing'],
+        [(True, 'Fine.')],
+        classifications=[(True, 'The task asks for a change.')],
+    )
+    session, _, _, services = build_session([
+        opening(),
+        json.dumps({'approved': True}),
+        json.dumps({'approved': True}),
+    ])
+
+    assert await session.run() is SessionState.merged
+
+    assert services.git.created_branches == ['ai-task-testsess']
+
+
+async def test_an_escalated_task_gets_a_branch_before_it_plans(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """
+    Requirement 2.7: a task that escalates joins the ordinary route in full,
+    branch included, or the work it goes on to do has nowhere to land.
+    """
+    import api.v1.agent_session as module
+
+    stub_agents(
+        monkeypatch,
+        ['1. Do the thing'],
+        [(True, 'Fine.')],
+        classifications=[(False, 'It looks like a question.')],
+    )
+
+    async def answer_that_escalates(self: AgentSession) -> SessionState:
+        return await self._escalate_to_planning()
+
+    monkeypatch.setattr(
+        module.AgentSession, '_handle_answering', answer_that_escalates, raising=True
+    )
+    session, _, _, services = build_session([
+        opening('Is the retry policy right, and fix it if not'),
+        json.dumps({'approved': True}),
+        json.dumps({'approved': True}),
+    ])
+
+    assert await session.run() is SessionState.merged
+
+    assert services.git.created_branches == ['ai-task-testsess']
+
+
+async def test_the_branch_is_created_only_once(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """
+    Creating the same branch twice fails, so the second attempt is a no-op.
+
+    Exercised directly rather than through a session run: today exactly one of
+    the two routes into planning creates it, so a run cannot reach the guard.
+    It is kept because `create_branch` is unforgiving of a repeat, and a third
+    caller added later would find out the hard way.
+    """
+    stub_agents(monkeypatch, ['1. Do the thing'], [(True, 'Fine.')])
+    session, _, _, services = build_session([opening()])
+
+    await session._ensure_branch()
+    await session._ensure_branch()
+
+    assert services.git.created_branches == ['ai-task-testsess']

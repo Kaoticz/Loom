@@ -12,6 +12,7 @@ from services.event_bus import (
     DoneEvent,
     ErrorEvent,
     PlanEvent,
+    QuestionEvent,
     ReviewEvent,
     SandboxStage,
     SandboxUnavailableEvent,
@@ -79,6 +80,7 @@ class MessageType(str, Enum):
     done = 'done'
     error = 'error'
     session_busy = 'session_busy'
+    question = 'question'
     system = 'system'
     sandbox_unavailable = 'sandbox_unavailable'
 
@@ -161,6 +163,20 @@ class DiffMessage(BaseAgentMessage):
     original: Annotated[str, Field()]
     modified: Annotated[str, Field()]
     truncated: Annotated[bool, Field(description='Whether either side was shortened because the file is too large to display in full.')] = False
+
+
+class QuestionMessage(BaseAgentMessage):
+    """
+    A question the agent has put to the user, with the answers it suggests.
+
+    The suggestions are only suggestions: the interface adds an option to reply
+    freely, which the agent neither supplies nor can suppress. A question with
+    no suggestions at all is therefore still a usable one.
+    """
+
+    type: Annotated[Literal[MessageType.question], Field()] = MessageType.question
+    question: Annotated[str, Field()]
+    options: Annotated[list[str], Field()] = []
 
 
 class ReviewMessage(BaseAgentMessage):
@@ -246,6 +262,7 @@ AgentMessage = Annotated[
     | ObservationMessage
     | CommitMessage
     | DiffMessage
+    | QuestionMessage
     | ReviewMessage
     | DoneMessage
     | ErrorMessage
@@ -301,6 +318,8 @@ def to_message(event: BaseAgentEvent) -> AgentMessage:
             modified=modified,
             truncated=original_cut or modified_cut,
         )
+    if isinstance(event, QuestionEvent):
+        return QuestionMessage(question=event.question, options=list(event.options))
     if isinstance(event, ReviewEvent):
         return ReviewMessage(approved=event.approved, comments=event.comments)
     if isinstance(event, DoneEvent):

@@ -14,6 +14,11 @@ class CommandAction(str, Enum):
     `stop` is unlike the rest: every other action answers a question the session
     asked, and arrives while it waits. `stop` arrives unprompted, while the agent
     is working and nothing is listening for an answer.
+
+    `reply` answers a question the *agent* asked, not the session, and goes to
+    the tool waiting on it rather than into the queue the session reads. Keeping
+    it a distinct action is what stops a reply being counted as a rejection, and
+    an approval being handed to a tool that asked something else entirely.
     """
 
     approve = 'approve'
@@ -21,6 +26,7 @@ class CommandAction(str, Enum):
     merge = 'merge'
     abort = 'abort'
     stop = 'stop'
+    reply = 'reply'
     proceed = 'continue'
     auto_approve = 'auto_approve'
 
@@ -39,6 +45,7 @@ class SessionCommand(BaseModel):
     approved: Annotated[bool | None, Field(description='Shorthand approval flag sent by the current client.')] = None
     action: Annotated[CommandAction | None, Field(description='An explicit instruction, taking precedence over the flag.')] = None
     reason: Annotated[str, Field(description='Why the user rejected, passed back to the agent as feedback.')] = ''
+    reply: Annotated[str, Field(description="The user's answer to a question the agent asked.")] = ''
 
     @property
     def resolved_action(self) -> CommandAction:

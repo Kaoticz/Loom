@@ -1,24 +1,42 @@
 <script lang="ts">
     import type { TaskStatus } from '$lib/stores/agent';
-    import { canSendPrompt, isWorking, promptPlaceholder } from '$lib/chatPresentation';
+    import { canSubmitPrompt, isWorking, promptPlaceholder } from '$lib/chatPresentation';
 
     let {
         prompt = $bindable(''),
         status,
         pendingAction = null,
+        answeringQuestion = false,
+        focusRequest = 0,
         onsend,
         onstop
     }: {
         prompt?: string;
         status: TaskStatus;
         pendingAction?: string | null;
+        /** Whether the agent is waiting on an answer, which the box now sends. */
+        answeringQuestion?: boolean;
+        /**
+         * Bumped to ask for focus.
+         *
+         * A number rather than a method, so the box stays prop-driven: choosing
+         * the free-reply option has to put the cursor where the reply is typed,
+         * and the panel offering that option cannot reach in here itself.
+         */
+        focusRequest?: number;
         onsend: (prompt: string) => void;
         onstop: () => void;
     } = $props();
 
     const working = $derived(isWorking(status));
-    const canSend = $derived(canSendPrompt(status, pendingAction));
-    const placeholder = $derived(promptPlaceholder(status, pendingAction));
+    const canSend = $derived(canSubmitPrompt(status, pendingAction, answeringQuestion));
+    const placeholder = $derived(promptPlaceholder(status, pendingAction, answeringQuestion));
+
+    let box: HTMLTextAreaElement | undefined = $state();
+
+    $effect(() => {
+        if (focusRequest > 0) box?.focus();
+    });
 
     function send() {
         if (!canSend || !prompt.trim()) return;
@@ -38,6 +56,7 @@
         class="flex gap-2 rounded-xl border border-gray-300 bg-white p-2 shadow-inner transition-all focus-within:ring-2 focus-within:ring-blue-500 dark:border-gray-600 dark:bg-gray-700"
     >
         <textarea
+            bind:this={box}
             bind:value={prompt}
             onkeydown={handleKeydown}
             {placeholder}

@@ -48,7 +48,9 @@ function renderFeed(scrollTop: number) {
         messages: [...messages],
         onapprove: () => {},
         onreject: () => {},
-        onretry: () => {}
+        onretry: () => {},
+        onanswer: () => {},
+        onfreereply: () => {}
     });
 
     const feed = rendered.getByTestId('chat-feed');

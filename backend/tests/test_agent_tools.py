@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+from collections.abc import Sequence
+
 from pathlib import Path
 from typing import Any
 from unittest.mock import MagicMock
@@ -25,9 +27,11 @@ from services.event_bus import (
 from services.file_editor import FileEditorService
 from services.git_manager import GitManagerService
 from services.session_context import SessionContext
+from services.user_questions import UserQuestioner
 from tests.conftest import git_log, stub_embedding_service
 
 EXPECTED_TOOLS: set[str] = {
+    'ask_user',
     'search_code',
     'search_code_lexical',
     'get_symbol',
@@ -53,55 +57,6 @@ async def invoke(tool_name: str, deps: AgentDeps, **kwargs: Any) -> str:
     context.deps = deps
     result: Any = await coder_agent._function_toolset.tools[tool_name].function(context, **kwargs)
     return str(result)
-
-
-class Adjudications:
-    """
-    A scripted stand-in for the adjudicating subagent.
-
-    Holds the verdicts to hand out in order and records the prompts it was
-    given, so a test can check the adjudicator was asked the right question as
-    well as what it answered.
-    """
-
-    verdicts: list[tuple[bool, str]]
-    prompts: list[str]
-    models: list[Any]
-
-    def __init__(self) -> None:
-        """
-        Create an adjudicator that has been asked nothing.
-        """
-        self.verdicts = []
-        self.prompts = []
-        self.models = []
-
-
-@pytest.fixture
-def adjudicator(monkeypatch: pytest.MonkeyPatch) -> Adjudications:
-    """
-    Replace the adjudicating subagent with a scripted stand-in.
-
-    :param monkeypatch: Fixture used to swap the agent out.
-    :returns: The recorder, whose verdicts a test appends to.
-    """
-    import agents.adjudicator as adjudicator_module
-    from agents.adjudicator import AdjudicationResult
-
-    scripted: Adjudications = Adjudications()
-
-    async def fake_run(prompt: str, **kwargs: Any) -> Any:
-        scripted.prompts.append(prompt)
-        scripted.models.append(kwargs.get('model'))
-        if not scripted.verdicts:
-            raise AssertionError('the adjudicator was consulted without a scripted verdict')
-        required, reason = scripted.verdicts.pop(0)
-        result: Any = MagicMock()
-        result.output = AdjudicationResult(changes_were_required=required, reason=reason)
-        return result
-
-    monkeypatch.setattr(adjudicator_module.adjudicator_agent, 'run', fake_run)
-    return scripted
 
 
 @pytest.fixture
@@ -183,27 +138,6 @@ async def test_edit_file_records_the_modification(deps: AgentDeps) -> None:
 
     assert len(deps.session.modified_files) == before + 1
     assert 'return 2' in Path(deps.git.repo_path, 'm.py').read_text()
-
-
-async def test_complete_task_gate(deps: AgentDeps, adjudicator: Adjudications) -> None:
-    """
-    Completion is refused until a change has been made and verified green.
-
-    The first refusal now comes from the adjudicator rather than from counting
-    files: with nothing modified, whether that is a problem depends on the task.
-    """
-    adjudicator.verdicts.append((True, 'The task asked for a new module.'))
-    assert 'rejected' in (await invoke('complete_task', deps, summary='done')).lower()
-
-    await invoke('create_file', deps, path='m.py', content='x\n')
-    assert 'not been verified' in await invoke('complete_task', deps, summary='done')
-
-    deps.session.record_verification(False)
-    assert 'verification command failed' in await invoke('complete_task', deps, summary='done')
-
-    deps.session.record_verification(True)
-    assert 'Task marked complete' in await invoke('complete_task', deps, summary='Added m.py.')
-    assert deps.session.completion_requested is True
 
 
 async def test_run_test_command_reports_the_verdict(deps: AgentDeps) -> None:
@@ -374,15 +308,15 @@ def collect(events: EventBus) -> list[AgentEvent]:
 async def test_every_tool_self_reports(
     deps: AgentDeps,
     events: EventBus,
-    adjudicator: Adjudications,
     tool_name: str,
     kwargs: dict[str, Any],
 ) -> None:
     """
     Tools announce themselves through the bus rather than being parsed for.
     """
-    # `complete_task` with nothing modified consults the adjudicator.
-    adjudicator.verdicts.append((True, 'The task called for changes.'))
+    # `complete_task` with nothing modified is refused, but a refusal is still
+    # reported: what is under test is that the tool announces itself either way.
+    deps.session.record_classification(True)
     seen: list[AgentEvent] = collect(events)
     await invoke(tool_name, deps, **kwargs)
 
@@ -585,144 +519,99 @@ async def test_missing_sandbox_tells_the_agent_not_to_retry(deps: AgentDeps) -> 
     assert 'could not be verified' in result
 
 
-async def test_a_task_needing_no_changes_completes(
-    deps: AgentDeps, adjudicator: Adjudications
-) -> None:
+async def test_a_task_classified_as_needing_no_changes_completes(deps: AgentDeps) -> None:
     """
     A task that only ever called for an answer is allowed to finish.
 
-    Requirement 10.1 and 10.5: refusing here is the defect, since summarising or
-    explaining changes nothing by nature.
+    Requirement 2.4: the classification was made before the work began, so the
+    gate reads it rather than asking anything.
     """
-    deps.session.configure('Summarise how the session state machine works.', 'reviewer')
-    adjudicator.verdicts.append((False, 'The task asked for an explanation, not a change.'))
+    deps.session.record_classification(False)
 
     result: str = await invoke('complete_task', deps, summary='It is a finite state machine.')
 
-    assert 'complete' in result.lower()
+    assert 'no file changes' in result
     assert deps.session.completion_requested is True
     assert deps.session.completed_without_changes is True
 
 
-async def test_a_task_needing_changes_is_still_refused(
-    deps: AgentDeps, adjudicator: Adjudications
+async def test_a_task_classified_as_needing_changes_is_refused_when_none_were_made(
+    deps: AgentDeps,
 ) -> None:
     """
-    Requirement 10.6: the existing refusal stands where it should.
+    Requirement 2.10: producing nothing is still a refusal, and says why.
     """
-    deps.session.configure('Add a health endpoint.', 'reviewer')
-    adjudicator.verdicts.append((True, 'The task asked for a new endpoint, which needs code.'))
+    deps.session.record_classification(True)
 
-    result: str = await invoke('complete_task', deps, summary='Looks fine to me.')
+    result: str = await invoke('complete_task', deps, summary='I had a look and it seems fine.')
 
     assert 'rejected' in result.lower()
-    assert 'new endpoint' in result
+    assert 'judged to require changing at least one file' in result
     assert deps.session.completion_requested is False
-    assert deps.session.completed_without_changes is False
 
 
-async def test_the_adjudicator_is_asked_about_the_task_and_the_summary(
-    deps: AgentDeps, adjudicator: Adjudications
+async def test_an_unclassified_session_is_refused_rather_than_excused(
+    deps: AgentDeps,
 ) -> None:
     """
-    Requirement 10.2: it receives the task description and the proposed summary.
+    A missing classification must not become a free pass.
+
+    Nothing should reach the gate unclassified, but if anything ever does, the
+    safe reading is the strict one: treating the absence as "no changes needed"
+    would let any task finish having done nothing at all.
     """
-    deps.session.configure('Explain the retry policy.', 'reviewer')
-    adjudicator.verdicts.append((False, 'Explaining changes nothing.'))
+    assert deps.session.changes_are_required is None
 
-    await invoke('complete_task', deps, summary='It retries three times.')
+    result: str = await invoke('complete_task', deps, summary='Nothing to do here.')
 
-    assert 'Explain the retry policy.' in adjudicator.prompts[0]
-    assert 'It retries three times.' in adjudicator.prompts[0]
-
-
-async def test_the_adjudicator_runs_on_the_reviewer_model(
-    deps: AgentDeps, adjudicator: Adjudications
-) -> None:
-    """
-    Requirement 10.3: judging the work is the reviewer's business, not the coder's.
-    """
-    deps.session.configure('Explain something.', 'some-reviewer-model')
-    adjudicator.verdicts.append((False, 'Nothing to change.'))
-
-    await invoke('complete_task', deps, summary='Explained.')
-
-    assert adjudicator.models[0] == 'some-reviewer-model'
+    assert 'rejected' in result.lower()
+    assert deps.session.completion_requested is False
 
 
-async def test_the_adjudicator_is_not_consulted_once_files_have_changed(
-    deps: AgentDeps, adjudicator: Adjudications
-) -> None:
-    """
-    Requirement 10.8: with changes present, the existing path is untouched.
-    """
-    await invoke('create_file', deps, path='m.py', content='x\n')
-    deps.session.record_verification(True)
-
-    result: str = await invoke('complete_task', deps, summary='Added m.py.')
-
-    assert 'Task marked complete' in result
-    assert adjudicator.prompts == [], 'the adjudicator should not have been asked'
-    assert deps.session.completed_without_changes is False
-
-
-async def test_an_unreachable_adjudicator_fails_rather_than_guessing(
+async def test_the_completion_gate_asks_nothing_of_a_subagent(
     deps: AgentDeps, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     """
-    Requirements 10.9 and 10.10: the error escapes the tool.
+    Requirement 2.9: the question is settled before the task starts.
 
-    Swallowing it would either let a task finish that should not have, or send
-    the agent round a loop it cannot escape. Escaping reaches the state machine's
-    own failure handling, which fails the session.
+    Asserted by making any use of the subagent an error. A gate that consulted
+    it would be re-litigating a decision already made, and could contradict it.
     """
-    import agents.adjudicator as adjudicator_module
+    import agents.classifier as classifier_module
 
-    async def unreachable(prompt: str, **kwargs: Any) -> Any:
-        raise ConnectionError('the reviewer model is unreachable')
+    async def refuse(prompt: str, **kwargs: Any) -> Any:
+        raise AssertionError('the classifier was consulted at completion time')
 
-    monkeypatch.setattr(adjudicator_module.adjudicator_agent, 'run', unreachable)
-    deps.session.configure('Explain something.', 'reviewer')
+    monkeypatch.setattr(classifier_module.classifier_agent, 'run', refuse)
+    deps.session.record_classification(False)
 
-    with pytest.raises(ConnectionError):
-        await invoke('complete_task', deps, summary='Explained.')
-
-    assert deps.session.completion_requested is False
+    assert 'no file changes' in await invoke('complete_task', deps, summary='An answer.')
 
 
-async def test_a_failing_adjudicator_still_reports_the_tool_failure(
-    deps: AgentDeps, events: EventBus, monkeypatch: pytest.MonkeyPatch
-) -> None:
+async def test_the_ordinary_completion_gate_is_unchanged(deps: AgentDeps) -> None:
     """
-    Requirement 10.10: the user still sees which tool failed on the way out.
+    Requirement 2.3: a task that changes files finishes exactly as it did.
     """
-    import agents.adjudicator as adjudicator_module
+    deps.session.record_classification(True)
 
-    async def unreachable(prompt: str, **kwargs: Any) -> Any:
-        raise ConnectionError('the reviewer model is unreachable')
+    await invoke('create_file', deps, path='m.py', content='x\n')
+    assert 'not been verified' in await invoke('complete_task', deps, summary='done')
 
-    monkeypatch.setattr(adjudicator_module.adjudicator_agent, 'run', unreachable)
-    seen: list[AgentEvent] = collect(events)
+    deps.session.record_verification(False)
+    assert 'verification command failed' in await invoke('complete_task', deps, summary='done')
 
-    with pytest.raises(ConnectionError):
-        await invoke('complete_task', deps, summary='Explained.')
-
-    failures = [
-        event
-        for event in seen
-        if isinstance(event, ToolObservationEvent) and event.status is ToolStatus.failure
-    ]
-    assert [event.tool_name for event in failures] == ['complete_task']
+    deps.session.record_verification(True)
+    assert 'Task marked complete' in await invoke('complete_task', deps, summary='Added m.py.')
+    assert deps.session.completion_requested is True
 
 
 async def test_an_empty_answer_is_refused_even_when_no_changes_were_needed(
-    deps: AgentDeps, adjudicator: Adjudications
+    deps: AgentDeps,
 ) -> None:
     """
     A task that produced no answer has not been completed, whatever the verdict.
     """
-    deps.session.configure('Explain something.', 'reviewer')
-    adjudicator.verdicts.append((False, 'Nothing to change.'))
+    deps.session.record_classification(False)
 
     with pytest.raises(ValueError):
         await invoke('complete_task', deps, summary='   ')
@@ -874,3 +763,121 @@ async def test_get_symbol_reports_a_count_rather_than_the_source(
     observations = [event for event in seen if isinstance(event, ToolObservationEvent)]
     assert observations[0].result == 'Found the definition of find_user.'
     assert 'def find_user' not in observations[0].result
+
+
+def questioner_answering(reply: str) -> tuple[UserQuestioner, list[tuple[str, list[str]]]]:
+    """
+    Build a questioner that answers immediately, recording what it was asked.
+
+    :param reply: The answer the user gives.
+    :returns: The questioner and the list its questions are recorded in.
+    """
+    asked: list[tuple[str, list[str]]] = []
+
+    async def emit(question: str, options: Sequence[str]) -> None:
+        asked.append((question, list(options)))
+
+    async def answer() -> str:
+        return reply
+
+    return UserQuestioner(emit_question=emit, await_reply=answer), asked
+
+
+async def test_ask_user_returns_the_reply_to_the_agent(deps: AgentDeps) -> None:
+    """
+    Requirement 4.1: the tool's result is what the user said.
+    """
+    deps.questioner, asked = questioner_answering('Use the second one.')
+
+    result: str = await invoke(
+        'ask_user', deps, question='Which retry policy?', options=['The first', 'The second']
+    )
+
+    assert 'Use the second one.' in result
+    assert asked == [('Which retry policy?', ['The first', 'The second'])]
+
+
+async def test_ask_user_accepts_a_question_with_no_suggestions(deps: AgentDeps) -> None:
+    """
+    Requirement 4.7: the free-reply option alone is a usable interface, so a
+    question offering nothing else is still worth asking.
+    """
+    deps.questioner, asked = questioner_answering('Whatever you think.')
+
+    result: str = await invoke('ask_user', deps, question='How should this behave?')
+
+    assert 'Whatever you think.' in result
+    assert asked == [('How should this behave?', [])]
+
+
+async def test_ask_user_truncates_rather_than_refusing(deps: AgentDeps) -> None:
+    """
+    Requirement 4.6a: extra options cost the agent nothing but a correction.
+
+    Refusing the call would lose the agent its turn over something cosmetic,
+    and the question would have been perfectly usable without the extras.
+    """
+    deps.questioner, asked = questioner_answering('The third.')
+
+    result: str = await invoke(
+        'ask_user',
+        deps,
+        question='Which one?',
+        options=[f'Option {index}' for index in range(1, 10)],
+    )
+
+    assert asked[0][1] == [f'Option {index}' for index in range(1, 7)]
+    assert 'The third.' in result
+    # The agent has to learn, or it will send nine again next time.
+    assert 'were dropped' in result
+
+
+async def test_ask_user_says_nothing_was_dropped_when_nothing_was(deps: AgentDeps) -> None:
+    """
+    The correction must not appear on a question that did not need it.
+    """
+    deps.questioner, _ = questioner_answering('The first.')
+
+    result: str = await invoke('ask_user', deps, question='Which?', options=['a', 'b'])
+
+    assert 'were dropped' not in result
+
+
+async def test_ask_user_refuses_an_empty_question(deps: AgentDeps) -> None:
+    """
+    An empty question puts nothing in front of the user to answer.
+    """
+    deps.questioner, asked = questioner_answering('...')
+
+    result: str = await invoke('ask_user', deps, question='   ')
+
+    assert 'rejected' in result.lower()
+    assert asked == []
+
+
+async def test_ask_user_says_so_when_there_is_no_one_to_ask(deps: AgentDeps) -> None:
+    """
+    The tools are also driven with no session behind them.
+
+    Hanging would be the worst outcome; so would pretending an answer.
+    """
+    assert deps.questioner is None
+
+    result: str = await invoke('ask_user', deps, question='Which one?')
+
+    assert 'no user to ask' in result
+
+
+async def test_ask_user_reports_itself_like_every_other_tool(
+    deps: AgentDeps, events: EventBus
+) -> None:
+    """
+    The question is a tool call, and the feed should show it as one.
+    """
+    deps.questioner, _ = questioner_answering('Yes.')
+    seen: list[AgentEvent] = collect(events)
+
+    await invoke('ask_user', deps, question='Shall I?')
+
+    actions = [event for event in seen if isinstance(event, ToolActionEvent)]
+    assert [event.tool_name for event in actions] == ['ask_user']

@@ -1,27 +1,35 @@
 <script lang="ts">
-    import type { BlockedReason, Message } from '$lib/stores/agent';
+    import type { BlockedReason, Message, PendingQuestion } from '$lib/stores/agent';
     import { isAtBottom } from '$lib/scrolling';
     import ApprovalPanel from './ApprovalPanel.svelte';
     import BlockedNotice from './BlockedNotice.svelte';
     import ChatMessage from './ChatMessage.svelte';
+    import QuestionPanel from './QuestionPanel.svelte';
 
     let {
         messages,
         blocked = null,
         actionType = null,
         reason = '',
+        question = null,
         onapprove,
         onreject,
-        onretry
+        onretry,
+        onanswer,
+        onfreereply
     }: {
         messages: Message[];
         blocked?: BlockedReason;
+        /** The question the agent is waiting on, or null if it is not. */
+        question?: PendingQuestion | null;
         actionType?: string | null;
         /** The text being composed, which the approval panel offers as a reason. */
         reason?: string;
         onapprove: () => void;
         onreject: (reason: string) => void;
         onretry: () => void;
+        onanswer: (answer: string) => void;
+        onfreereply: () => void;
     } = $props();
 
     let container: HTMLElement | undefined = $state();
@@ -67,5 +75,14 @@
 
     {#if actionType}
         <ApprovalPanel {actionType} {reason} {onapprove} {onreject} />
+    {/if}
+
+    {#if question}
+        <QuestionPanel
+            question={question.question}
+            options={question.options}
+            {onanswer}
+            {onfreereply}
+        />
     {/if}
 </div>

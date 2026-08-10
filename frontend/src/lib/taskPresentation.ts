@@ -12,6 +12,9 @@ export const taskStatusStyles: Record<TaskStatus, string> = {
     running: 'bg-blue-100 text-blue-800 dark:bg-blue-900/40 dark:text-blue-200',
     completed: 'bg-green-100 text-green-800 dark:bg-green-900/40 dark:text-green-200',
     merged: 'bg-emerald-100 text-emerald-800 dark:bg-emerald-900/40 dark:text-emerald-200',
+    // Deliberately unlike `completed` and `merged`: this task produced an answer
+    // rather than a diff, so nothing was merged and nothing is waiting to be.
+    answered: 'bg-sky-100 text-sky-800 dark:bg-sky-900/40 dark:text-sky-200',
     failed: 'bg-red-100 text-red-800 dark:bg-red-900/40 dark:text-red-200',
     // Deliberately unlike `failed`: the user stopped this, it did not break.
     cancelled: 'bg-amber-100 text-amber-800 dark:bg-amber-900/40 dark:text-amber-200'

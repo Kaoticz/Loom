@@ -106,18 +106,30 @@ describe('sandboxStageLabels', () => {
 });
 
 describe('isWorking', () => {
-    it.each(['indexing', 'planning', 'executing', 'reviewing', 're_working', 'merging'] as const)(
-        'counts %s as working',
-        (status) => {
-            expect(isWorking(status)).toBe(true);
-        }
-    );
+    it.each([
+        'indexing',
+        // Both phases the read-only route added. The agent is running under its
+        // own steam in each, so a stop must be on offer and a typed prompt must
+        // not be sent into a session that is not listening for one.
+        'classifying',
+        'planning',
+        'executing',
+        'answering',
+        'reviewing',
+        're_working',
+        'merging'
+    ] as const)('counts %s as working', (status) => {
+        expect(isWorking(status)).toBe(true);
+    });
 
     it.each([
         'idle',
         'waiting_approval',
         'waiting_review_approval',
         'completed',
+        // The answer has been given and the session is over, so a new task can
+        // be typed straight away.
+        'answered',
         'merged',
         'failed'
     ] as const)('does not count %s as working', (status) => {

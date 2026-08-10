@@ -27,6 +27,7 @@ class AgentEventType(str, Enum):
     error = 'error'
     system = 'system'
     sandbox_unavailable = 'sandbox_unavailable'
+    question = 'question'
 
 
 INDEXING_PROGRESS_KEY: str = 'indexing_progress'
@@ -56,8 +57,10 @@ class SessionStatus(str, Enum):
     """
 
     indexing = 'indexing'
+    classifying = 'classifying'
     planning = 'planning'
     executing = 'executing'
+    answering = 'answering'
     reviewing = 'reviewing'
     re_working = 're_working'
     merging = 'merging'
@@ -185,6 +188,16 @@ class DiffEvent(BaseAgentEvent):
     modified: Annotated[str, Field()]
 
 
+class QuestionEvent(BaseAgentEvent):
+    """
+    Emitted when the agent puts a question to the user and waits for an answer.
+    """
+
+    type: Annotated[Literal[AgentEventType.question], Field()] = AgentEventType.question
+    question: Annotated[str, Field()]
+    options: Annotated[list[str], Field()] = []
+
+
 class ReviewEvent(BaseAgentEvent):
     """
     Emitted with the reviewer agent's verdict on the cumulative diff.
@@ -259,6 +272,7 @@ AgentEvent = Annotated[
     | ToolObservationEvent
     | CommitEvent
     | DiffEvent
+    | QuestionEvent
     | ReviewEvent
     | DoneEvent
     | ErrorEvent

@@ -1,12 +1,17 @@
 from time import monotonic
 from asyncio import Event
-from collections.abc import AsyncIterable
+from collections.abc import AsyncIterable, Sequence
 from typing import Any, Awaitable, Callable, Protocol
 
-from agents.coder import AgentDeps, coder_agent
+from agents.classifier import (
+    ClassificationResult,
+    classifier_agent,
+    build_classification_prompt,
+)
+from agents.coder import AgentDeps, answering_agent, coder_agent
 from agents.reviewer import ReviewResult, reviewer_agent
 from fastapi import WebSocket
-from pydantic_ai import RunContext
+from pydantic_ai import Agent, RunContext
 from pydantic_ai.agent import AgentRunResult
 from pydantic_ai.messages import (
     AgentStreamEvent,
@@ -24,6 +29,7 @@ from services.event_bus import (
     INDEXING_PROGRESS_KEY,
     DoneEvent,
     ErrorEvent,
+    QuestionEvent,
     EventBus,
     PlanEvent,
     ReviewEvent,
@@ -42,6 +48,11 @@ from services.review_context import build_review_prompt, collect_review_diffs
 from services.model_resolution import resolve_model
 from services.session_context import SessionContext
 from services.session_inbox import SessionInbox
+from services.user_questions import (
+    ClientGone as ClientGone,
+    StopRequested as StopRequested,
+    UserQuestioner,
+)
 from services.session_fsm import SessionState, SessionStateMachine
 from services.session_limits import IterationLimits
 from services.task_recorder import TaskRecorder
@@ -55,18 +66,6 @@ import logging
 import os
 
 logger = logging.getLogger(__name__)
-
-
-class ClientGone(Exception):
-    """
-    Raised to unwind out of a long running state once the client has left.
-    """
-
-
-class StopRequested(Exception):
-    """
-    Raised to unwind out of a long running state once the user has pressed stop.
-    """
 
 
 def _read_secrets(raw: Any) -> dict[str, str]:
@@ -132,6 +131,7 @@ class AgentSession:
 
     _task: str
     _branch_name: str
+    _branch_created: bool
     _coder_model: str
     _reviewer_model: str
     _plan: ParsedPlan
@@ -180,6 +180,12 @@ class AgentSession:
         self._session_id = session_id
         self._events = events
         self._deps = deps
+        # The tools reach the user only through this: asking a question and
+        # awaiting one reply, rather than the whole inbox, which a tool could
+        # use to consume an approval meant for the session.
+        self._deps.questioner = UserQuestioner(
+            emit_question=self._ask_question, await_reply=self._inbox.await_reply
+        )
         self._session = session
         self._history = history
         self._machine = machine
@@ -188,6 +194,7 @@ class AgentSession:
 
         self._task = ''
         self._branch_name = f'ai-task-{session_id}'
+        self._branch_created = False
         self._coder_model = DEFAULT_MODEL
         self._reviewer_model = DEFAULT_MODEL
         self._plan = ParsedPlan(steps=[])
@@ -313,12 +320,14 @@ class AgentSession:
         """
         handlers: dict[SessionState, Callable[[], Awaitable[SessionState]]] = {
             SessionState.initializing: self._handle_initializing,
+            SessionState.classifying: self._handle_classifying,
             SessionState.planning: self._handle_planning,
             SessionState.waiting_plan_approval: self._handle_waiting_plan_approval,
             SessionState.executing: self._handle_executing,
             SessionState.reviewing: self._handle_reviewing,
             SessionState.waiting_review_approval: self._handle_waiting_review_approval,
             SessionState.re_working: self._handle_re_working,
+            SessionState.answering: self._handle_answering,
             SessionState.completed: self._handle_completed,
             SessionState.merging: self._handle_merging,
         }
@@ -343,9 +352,6 @@ class AgentSession:
 
         self._coder_model = str(message.get('coder_model', DEFAULT_MODEL))
         self._reviewer_model = str(message.get('reviewer_model', DEFAULT_MODEL))
-        # Carried on the context because the adjudicating subagent runs inside a
-        # tool call, where the session is out of reach.
-        self._session.configure(self._task, self._reviewer_model)
         self._services.embedding.embedding_model = str(
             message.get('embedding_model', DEFAULT_EMBEDDING_MODEL)
         )
@@ -479,11 +485,9 @@ class AgentSession:
         if await self._repository_is_empty():
             return await self._confirm_empty_repository()
 
-        await self._services.git.create_branch(self._branch_name)
         if self._recorder is not None:
-            self._recorder.task.branch_name = self._branch_name
             await self._recorder.record_status(TaskStatus.running)
-        return SessionState.planning
+        return SessionState.classifying
 
     async def _repository_is_empty(self) -> bool:
         """
@@ -519,11 +523,9 @@ class AgentSession:
             )
             return SessionState.failed
 
-        await self._services.git.create_branch(self._branch_name)
         if self._recorder is not None:
-            self._recorder.task.branch_name = self._branch_name
             await self._recorder.record_status(TaskStatus.running)
-        return SessionState.planning
+        return SessionState.classifying
 
     async def _start_recording(self) -> None:
         """
@@ -559,6 +561,221 @@ class AgentSession:
         except Exception as error:
             logger.warning('Task history is unavailable for this session: %s', error)
             self._recorder = None
+
+    async def _run_coder_streaming(self, prompt: str, agent: Agent[AgentDeps, str]) -> str:
+        """
+        Run a coder agent, streaming its reasoning to the client as it goes.
+
+        Distinct from `_run_coder`, which planning uses: a plan is a single
+        artefact the client is shown once it exists, while executing and
+        answering are long runs whose reasoning is worth watching arrive.
+
+        The graph is run with `run()` and an event stream handler rather than
+        `run_stream()`. `run_stream()` stops the graph once it has an output
+        matching the output type, which for a text-output agent means it
+        executes only the first round of tool calls and abandons the rest. A
+        ReAct sequence such as read, edit, test, complete would be cut off after
+        its first step, so the agent could never finish the work.
+
+        :param prompt: The instruction to give the agent.
+        :param agent: The agent to run. The answering path uses a read-only one,
+            so a task judged to need no changes cannot make any.
+        :returns: The agent's final text output.
+        :raises StopRequested: If the user asked for the session to stop.
+        :raises ClientGone: If the client disconnected while the agent was running.
+        """
+        buffer: ThoughtBuffer = ThoughtBuffer()
+
+        async def stream_thoughts(
+            context: RunContext[AgentDeps],
+            stream: AsyncIterable[AgentStreamEvent],
+        ) -> None:
+            """
+            Turn the model's text deltas into thoughts as the run proceeds.
+
+            Tool activity is not reported here: the tools already announce
+            themselves through the event bus.
+
+            :param context: The run context, unused.
+            :param stream: The events produced while the agent runs.
+            """
+            async for event in stream:
+                if self._inbox.stop_requested:
+                    # Checked per streamed event, which is what makes stopping
+                    # feel immediate rather than waiting out the current step.
+                    raise StopRequested()
+
+                if self._connection_lost.is_set():
+                    # Checked here as well as between states: running the agent is
+                    # the expensive phase, and waiting for it to finish would keep
+                    # calling the model for a client that has gone.
+                    raise ClientGone()
+
+                if isinstance(event, PartStartEvent) and isinstance(event.part, TextPart):
+                    for thought in buffer.add(event.part.content, monotonic()):
+                        await self._say(thought)
+                elif isinstance(event, PartDeltaEvent) and isinstance(event.delta, TextPartDelta):
+                    for thought in buffer.add(event.delta.content_delta, monotonic()):
+                        await self._say(thought)
+
+        result: AgentRunResult[str] = await agent.run(
+            prompt,
+            deps=self._deps,
+            model=resolve_model(self._coder_model),
+            event_stream_handler=stream_thoughts,
+        )
+
+        remaining: str | None = buffer.flush()
+        if remaining is not None:
+            await self._say(remaining)
+
+        output: str = result.output
+        self._history.add(TurnRole.agent, output)
+        return output
+
+    async def _handle_classifying(self) -> SessionState:
+        """
+        Decide whether the task requires changing any file, before planning it.
+
+        Asked of the task alone. A task that needs no changes is never planned,
+        never put to plan approval and never offered a merge, because none of
+        those decide anything about an answer.
+
+        :returns: The next state.
+        """
+        await self._announce(
+            'Working out whether this task requires changing any files...',
+            SessionStatus.classifying,
+        )
+
+        try:
+            verdict: AgentRunResult[ClassificationResult] = await classifier_agent.run(
+                build_classification_prompt(self._task),
+                model=resolve_model(self._reviewer_model),
+            )
+        except Exception as error:
+            # Guessing either way is worse than stopping: guessing "no changes"
+            # would end real work with an answer, and guessing "changes" would
+            # put a question through planning and a merge decision.
+            logger.exception('The task could not be classified.')
+            await self._events.emit(
+                ErrorEvent(content=f'The task could not be classified, so it was not started: {error}')
+            )
+            return SessionState.failed
+
+        decision: ClassificationResult = verdict.output
+        self._session.record_classification(decision.changes_are_required)
+
+        if decision.changes_are_required:
+            await self._announce(f'This task requires changing files. {decision.reason}')
+            await self._ensure_branch()
+            return SessionState.planning
+
+        await self._announce(
+            f'This task needs no file changes. {decision.reason} '
+            'Reading the repository to answer it.'
+        )
+        return SessionState.answering
+
+    async def _ask_question(self, question: str, options: Sequence[str]) -> None:
+        """
+        Put the agent's question to the user.
+
+        The question joins the feed rather than appearing as a transient prompt:
+        it and the answer are part of what happened, and a reader scrolling back
+        should find the exchange that shaped the work.
+
+        :param question: What the agent asked.
+        :param options: The answers it suggested, already truncated.
+        """
+        await self._events.emit(QuestionEvent(question=question, options=list(options)))
+
+    async def _ensure_branch(self) -> None:
+        """
+        Create the task branch, once, for work that is going to change files.
+
+        Deliberately not done while initialising. A task that needs no changes
+        never reaches here, so it leaves no empty branch behind and no branch
+        name on its history record — it did not touch the repository at all,
+        and nothing about it should suggest otherwise.
+        """
+        if self._branch_created:
+            return
+
+        await self._services.git.create_branch(self._branch_name)
+        self._branch_created = True
+        if self._recorder is not None:
+            self._recorder.task.branch_name = self._branch_name
+
+    async def _handle_answering(self) -> SessionState:
+        """
+        Let the agent read what it needs and answer, without planning.
+
+        :returns: The next state.
+        """
+        await self._announce('Answering the task...', SessionStatus.answering)
+
+        prompt: str = (
+            f'Task: {self._task}\n\n'
+            'This task was judged to need no file changes, so you have read-only access: the '
+            'tools that write files, edit them or run commands are not available to you here. '
+            'Read whatever you need to answer it, then call complete_task with your answer as '
+            'the summary. If it turns out the task cannot be carried out without changing a '
+            'file, say so in your summary and stop; it will be replanned as ordinary work.'
+        )
+
+        await self._run_coder_streaming(prompt, answering_agent)
+
+        # Nothing is checked about the working tree here, because the answering
+        # agent has no tool that could have changed it: `create_file`,
+        # `edit_file` and `run_test_command` are not registered on it. The only
+        # way this path fails to produce an answer is by not producing one —
+        # which is what an agent does when it finds the task cannot be carried
+        # out without a change it is unable to make.
+        if not self._session.completion_requested:
+            return await self._escalate_to_planning()
+
+        return await self._present_answer()
+
+    async def _escalate_to_planning(self) -> SessionState:
+        """
+        Take a task that turned out to need changes onto the ordinary route.
+
+        Reached when the answering agent modified something, or stopped without
+        giving an answer. Either way the classification did not hold, and the
+        work is planned as it would have been in the first place.
+
+        The verdict is corrected on the way past, so that the completion gate
+        stops excusing a finish with nothing modified.
+
+        :returns: The next state.
+        """
+        self._session.record_classification(True)
+        await self._ensure_branch()
+        await self._announce(
+            'This task turned out to need file changes after all. Planning the work.',
+            SessionStatus.planning,
+        )
+        return SessionState.planning
+
+    async def _present_answer(self) -> SessionState:
+        """
+        Report the answer and end the session.
+
+        No branch and no commit count are reported, because nothing was changed:
+        there is no merge to offer, and offering one would promise a diff that
+        does not exist.
+
+        :returns: The next state.
+        """
+        answer: str = (
+            self._session.completion_summary
+            or 'The agent finished without providing an answer.'
+        )
+
+        await self._record_status(TaskStatus.answered, answer)
+        await self._events.emit(DoneEvent(summary=answer))
+        return SessionState.answered
 
     async def _handle_planning(self) -> SessionState:
         """
@@ -688,60 +905,7 @@ class AgentSession:
                 'values are not available to you and must never be written into a file.'
             )
 
-        buffer: ThoughtBuffer = ThoughtBuffer()
-
-        async def stream_thoughts(
-            context: RunContext[AgentDeps],
-            stream: AsyncIterable[AgentStreamEvent],
-        ) -> None:
-            """
-            Turn the model's text deltas into thoughts as the run proceeds.
-
-            Tool activity is not reported here: the tools already announce
-            themselves through the event bus.
-
-            :param context: The run context, unused.
-            :param stream: The events produced while the agent runs.
-            """
-            async for event in stream:
-                if self._inbox.stop_requested:
-                    # Checked per streamed event, which is what makes stopping
-                    # feel immediate rather than waiting out the current step.
-                    raise StopRequested()
-
-                if self._connection_lost.is_set():
-                    # Checked here as well as between states: execution is the
-                    # expensive phase, and waiting for it to finish would keep
-                    # calling the model for a client that has gone.
-                    raise ClientGone()
-
-                if isinstance(event, PartStartEvent) and isinstance(event.part, TextPart):
-                    for thought in buffer.add(event.part.content, monotonic()):
-                        await self._say(thought)
-                elif isinstance(event, PartDeltaEvent) and isinstance(event.delta, TextPartDelta):
-                    for thought in buffer.add(event.delta.content_delta, monotonic()):
-                        await self._say(thought)
-
-        result: AgentRunResult[str] = await coder_agent.run(
-            prompt,
-            deps=self._deps,
-            model=resolve_model(self._coder_model),
-            event_stream_handler=stream_thoughts,
-        )
-
-        remaining: str | None = buffer.flush()
-        if remaining is not None:
-            await self._say(remaining)
-
-        output: str = result.output
-        self._history.add(TurnRole.agent, output)
-
-        if self._session.completed_without_changes:
-            # Nothing was changed, and a subagent has confirmed the task never
-            # called for a change. There is no diff, so review would have nothing
-            # to judge and would reject the task for producing nothing.
-            await self._announce('The task needed no file changes. Presenting the answer.')
-            return SessionState.completed
+        await self._run_coder_streaming(prompt, coder_agent)
 
         if not self._session.completion_requested:
             # Stopping without signalling completion usually means the agent lost

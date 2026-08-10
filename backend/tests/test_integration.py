@@ -205,6 +205,26 @@ def wired(monkeypatch: pytest.MonkeyPatch) -> None:
 
     monkeypatch.setattr(reviewer_module.reviewer_agent, 'run', fake_review)
 
+    from agents.classifier import ClassificationResult
+    import agents.classifier as classifier_module
+
+    async def fake_classify(prompt: str, **kwargs: Any) -> Any:
+        """
+        Answer the classification the session now asks before planning.
+
+        The scripted coder model cannot produce this structured output, and a
+        session that cannot be classified refuses to start at all.
+        """
+        from unittest.mock import MagicMock
+
+        result: Any = MagicMock()
+        result.output = ClassificationResult(
+            changes_are_required=True, reason='The task asks for a file to be created.'
+        )
+        return result
+
+    monkeypatch.setattr(classifier_module.classifier_agent, 'run', fake_classify)
+
 
 def drain(websocket: Any, until: set[str], limit: int = 200) -> list[dict[str, Any]]:
     """

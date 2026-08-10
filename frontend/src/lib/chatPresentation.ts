@@ -18,6 +18,8 @@ import type { SandboxStage } from '$lib/schemas';
  */
 export const MARKDOWN_TYPES: MessageType[] = [
     'prompt',
+    'question',
+    'reply',
     'thought',
     'plan',
     'review',
@@ -46,6 +48,11 @@ export const typeStyles: Record<MessageType, string> = {
     // A refusal, not a fault: distinct from `error` so a busy slot does not look
     // like the run failed.
     session_busy: 'bg-amber-50 border-amber-200 text-amber-900',
+    // The agent asking rather than telling, and the answer it was given. The
+    // reply sits with the prompt on the right, because both are the user
+    // speaking.
+    question: 'bg-teal-50 border-teal-300 text-teal-900',
+    reply: 'bg-blue-50 border-blue-200 text-blue-800 self-end',
     // Deliberately unlike `thought`: system messages are Loom talking about the
     // session, not the model reasoning, and should read as such.
     system: 'bg-indigo-50 border-indigo-200 text-indigo-800 text-xs tracking-wide'
@@ -112,7 +119,9 @@ export const sandboxStageLabels: Record<SandboxStage, string> = {
 export function isWorking(status: TaskStatus): boolean {
     return (
         status === 'indexing' ||
+        status === 'classifying' ||
         status === 'planning' ||
+        status === 'answering' ||
         status === 'executing' ||
         status === 'reviewing' ||
         status === 're_working' ||
@@ -137,6 +146,26 @@ export function canSendPrompt(status: TaskStatus, pendingAction: string | null):
 }
 
 /**
+ * Whether the prompt box may be sent at all, task or reply.
+ *
+ * Requirement 4.8: a new task is withheld while a question is outstanding, but
+ * the reply must not be, or the interface would be asking for an answer while
+ * disabling the only means of giving one.
+ *
+ * @param status Where the session currently is.
+ * @param pendingAction The decision being asked for, if any.
+ * @param answeringQuestion Whether the agent is waiting on an answer.
+ * @returns True when the box's contents may be sent.
+ */
+export function canSubmitPrompt(
+    status: TaskStatus,
+    pendingAction: string | null,
+    answeringQuestion: boolean
+): boolean {
+    return answeringQuestion || canSendPrompt(status, pendingAction);
+}
+
+/**
  * What the prompt box is currently for.
  *
  * The box never goes dead, so the placeholder is what tells the reader whether
@@ -146,7 +175,17 @@ export function canSendPrompt(status: TaskStatus, pendingAction: string | null):
  * @param pendingAction The decision being asked for, if any.
  * @returns The placeholder to show.
  */
-export function promptPlaceholder(status: TaskStatus, pendingAction: string | null): string {
+export function promptPlaceholder(
+    status: TaskStatus,
+    pendingAction: string | null,
+    answeringQuestion: boolean = false
+): string {
+    // Requirement 4.9a: the box sends a reply rather than a task while a
+    // question is outstanding, and a control that silently changes what it does
+    // is worse than one that says so.
+    if (answeringQuestion) {
+        return "Type your reply to the agent's question...";
+    }
     if (pendingAction !== null) {
         return 'Add a reason for rejecting, or leave blank...';
     }

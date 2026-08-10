@@ -34,7 +34,9 @@ class FakeSocket {
         this.sent.push(data);
     }
 
-    close(): void {}
+    close(): void {
+        this.readyState = 3;
+    }
 
     /** Push one server message through the socket. */
     deliver(payload: object): void {
@@ -56,6 +58,7 @@ beforeEach(() => {
     // The store is a module singleton, so one test's outstanding decision would
     // otherwise still be outstanding in the next. Pointing it at a different
     // repository is the store's own way of archiving a task and starting clean.
+    agentStore.disconnect();
     session += 1;
     agentStore.updateConfig({ repoPath: `/test/repo-${session}` });
 });
@@ -174,5 +177,133 @@ describe('composing and deciding', () => {
         expect(box.value).toBe('the next thing I want');
         expect(box).toBeEnabled();
         expect(screen.getByRole('button', { name: 'Stop the agent' })).toBeInTheDocument();
+    });
+});
+
+describe('answering a question from the agent', () => {
+    /** Put the session in front of an outstanding question, and let it render. */
+    async function askQuestion(socket: FakeSocket, options: string[] = []): Promise<void> {
+        // A question arrives while the agent is working, which is what makes
+        // requirement 4.8 delicate: the interface is mid-task and still has to
+        // accept an answer.
+        socket.deliver({ type: 'system', content: 'Executing plan...', status: 'executing' });
+        socket.deliver({ type: 'question', question: 'Which retry policy?', options });
+        await tick();
+    }
+
+    /** The prompt box, which is the only text input in the interface. */
+    function box(): HTMLElement {
+        return screen.getByRole('textbox', { name: 'Task prompt' });
+    }
+
+    it('shows the question with the answers the agent suggested', async () => {
+        const { socket } = renderChat();
+
+        await askQuestion(socket, ['The HTTP client', 'The database pool']);
+
+        expect(screen.getByTestId('question-panel')).toBeInTheDocument();
+        expect(screen.getByRole('button', { name: 'The HTTP client' })).toBeInTheDocument();
+    });
+
+    it('sends a chosen answer straight to the agent', async () => {
+        const { socket } = renderChat();
+        await askQuestion(socket, ['The HTTP client', 'The database pool']);
+
+        await fireEvent.click(screen.getByRole('button', { name: 'The database pool' }));
+
+        expect(socket.lastSent).toEqual({ action: 'reply', reply: 'The database pool' });
+    });
+
+    it('says the prompt box now sends a reply', async () => {
+        // Requirement 4.9a: the box has changed meaning, and a control that
+        // changes silently is worse than one that says so.
+        const { socket } = renderChat();
+
+        await askQuestion(socket);
+
+        expect(box()).toHaveAttribute('placeholder', "Type your reply to the agent's question...");
+    });
+
+    it('sends a typed reply as a reply rather than a new task', async () => {
+        // Requirement 4.8 and 4.9. The session is working, so the box would
+        // ordinarily refuse to send at all; a question has to lift that, and
+        // what it sends must be the answer, not a fresh task.
+        const { socket } = renderChat();
+        await askQuestion(socket);
+
+        await fireEvent.input(box(), { target: { value: 'The one in the HTTP client' } });
+        await fireEvent.keyDown(box(), { key: 'Enter' });
+
+        expect(socket.lastSent).toEqual({
+            action: 'reply',
+            reply: 'The one in the HTTP client'
+        });
+    });
+
+    it('withholds a new task while the question is outstanding', async () => {
+        // The other half of 4.8: nothing typed can start a second task, because
+        // everything typed is an answer until the question is gone.
+        const { socket } = renderChat();
+        await askQuestion(socket);
+
+        await fireEvent.input(box(), { target: { value: 'do something else entirely' } });
+        await fireEvent.keyDown(box(), { key: 'Enter' });
+
+        expect(socket.lastSent).not.toHaveProperty('prompt');
+        expect(socket.lastSent.action).toBe('reply');
+    });
+
+    it('puts both the question and the answer in the feed', async () => {
+        // Requirement 4.5.
+        const { socket } = renderChat();
+        await askQuestion(socket, ['The HTTP client']);
+
+        await fireEvent.click(screen.getByRole('button', { name: 'The HTTP client' }));
+        await tick();
+
+        expect(screen.getByText('Which retry policy?')).toBeInTheDocument();
+        expect(screen.getAllByText('The HTTP client').length).toBeGreaterThan(0);
+    });
+
+    it('takes the question away once it has been answered', async () => {
+        const { socket } = renderChat();
+        await askQuestion(socket, ['The HTTP client']);
+
+        await fireEvent.click(screen.getByRole('button', { name: 'The HTTP client' }));
+        await tick();
+
+        expect(screen.queryByTestId('question-panel')).not.toBeInTheDocument();
+    });
+
+    it('puts the cursor in the box when the reader chooses to type', async () => {
+        // Requirement 4.4: choosing the free-reply option has to lead somewhere.
+        const { socket } = renderChat();
+        await askQuestion(socket, ['The HTTP client']);
+
+        await fireEvent.click(screen.getByTestId('free-reply-option'));
+        await tick();
+
+        expect(document.activeElement).toBe(box());
+    });
+
+    it('stops accepting anything once the question is answered', async () => {
+        // The lifting of requirement 4.8's rule lasts exactly as long as the
+        // question. The agent is still working afterwards, so the box goes back
+        // to withholding what is typed rather than sending it as a task.
+        const { socket } = renderChat();
+        await askQuestion(socket, ['The HTTP client']);
+        await fireEvent.click(screen.getByRole('button', { name: 'The HTTP client' }));
+        await tick();
+        const afterAnswering = socket.sent.length;
+
+        expect(box()).toHaveAttribute(
+            'placeholder',
+            'Write the next task while the agent works...'
+        );
+
+        await fireEvent.input(box(), { target: { value: 'a brand new task' } });
+        await fireEvent.keyDown(box(), { key: 'Enter' });
+
+        expect(socket.sent).toHaveLength(afterAnswering);
     });
 });

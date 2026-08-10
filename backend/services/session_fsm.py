@@ -12,15 +12,25 @@ class SessionState(str, Enum):
     for the user's final merge decision; `merged` is the terminal state reached
     once that merge has succeeded. `cancelled` is distinct from `failed`: the
     user stopped the work, rather than the work breaking.
+
+    `classifying` decides whether the task requires changing any file at all.
+    A task that does not takes the `answering` path, which reads what it needs
+    and finishes at `answered` — a terminal state, since there is no diff to
+    review and no branch to merge. `answered` is deliberately not `completed`:
+    in this codebase that status means the reviewer approved and a merge
+    decision is pending, which would promise a merge that does not exist.
     """
 
     initializing = 'initializing'
+    classifying = 'classifying'
     planning = 'planning'
     waiting_plan_approval = 'waiting_plan_approval'
     executing = 'executing'
     reviewing = 'reviewing'
     waiting_review_approval = 'waiting_review_approval'
     re_working = 're_working'
+    answering = 'answering'
+    answered = 'answered'
     completed = 'completed'
     merging = 'merging'
     merged = 'merged'
@@ -29,12 +39,25 @@ class SessionState(str, Enum):
 
 
 TERMINAL_STATES: frozenset[SessionState] = frozenset(
-    {SessionState.merged, SessionState.failed, SessionState.cancelled}
+    {
+        SessionState.merged,
+        SessionState.answered,
+        SessionState.failed,
+        SessionState.cancelled,
+    }
 )
 
 TRANSITIONS: Mapping[SessionState, frozenset[SessionState]] = {
     SessionState.initializing: frozenset(
-        {SessionState.planning, SessionState.failed, SessionState.cancelled}
+        {SessionState.classifying, SessionState.failed, SessionState.cancelled}
+    ),
+    SessionState.classifying: frozenset(
+        {
+            SessionState.planning,
+            SessionState.answering,
+            SessionState.failed,
+            SessionState.cancelled,
+        }
     ),
     SessionState.planning: frozenset(
         {SessionState.waiting_plan_approval, SessionState.failed, SessionState.cancelled}
@@ -48,15 +71,19 @@ TRANSITIONS: Mapping[SessionState, frozenset[SessionState]] = {
         }
     ),
     SessionState.executing: frozenset(
+        {SessionState.reviewing, SessionState.failed, SessionState.cancelled}
+    ),
+    SessionState.answering: frozenset(
         {
-            SessionState.reviewing,
-            # A task adjudicated as needing no file changes has no diff, so there
-            # is nothing for review to judge.
-            SessionState.completed,
+            SessionState.answered,
+            # The classification was wrong and the task does need changes after
+            # all, so it rejoins the ordinary route at planning.
+            SessionState.planning,
             SessionState.failed,
             SessionState.cancelled,
         }
     ),
+    SessionState.answered: frozenset(),
     SessionState.reviewing: frozenset(
         {SessionState.waiting_review_approval, SessionState.failed, SessionState.cancelled}
     ),

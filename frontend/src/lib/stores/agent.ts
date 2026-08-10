@@ -1,4 +1,5 @@
 import { writable, get } from 'svelte/store';
+import { z } from 'zod';
 import { browser } from '$app/environment';
 import {
     agentMessageSchema,
@@ -21,6 +22,8 @@ export type MessageType =
     | 'done'
     | 'error'
     | 'session_busy'
+    | 'question'
+    | 'reply'
     | 'system';
 
 export interface Message {
@@ -66,13 +69,16 @@ export interface Message {
 export type TaskStatus =
     | 'idle'
     | 'indexing'
+    | 'classifying'
     | 'planning'
     | 'waiting_approval'
     | 'executing'
+    | 'answering'
     | 'reviewing'
     | 'waiting_review_approval'
     | 're_working'
     | 'completed'
+    | 'answered'
     | 'merging'
     | 'merged'
     | 'failed'
@@ -90,6 +96,12 @@ export type ConnectionState = 'connecting' | 'connected' | 'disconnected';
 export type BlockedReason = 'another_tab' | 'stale' | null;
 
 export type ActionType = 'approve_plan' | 'approve_review' | 'approve_merge' | null;
+
+/** A question the agent is waiting on an answer to. */
+export interface PendingQuestion {
+    question: string;
+    options: string[];
+}
 
 export interface FileDiff {
     original: string;
@@ -125,6 +137,49 @@ const MAX_VALIDATION_SLOTS = 5;
 /** Appended to a run of reasoning that hit `MAX_THOUGHT_CHARACTERS`. */
 const THOUGHT_TRUNCATION_NOTICE =
     '\n... (truncated: this run of reasoning grew too long to display in full)';
+
+/**
+ * The values a WebSocket reports as its `readyState`, named.
+ *
+ * Spelled out rather than read from `WebSocket.CONNECTING` and friends, because
+ * the tests replace the global with a stand-in that has no static constants, and
+ * a comparison against `undefined` would silently never match.
+ */
+const SocketReadyState = {
+    connecting: 0,
+    open: 1,
+    closing: 2,
+    closed: 3
+} as const;
+
+/**
+ * What one tab says to another about who is holding the session.
+ *
+ * `from` identifies the store instance that sent it, and is what makes the
+ * exchange trustworthy: `BroadcastChannel` delivers a message to every other
+ * channel on the origin — including further channels belonging to the tab that
+ * sent it — and the event itself does not say where it came from. Without an
+ * identity a tab hears its own query, answers it, and concludes that a sibling
+ * holds the session.
+ */
+const presenceMessageSchema = z.object({
+    type: z.enum(['who_has_session', 'i_have_session']),
+    from: z.string()
+});
+
+type PresenceMessage = z.infer<typeof presenceMessageSchema>;
+
+/**
+ * Mint an identifier for one store instance.
+ *
+ * @returns An identifier no other store instance is expected to share.
+ */
+function createInstanceId(): string {
+    if (typeof crypto !== 'undefined' && typeof crypto.randomUUID === 'function') {
+        return crypto.randomUUID();
+    }
+    return `loom-${Math.random().toString(36).slice(2)}-${Date.now().toString(36)}`;
+}
 
 export interface AgentConfig {
     coderModel: string;
@@ -162,6 +217,14 @@ export interface AgentState {
     sandboxUnavailable: { stage: SandboxStage; reason: string } | null;
     /** Whether the reader has dismissed the sandbox notice for this session. */
     sandboxNoticeDismissed: boolean;
+    /**
+     * The question the agent is waiting on, or null when it is not waiting.
+     *
+     * Held as state rather than read back out of the feed: the feed keeps the
+     * exchange as a record, while this is what the interface acts on, and
+     * deriving one from the other would tie the two together for no gain.
+     */
+    pendingQuestion: PendingQuestion | null;
     config: AgentConfig;
 }
 
@@ -187,6 +250,7 @@ const initialState: AgentState = {
     blocked: null,
     sandboxUnavailable: null,
     sandboxNoticeDismissed: false,
+    pendingQuestion: null,
     // Secrets are deliberately never persisted, so merge the saved config over
     // the defaults rather than replacing them.
     config: savedConfig
@@ -217,19 +281,53 @@ function createAgentStore() {
 
     const SESSION_CHANNEL = 'loom_session';
 
+    /**
+     * Who this store instance is, for the length of its life.
+     *
+     * One instance per tab, so this identifies the tab as far as the presence
+     * protocol is concerned. Every message it sends carries it, and any message
+     * bearing it came from here and is disregarded.
+     */
+    const instanceId: string = createInstanceId();
+
+    /** Read a presence message, or null if it was not one. */
+    function readPresence(data: unknown): PresenceMessage | null {
+        const result = presenceMessageSchema.safeParse(data);
+        if (!result.success) return null;
+        // Anything carrying this instance's identity was posted by one of this
+        // tab's own channels, and says nothing about any sibling.
+        if (result.data.from === instanceId) return null;
+        return result.data;
+    }
+
     /** Answer sibling tabs so they can tell a real tab from a stale socket. */
     function announcePresence(): BroadcastChannel | null {
         if (!browser || typeof BroadcastChannel === 'undefined') return null;
 
         const channel = new BroadcastChannel(SESSION_CHANNEL);
-        channel.onmessage = (event) => {
+        channel.onmessage = (event: MessageEvent<unknown>) => {
+            const message = readPresence(event.data);
+            if (message === null || message.type !== 'who_has_session') return;
+
             // Only a tab that actually holds a session should answer.
-            if (event.data?.type === 'who_has_session') {
-                const held = get({ subscribe }).connection === 'connected';
-                if (held) channel.postMessage({ type: 'i_have_session' });
-            }
+            const held = get({ subscribe }).connection === 'connected';
+            if (!held) return;
+
+            const reply: PresenceMessage = { type: 'i_have_session', from: instanceId };
+            channel.postMessage(reply);
         };
         return channel;
+    }
+
+    /**
+     * Stop answering presence queries.
+     *
+     * Called wherever a session ends or is replaced, so that a tab never leaves
+     * behind a channel still willing to speak for a session it no longer has.
+     */
+    function stopAnnouncing(): void {
+        presence?.close();
+        presence = null;
     }
 
     /** Ask whether any sibling tab holds the session. Resolves false on silence. */
@@ -247,30 +345,77 @@ function createAgentStore() {
                 resolve(answer);
             };
 
-            channel.onmessage = (event) => {
-                if (event.data?.type === 'i_have_session') finish(true);
+            channel.onmessage = (event: MessageEvent<unknown>) => {
+                const message = readPresence(event.data);
+                if (message === null || message.type !== 'i_have_session') return;
+                finish(true);
             };
-            channel.postMessage({ type: 'who_has_session' });
+
+            const query: PresenceMessage = { type: 'who_has_session', from: instanceId };
+            channel.postMessage(query);
             setTimeout(() => finish(false), timeoutMs);
         });
     }
 
-    function connect(url: string) {
-        lastUrl = url;
-        update((state) => ({ ...state, connection: 'connecting' }));
-        socket = new WebSocket(url);
+    /** Whether a socket is already open, or on its way to being open. */
+    function sessionIsLive(): boolean {
+        if (socket === null) return false;
+        return (
+            socket.readyState === SocketReadyState.connecting ||
+            socket.readyState === SocketReadyState.open
+        );
+    }
 
-        socket.onopen = () => {
+    /**
+     * End the current socket without letting it speak for the session afterwards.
+     *
+     * @returns Nothing; the socket reference is cleared as part of closing.
+     */
+    function teardown(): void {
+        clearTimeout(reconnectTimeout);
+        stopAnnouncing();
+        const closing = socket;
+        // Cleared before closing, so the handlers still attached to the old
+        // socket recognise themselves as superseded and stay quiet.
+        socket = null;
+        closing?.close();
+    }
+
+    function connect(url: string) {
+        // Requirement 1.2. Connecting is idempotent: the layout establishes the
+        // session once, but nothing stops a second call arriving, and a second
+        // socket would be refused as busy by a backend that is already talking
+        // to the first one.
+        if (sessionIsLive()) return;
+
+        lastUrl = url;
+        stopAnnouncing();
+        update((state) => ({ ...state, connection: 'connecting' }));
+
+        const opened = new WebSocket(url);
+        socket = opened;
+
+        opened.onopen = () => {
+            if (socket !== opened) return;
             update((state) => ({ ...state, connection: 'connected', blocked: null }));
-            presence?.close();
+            stopAnnouncing();
             presence = announcePresence();
         };
 
-        socket.onmessage = (event) => {
+        opened.onmessage = (event) => {
+            if (socket !== opened) return;
             receive(event.data);
         };
 
-        socket.onclose = () => {
+        opened.onclose = () => {
+            // A socket that has already been replaced must not report a
+            // disconnection, schedule a reconnect, or otherwise speak for the
+            // session that succeeded it.
+            if (socket !== opened) return;
+
+            // The session is over, so this tab no longer answers for it.
+            stopAnnouncing();
+
             update((state) => {
                 // A refused connection is a decision, not a fault: reconnecting
                 // would loop against a backend that will keep refusing.
@@ -282,7 +427,8 @@ function createAgentStore() {
             });
         };
 
-        socket.onerror = (error) => {
+        opened.onerror = (error) => {
+            if (socket !== opened) return;
             console.error('WebSocket error:', error);
             update((state) => ({ ...state, connection: 'disconnected' }));
         };
@@ -549,6 +695,15 @@ function createAgentStore() {
                 return applyThought(nextState, data);
             }
 
+            // The question joins the feed and also becomes the state the
+            // interface acts on, so it cannot go through the append path alone.
+            if (data.type === 'question') {
+                nextState.pendingQuestion = {
+                    question: data.question,
+                    options: [...data.options]
+                };
+            }
+
             const newMessage: Message = {
                 id: nextMessageId(),
                 type: data.type,
@@ -591,6 +746,15 @@ function createAgentStore() {
                     break;
                 case 'done':
                     newMessage.content = data.summary;
+                    // A task that changed nothing carries no branch, because
+                    // there is none: it produced an answer. Offering a merge
+                    // would promise a diff that does not exist.
+                    if (!data.branch_name) {
+                        nextState.status = 'answered';
+                        nextState.requiresAction = false;
+                        nextState.actionType = null;
+                        break;
+                    }
                     // The backend sends 'done' twice: once when the reviewer has
                     // approved and the merge decision is pending, and again once
                     // the merge has happened.
@@ -609,6 +773,9 @@ function createAgentStore() {
                     nextState.status = 'failed';
                     nextState.requiresAction = false;
                     nextState.actionType = null;
+                    break;
+                case 'question':
+                    newMessage.content = data.question;
                     break;
                 case 'session_busy':
                     // The refusal is authoritative, but only a sibling's reply
@@ -661,6 +828,33 @@ function createAgentStore() {
 
                 return { ...state, config: nextConfig };
             });
+        },
+        /**
+         * Answer the question the agent is waiting on.
+         *
+         * The reply is recorded in the feed as well as sent, so the exchange
+         * reads as a conversation rather than the question sitting there
+         * unanswered.
+         *
+         * @param reply - What the user chose or typed.
+         */
+        answerQuestion: (reply: string) => {
+            const answer = reply.trim();
+            if (!answer) return;
+            update((state) => ({
+                ...state,
+                pendingQuestion: null,
+                messages: [
+                    ...state.messages,
+                    {
+                        id: nextMessageId(),
+                        type: 'reply',
+                        content: answer,
+                        timestamp: new Date()
+                    }
+                ]
+            }));
+            socket?.send(JSON.stringify({ action: 'reply', reply: answer }));
         },
         sendPrompt: (prompt: string) => {
             const state = get({ subscribe });
@@ -717,11 +911,22 @@ function createAgentStore() {
         retryConnection: () => {
             if (!lastUrl) return;
             update((state) => ({ ...state, blocked: null, messages: [] }));
+            // The refused socket may not have been reaped yet, and the
+            // idempotency guard would otherwise read it as a live session and
+            // decline to try again — which is the retry doing nothing.
+            teardown();
             connect(lastUrl);
         },
+        /**
+         * End the session deliberately.
+         *
+         * Distinct from a socket that drops: no reconnect is scheduled, because
+         * closing was the point. The state is set here rather than left to the
+         * socket's own `onclose`, which stays silent once superseded.
+         */
         disconnect: () => {
-            clearTimeout(reconnectTimeout);
-            socket?.close();
+            teardown();
+            update((state) => ({ ...state, connection: 'disconnected' }));
         },
         connect
     };

@@ -1,5 +1,5 @@
 <script lang="ts">
-    import { onMount, onDestroy } from 'svelte';
+    import { onMount } from 'svelte';
     import AgentChat from '$lib/components/AgentChat.svelte';
     import DiffViewer from '$lib/components/DiffViewer.svelte';
     import SandboxBanner from '$lib/components/SandboxBanner.svelte';
@@ -29,12 +29,6 @@
             console.error('Failed to fetch models', e);
             modelsError = e instanceof Error ? e.message : 'The model list could not be loaded.';
         }
-        const wsUrl = import.meta.env.VITE_WS_URL || 'ws://localhost:8000/api/v1/agent-session';
-        agentStore.connect(wsUrl);
-    });
-
-    onDestroy(() => {
-        agentStore.disconnect();
     });
 
     function handleModelChange(e: Event) {

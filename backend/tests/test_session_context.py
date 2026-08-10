@@ -242,7 +242,8 @@ def test_a_missing_sandbox_still_requires_a_modification() -> None:
     The waiver covers verification, not the work itself.
 
     A task that needed changes and got none is still incomplete, sandbox or no
-    sandbox; that question belongs to the adjudicator, not to this gate.
+    sandbox; whether it needed them was settled by the classifier before the
+    work began, and is not this gate's question.
     """
     context: SessionContext = SessionContext()
     context.mark_sandbox_unavailable()
@@ -267,28 +268,36 @@ def test_sandbox_availability_does_not_come_back() -> None:
     assert context.sandbox_available is False
 
 
-def test_the_task_is_not_reassignable_once_the_session_is_running() -> None:
+def test_a_fresh_context_has_no_classification() -> None:
     """
-    What the session was asked to do is fixed for its lifetime.
-
-    The adjudicator judges the agent's work against this text, so anything able
-    to rewrite it part way through could change the standard the work is held to.
+    Nothing is known about the task before the classifier has judged it.
     """
     context: SessionContext = SessionContext()
-    context.configure('Explain the retry policy.', 'reviewer-model')
 
-    assert context.task == 'Explain the retry policy.'
-    assert context.reviewer_model == 'reviewer-model'
+    assert context.changes_are_required is None
+
+
+def test_the_classification_is_recorded_as_given() -> None:
+    """
+    The completion gate reads this, so it must say what the classifier said.
+    """
+    context: SessionContext = SessionContext()
+
+    context.record_classification(False)
+    assert context.changes_are_required is False
+
+    # Escalation corrects the verdict when an answering task turns out to need
+    # changes, so the gate stops excusing a finish with nothing modified.
+    context.record_classification(True)
+    assert context.changes_are_required is True
+
+
+def test_the_classification_is_not_reassignable_as_an_attribute() -> None:
+    """
+    Recorded through the method, so it cannot be quietly flipped by anything
+    holding the context.
+    """
+    context: SessionContext = SessionContext()
 
     with pytest.raises(AttributeError):
-        context.task = 'Something else entirely.'  # type: ignore[misc]
-
-
-def test_a_fresh_context_knows_no_task() -> None:
-    """
-    Neither field is known before the opening message has been read.
-    """
-    context: SessionContext = SessionContext()
-
-    assert context.task == ''
-    assert context.reviewer_model == ''
+        context.changes_are_required = False  # type: ignore[misc]

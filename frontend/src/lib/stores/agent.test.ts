@@ -23,6 +23,14 @@ function latest(store: AgentStore) {
 class FakeSocket {
     static latest: FakeSocket;
 
+    /**
+     * Every socket opened since the last reset.
+     *
+     * Kept because the questions requirement 1.2 and 1.6 ask are about how many
+     * sockets exist, which the latest one alone cannot answer.
+     */
+    static instances: FakeSocket[] = [];
+
     readyState = 1;
     sent: string[] = [];
     onopen?: () => void;
@@ -32,13 +40,18 @@ class FakeSocket {
 
     constructor(public url: string) {
         FakeSocket.latest = this;
+        FakeSocket.instances.push(this);
     }
 
     send(data: string): void {
         this.sent.push(data);
     }
 
-    close(): void {}
+    // A closed socket reports itself closed. Without this the store's guard
+    // against opening a second socket would read a dead one as live.
+    close(): void {
+        this.readyState = 3;
+    }
 
     /** Push one server message through the socket. */
     deliver(payload: object): void {
@@ -51,14 +64,46 @@ class FakeSocket {
     }
 }
 
-/** Import the store fresh, connected to a new fake socket. */
-async function connected(): Promise<{ store: AgentStore; socket: FakeSocket }> {
+/** The address the tests connect to, and the one a retry must reuse. */
+const TEST_URL = 'ws://test/agent-session';
+
+/**
+ * Store instances this test file has brought into being.
+ *
+ * Resetting the module registry produces a new store but does not dispose of
+ * the old one, which keeps its presence channel open and goes on answering as a
+ * perfectly genuine second tab. A real browser tab holds one store for its
+ * lifetime, so these have to be retired deliberately to keep one test's tab out
+ * of the next test's.
+ */
+const openTabs: AgentStore[] = [];
+
+/** Import the store fresh, as a tab of its own. */
+async function freshStore(): Promise<AgentStore> {
     localStorage.clear();
     vi.resetModules();
     vi.stubGlobal('WebSocket', FakeSocket);
 
     const store = (await import('./agent')).agentStore;
-    store.connect('ws://test/agent-session');
+    openTabs.push(store);
+    return store;
+}
+
+beforeEach(() => {
+    // `unstubGlobals` is off, so a global replaced by one test stays replaced
+    // for every test after it. That matters most for timers: a test that
+    // stubs `setTimeout` with a mock would leave later tests unable to time
+    // anything out, and a presence query that can never time out would make
+    // the assertions below pass for entirely the wrong reason.
+    vi.unstubAllGlobals();
+    for (const tab of openTabs.splice(0)) tab.disconnect();
+    FakeSocket.instances = [];
+});
+
+/** Import the store fresh, connected to a new fake socket. */
+async function connected(): Promise<{ store: AgentStore; socket: FakeSocket }> {
+    const store = await freshStore();
+    store.connect(TEST_URL);
     const socket = FakeSocket.latest;
     socket.onopen?.();
     return { store, socket };
@@ -206,6 +251,40 @@ describe('message handling', () => {
         expect(get(store).requiresAction).toBe(false);
     });
 
+    it('offers no merge for a task that changed nothing', async () => {
+        // Requirement 2.5. A task that only answered has no branch, so there is
+        // nothing to merge; offering the decision would promise a diff that does
+        // not exist, and the session would sit waiting for a reply about it.
+        const { store, socket } = await connected();
+
+        socket.deliver({
+            type: 'done',
+            summary: 'The retry policy tries three times, then gives up.'
+        });
+
+        const state = get(store);
+        expect(state.status).toBe('answered');
+        expect(state.requiresAction).toBe(false);
+        expect(state.actionType).toBeNull();
+        expect(latest(store).content).toBe('The retry policy tries three times, then gives up.');
+    });
+
+    it('still offers a merge when a branch was produced', async () => {
+        // The guard keys on the branch, so a task that did change files must be
+        // unaffected by it.
+        const { store, socket } = await connected();
+
+        socket.deliver({
+            type: 'done',
+            summary: 'Added the function.',
+            branch_name: 'ai-task-1',
+            total_commits: 2
+        });
+
+        expect(get(store).status).toBe('completed');
+        expect(get(store).actionType).toBe('approve_merge');
+    });
+
     it('marks the session failed on an error', async () => {
         const { store, socket } = await connected();
 
@@ -341,6 +420,246 @@ describe('a session already running elsewhere', () => {
 
         expect(get(store).blocked).toBeNull();
         expect(get(store).messages).toHaveLength(0);
+    });
+});
+
+/**
+ * A BroadcastChannel that keeps count of how many of its instances are open.
+ *
+ * A leaked channel is invisible from the outside until the day it answers a
+ * query it should never have heard, so the count is what makes the lifetime of
+ * the presence channel assertable at all.
+ */
+class TrackedChannel extends BroadcastChannel {
+    static open: Set<TrackedChannel> = new Set();
+
+    constructor(name: string) {
+        super(name);
+        TrackedChannel.open.add(this);
+    }
+
+    override close(): void {
+        TrackedChannel.open.delete(this);
+        super.close();
+    }
+}
+
+/** A refusal from the backend, which is what sets a tab asking after siblings. */
+function refuse(socket: FakeSocket): void {
+    socket.deliver({ type: 'session_busy', content: 'busy', active_session_id: 'x' });
+}
+
+/**
+ * Wait until a presence query has had time to go unanswered.
+ *
+ * Longer than the store's own 300ms window, so that what is observed afterwards
+ * is a settled answer rather than one still outstanding. A shorter wait would
+ * make these tests pass whether the query resolved or hung.
+ */
+function settlePresence(): Promise<void> {
+    return new Promise((resolve) => setTimeout(resolve, 450));
+}
+
+describe('presence between tabs', () => {
+    it('does not treat its own reply as a sibling holding the session', async () => {
+        // The defect this covers: BroadcastChannel delivers to every other
+        // channel on the origin, including the second one this same tab opens to
+        // ask the question. The tab heard its own query, saw that it was itself
+        // connected, and answered — so a refusal that merely needed retrying was
+        // reported as another tab holding the session, escapable only by a
+        // reload, which destroys the leaked channel along with everything else.
+        const { store, socket } = await connected();
+
+        refuse(socket);
+        await settlePresence();
+
+        expect(get(store).blocked).toBe('stale');
+    });
+
+    it('still detects a session genuinely held by another tab', async () => {
+        // The guard against self-detection must not be so broad that it silences
+        // real siblings: two tabs are two store instances, with two identities.
+        const holder = await freshStore();
+        holder.connect(TEST_URL);
+        FakeSocket.latest.onopen?.();
+
+        // A separate module registry stands in for a separate tab.
+        const arriving = await freshStore();
+        arriving.connect(TEST_URL);
+        const refused = FakeSocket.latest;
+        refused.onopen?.();
+
+        refuse(refused);
+        await settlePresence();
+
+        expect(get(arriving).blocked).toBe('another_tab');
+    });
+
+    it('closes its presence channel when the session ends', async () => {
+        // Requirement 1.4. A channel outliving its session is an answerer with
+        // nothing to answer for, and there is no way to reach it again to close
+        // it later.
+        vi.stubGlobal('BroadcastChannel', TrackedChannel);
+        TrackedChannel.open.clear();
+
+        const { store } = await connected();
+        expect(TrackedChannel.open.size).toBe(1);
+
+        store.disconnect();
+
+        expect(TrackedChannel.open.size).toBe(0);
+    });
+
+    it('leaves one answerer behind when a session replaces another', async () => {
+        // Requirement 1.4 again, for the reconnect case: a tab holding two open
+        // channels can hear itself through the one it did not post on.
+        vi.stubGlobal('BroadcastChannel', TrackedChannel);
+        TrackedChannel.open.clear();
+
+        const { store } = await connected();
+        store.retryConnection();
+        FakeSocket.latest.onopen?.();
+
+        expect(TrackedChannel.open.size).toBe(1);
+    });
+});
+
+describe('establishing the session', () => {
+    it('does not open a second socket when one is already open', async () => {
+        // Requirement 1.2. The layout connects once, but nothing prevents a
+        // second call, and a second socket would be refused as busy by a backend
+        // already talking to the first.
+        const { store } = await connected();
+
+        store.connect(TEST_URL);
+
+        expect(FakeSocket.instances).toHaveLength(1);
+    });
+
+    it('does not open a second socket while the first is still connecting', async () => {
+        const store = await freshStore();
+
+        store.connect(TEST_URL);
+        // Not yet open: the handshake is still in flight.
+        FakeSocket.latest.readyState = 0;
+        store.connect(TEST_URL);
+
+        expect(FakeSocket.instances).toHaveLength(1);
+    });
+
+    it('opens a fresh socket when retrying after a refusal', async () => {
+        // Requirement 1.6. The guard against a second socket must not also block
+        // the retry the notice offers, which is the only way out short of a
+        // reload.
+        const { store, socket } = await connected();
+        refuse(socket);
+        socket.onclose?.();
+
+        store.retryConnection();
+
+        expect(FakeSocket.instances).toHaveLength(2);
+        expect(get(store).connection).toBe('connecting');
+
+        FakeSocket.latest.onopen?.();
+
+        expect(get(store).connection).toBe('connected');
+        expect(get(store).blocked).toBeNull();
+    });
+
+    it('does not reconnect after the session is ended deliberately', async () => {
+        // Closing was the point, so reopening three seconds later undoes it. The
+        // old ordering cleared the pending timer and only then closed the socket,
+        // whose own close handler promptly scheduled another one.
+        const { store, socket } = await connected();
+
+        const scheduled = vi.fn();
+        vi.stubGlobal('setTimeout', scheduled);
+        store.disconnect();
+        socket.onclose?.();
+
+        expect(scheduled).not.toHaveBeenCalled();
+        expect(get(store).connection).toBe('disconnected');
+    });
+});
+
+describe('a question from the agent', () => {
+    /** Deliver a question and let the store settle. */
+    async function askedAbout(options: string[] = []) {
+        const { store, socket } = await connected();
+        socket.deliver({ type: 'question', question: 'Which retry policy?', options });
+        return { store, socket };
+    }
+
+    it('records the question as outstanding', async () => {
+        const { store } = await askedAbout(['The first', 'The second']);
+
+        expect(get(store).pendingQuestion).toEqual({
+            question: 'Which retry policy?',
+            options: ['The first', 'The second']
+        });
+    });
+
+    it('puts the question in the feed as part of the record', async () => {
+        // Requirement 4.5: the exchange is what happened, not a transient
+        // prompt that vanishes once answered.
+        const { store } = await askedAbout();
+
+        expect(latest(store).type).toBe('question');
+        expect(latest(store).content).toBe('Which retry policy?');
+    });
+
+    it('accepts a question with no suggested answers', async () => {
+        const { store } = await askedAbout();
+
+        expect(get(store).pendingQuestion?.options).toEqual([]);
+    });
+
+    it('sends the reply as its own kind of command', async () => {
+        // It must not arrive as an approval or a rejection: the session reads
+        // those for its own questions, and would resolve this as a refusal of
+        // something the user was never asked about.
+        const { store, socket } = await askedAbout(['The first']);
+
+        store.answerQuestion('The first');
+
+        expect(socket.lastSent).toEqual({ action: 'reply', reply: 'The first' });
+    });
+
+    it('puts the reply in the feed beside the question', async () => {
+        const { store } = await askedAbout();
+
+        store.answerQuestion('The one in the HTTP client');
+
+        expect(latest(store).type).toBe('reply');
+        expect(latest(store).content).toBe('The one in the HTTP client');
+    });
+
+    it('stops treating the question as outstanding once answered', async () => {
+        const { store } = await askedAbout();
+
+        store.answerQuestion('The first');
+
+        expect(get(store).pendingQuestion).toBeNull();
+    });
+
+    it('trims the reply before sending it', async () => {
+        const { store, socket } = await askedAbout();
+
+        store.answerQuestion('  padded  ');
+
+        expect(socket.lastSent).toEqual({ action: 'reply', reply: 'padded' });
+    });
+
+    it('does not send an empty reply', async () => {
+        // The agent is waiting for something it can act on, and an empty string
+        // would end the wait without answering.
+        const { store, socket } = await askedAbout();
+        const before = socket.sent.length;
+
+        store.answerQuestion('   ');
+
+        expect(socket.sent).toHaveLength(before);
+        expect(get(store).pendingQuestion).not.toBeNull();
     });
 });
 

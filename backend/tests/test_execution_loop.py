@@ -12,7 +12,14 @@ from pydantic_ai.models.function import AgentInfo, DeltaToolCall, FunctionModel
 
 import api.v1.agent_session as agent_session_module
 from api.v1.agent_session import AgentSession
-from services.event_bus import AgentEvent, SystemEvent, ThoughtEvent, ToolActionEvent
+from services.event_bus import (
+    AgentEvent,
+    DoneEvent,
+    SessionStatus,
+    SystemEvent,
+    ThoughtEvent,
+    ToolActionEvent,
+)
 from services.git_manager import GitManagerService
 from services.session_fsm import SessionState
 from tests.test_agent_session import FakeGit, build_session, opening
@@ -315,31 +322,85 @@ async def test_a_stop_during_streaming_unwinds_immediately(
         await session._handle_executing()
 
 
-async def test_a_task_needing_no_changes_skips_review(
+async def test_an_answering_task_ends_with_its_answer(
     monkeypatch: pytest.MonkeyPatch, git_repo: GitManagerService
 ) -> None:
     """
-    With nothing changed and nothing to review, the session goes straight on.
+    Requirement 2.5: the answer is presented and the session ends there.
 
-    Requirement 10.5 and 10.7: review would have no diff to judge, and the
-    reviewing state would reject the task for having produced nothing.
+    No review, because there is no diff to judge, and no merge decision,
+    because there is no branch to merge.
     """
     responses: list[ModelResponse] = [
         ModelResponse(parts=[TextPart(content='Nothing needed changing.')]),
     ]
     session, events = prepare(monkeypatch, responses, git_repo)
+    session._session.record_classification(False)
     session._session.accept_completion_without_changes('The retry policy tries three times.')
 
-    state: SessionState = await session._handle_executing()
+    state: SessionState = await session._handle_answering()
 
-    assert state is SessionState.completed
+    assert state is SessionState.answered
+
+    done: list[DoneEvent] = [event for event in events if isinstance(event, DoneEvent)]
+    assert len(done) == 1
+    assert done[0].summary == 'The retry policy tries three times.'
+    # An empty branch is what tells the client there is nothing to merge.
+    assert done[0].branch_name == ''
+    assert done[0].total_commits == 0
+
+
+async def test_an_answering_task_that_gave_no_answer_escalates(
+    monkeypatch: pytest.MonkeyPatch, git_repo: GitManagerService
+) -> None:
+    """
+    Requirement 2.7: the classification did not hold, so the task is planned.
+
+    Ending without an answer is the only way this can happen now. The agent has
+    no tool that could change a file, so an answering task that finds it needs
+    one can do nothing but say so and stop — which is exactly what the prompt
+    tells it to do.
+    """
+    responses: list[ModelResponse] = [
+        ModelResponse(parts=[TextPart(content='This cannot be answered without editing the retry policy.')]),
+    ]
+    session, _ = prepare(monkeypatch, responses, git_repo)
+    session._session.record_classification(False)
+
+    state: SessionState = await session._handle_answering()
+
+    assert state is SessionState.planning
+    # The verdict is corrected, or the completion gate would go on excusing a
+    # finish with nothing modified once the task is replanned.
+    assert session._session.changes_are_required is True
+
+
+async def test_the_escalation_is_announced(
+    monkeypatch: pytest.MonkeyPatch, git_repo: GitManagerService
+) -> None:
+    """
+    Requirement 2.7: the user is told, in the way other phase changes are told.
+    """
+    responses: list[ModelResponse] = [
+        ModelResponse(parts=[TextPart(content='This needs a change I cannot make.')]),
+    ]
+    session, events = prepare(monkeypatch, responses, git_repo)
+    session._session.record_classification(False)
+
+    await session._handle_answering()
+
+    announcements: list[SystemEvent] = [
+        event for event in events if isinstance(event, SystemEvent)
+    ]
+    assert any('need file changes after all' in event.content for event in announcements)
+    assert any(event.status is SessionStatus.planning for event in announcements)
 
 
 async def test_a_task_that_changed_files_still_goes_to_review(
     monkeypatch: pytest.MonkeyPatch, git_repo: GitManagerService
 ) -> None:
     """
-    Requirement 10.8: the ordinary path is untouched.
+    Requirement 2.3: the ordinary path is untouched.
     """
     responses: list[ModelResponse] = [
         ModelResponse(parts=[TextPart(content='Done.')]),
@@ -352,3 +413,70 @@ async def test_a_task_that_changed_files_still_goes_to_review(
     state: SessionState = await session._handle_executing()
 
     assert state is SessionState.reviewing
+
+
+def recording_model(seen: list[list[str]]) -> FunctionModel:
+    """
+    Build a model that records which tools it was offered.
+
+    The tool definitions a provider receives are the only place the guarantee is
+    observable: an agent cannot be shown to lack a tool by asking it nicely not
+    to use one.
+
+    :param seen: A list each call appends its offered tool names to.
+    :returns: A model that answers immediately, having noted its tools.
+    """
+
+    async def stream(
+        messages: list[ModelMessage], info: AgentInfo
+    ) -> AsyncIterator[str | dict[int, DeltaToolCall]]:
+        seen.append(sorted(tool.name for tool in info.function_tools))
+        yield 'Nothing to report.'
+
+    return FunctionModel(stream_function=stream)
+
+
+async def test_an_answering_task_is_offered_no_tool_that_writes(
+    monkeypatch: pytest.MonkeyPatch, git_repo: GitManagerService
+) -> None:
+    """
+    A task needing no file changes cannot make any.
+
+    The prompt also tells the agent not to write, but an instruction is only
+    obeyed until it is not, and by then the repository has already changed. The
+    tools are therefore absent rather than merely discouraged.
+    """
+    offered: list[list[str]] = []
+    session, _ = prepare(monkeypatch, [], git_repo)
+    monkeypatch.setattr(agent_session_module, 'resolve_model', lambda name: recording_model(offered))
+    session._session.record_classification(False)
+
+    await session._handle_answering()
+
+    assert offered, 'the model was never called'
+    for tools in offered:
+        assert 'create_file' not in tools
+        assert 'edit_file' not in tools
+        assert 'run_test_command' not in tools
+        # Reading and answering must still be possible, or the path is useless.
+        assert 'read_file' in tools
+        assert 'complete_task' in tools
+
+
+async def test_an_ordinary_task_is_still_offered_the_writing_tools(
+    monkeypatch: pytest.MonkeyPatch, git_repo: GitManagerService
+) -> None:
+    """
+    Requirement 2.3: withholding the tools must not leak into the normal path.
+    """
+    offered: list[list[str]] = []
+    session, _ = prepare(monkeypatch, [], git_repo)
+    monkeypatch.setattr(agent_session_module, 'resolve_model', lambda name: recording_model(offered))
+    session._session.record_classification(True)
+
+    await session._handle_executing()
+
+    assert offered, 'the model was never called'
+    assert 'create_file' in offered[0]
+    assert 'edit_file' in offered[0]
+    assert 'run_test_command' in offered[0]

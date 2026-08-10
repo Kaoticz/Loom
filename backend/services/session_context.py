@@ -24,8 +24,7 @@ class SessionContext:
     _completion_summary: str | None
     _completed_without_changes: bool
     _sandbox_available: bool
-    _task: str
-    _reviewer_model: str
+    _changes_are_required: bool | None
 
     def __init__(self, max_failed_verifications: int = DEFAULT_MAX_FAILED_VERIFICATIONS) -> None:
         """
@@ -44,8 +43,7 @@ class SessionContext:
         self._completion_summary = None
         self._completed_without_changes = False
         self._sandbox_available = True
-        self._task = ''
-        self._reviewer_model = ''
+        self._changes_are_required = None
 
     @property
     def modified_files(self) -> Sequence[str]:
@@ -125,37 +123,30 @@ class SessionContext:
         return self._completion_summary
 
     @property
-    def task(self) -> str:
+    def changes_are_required(self) -> bool | None:
         """
-        The task as the user originally described it.
+        Whether this task was classified as needing at least one file changed.
 
-        :returns: The task description, or an empty string before it is known.
+        None until the classification has been made. The completion gate treats
+        None exactly as it treats True: an unclassified session has not earned
+        the right to finish without changing anything, and defaulting the other
+        way would turn a missing classification into a free pass.
+
+        :returns: The verdict, or None if the task has not been classified.
         """
-        return self._task
+        return self._changes_are_required
 
-    @property
-    def reviewer_model(self) -> str:
+    def record_classification(self, changes_are_required: bool) -> None:
         """
-        The model configured for judging the work.
+        Record what the classifier decided about this task.
 
-        :returns: The reviewer model identifier, or an empty string before it is known.
+        Set once, before any work begins, and read by the completion gate. It is
+        recorded here rather than passed to the tool because the gate runs from
+        inside a tool call, where the session is the only thing in reach.
+
+        :param changes_are_required: True if the task needs at least one file changed.
         """
-        return self._reviewer_model
-
-    def configure(self, task: str, reviewer_model: str) -> None:
-        """
-        Record what the session was asked to do, and which model judges it.
-
-        Both are needed by the adjudicating subagent, which runs from inside a
-        tool call where the session itself is out of reach. They are set here
-        rather than left as open attributes so that the task cannot be quietly
-        rewritten part way through by anything holding the context.
-
-        :param task: The task as the user described it.
-        :param reviewer_model: The model identifier to use for judging the work.
-        """
-        self._task = task
-        self._reviewer_model = reviewer_model
+        self._changes_are_required = changes_are_required
 
     @property
     def sandbox_available(self) -> bool:
@@ -190,13 +181,13 @@ class SessionContext:
         the reviewing state would otherwise reject the task for having produced
         nothing.
 
-        :returns: True if completion was adjudicated as needing no changes.
+        :returns: True if completion was accepted for a task needing no changes.
         """
         return self._completed_without_changes
 
     def accept_completion_without_changes(self, summary: str) -> str:
         """
-        Accept completion for a task adjudicated as requiring no file changes.
+        Accept completion for a task classified as requiring no file changes.
 
         The usual gate demands a modification and a passing verification. Neither
         applies to a task that was only ever going to produce an answer, so this

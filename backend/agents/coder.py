@@ -7,7 +7,6 @@ from typing import Any, ClassVar
 from httpx import AsyncClient, HTTPError, Response
 from pydantic import BaseModel, ConfigDict
 from pydantic_ai import Agent, RunContext
-from pydantic_ai.agent import AgentRunResult
 
 from services.code_search import CodeSearchService, LexicalMatch, SymbolDefinition
 from services.docker_sandbox import CommandResult, DockerSandboxManager
@@ -21,13 +20,8 @@ from services.tool_reporting import (
     report_tool,
 )
 from services.file_editor import EditResult, FileEditorService
-from agents.adjudicator import (
-    AdjudicationResult,
-    adjudicator_agent,
-    build_adjudication_prompt,
-)
-from services.model_resolution import resolve_model
 from services.session_context import SessionContext
+from services.user_questions import MAX_SUGGESTED_ANSWERS, UserQuestioner
 
 logger: Logger = getLogger(__name__)
 
@@ -89,6 +83,22 @@ If a tool call fails or a test does not pass:
 Never silently skip a failing step, and never move to the next step while a verification
 command you just ran is still failing.
 
+# 4b. Asking the user
+
+When the task cannot be carried out correctly without something only the user can tell you — which
+of several things they meant, which of two reasonable approaches they want, a decision the
+repository does not settle — call `ask_user`. It puts the question to the user and waits, and
+returns what they said.
+
+Suggest up to six answers when you can see what the likely ones are. The interface always offers
+the user a further option of typing their own reply, so you neither need to add one nor can remove
+it, and a question with no suggested answers at all is perfectly usable.
+
+Ask when the answer changes what you would do. Do not ask permission for work you were already
+asked to do, do not ask what you could find out by reading the repository, and do not ask a
+question you could answer by making a reasonable assumption and saying so in your summary. Every
+question stops the task until someone comes back to it.
+
 # 5. Finishing
 
 When, and only when, the task is genuinely done, call the `complete_task` tool.
@@ -105,14 +115,18 @@ Most tasks require changing files. For those:
 
 Some tasks require changing nothing at all: summarising code, explaining how something works,
 assessing a design, or investigating whether a problem exists where the answer turns out to be
-no. For those:
+no. Whether this is such a task has already been decided before you were given it, and you will
+be told plainly when it is. For those:
 
 - Pass your answer itself as the summary. It is the whole product of the task, so make it
   complete: the reader sees this and nothing else.
 - Do not invent a file change to satisfy the rule above. A task that asked a question is
   finished when the question is answered.
-- Do not use this to escape work you found difficult. Whether the task genuinely required no
-  changes is checked, and if it did require them you will be told to carry on.
+- Do not use this to escape work you found difficult. On any task you were not told is an
+  answering task, completing without a modification is refused outright.
+- If you were told this is an answering task but find that it cannot be answered without
+  changing a file, do not change one. Say so in your summary and stop. The task will be
+  replanned as ordinary work.
 
 In both cases, `complete_task` is the final action of your execution phase. After calling it,
 stop. Do not produce another plan, do not call more tools, and do not keep reasoning.
@@ -137,6 +151,13 @@ class AgentDeps(BaseModel):
     embedding: EmbeddingService
     events: EventBus
     session: SessionContext
+    questioner: UserQuestioner | None = None
+    """
+    How a tool puts a question to the user, when the session supplies one.
+
+    Optional because the tools are also driven directly by tests and by any
+    caller with no user to ask; `ask_user` says so plainly rather than hanging.
+    """
 
 
 coder_agent: Agent[AgentDeps, str] = Agent(
@@ -493,6 +514,45 @@ async def _web_search(query: str) -> str:
 
 
 @coder_agent.tool
+async def ask_user(
+    ctx: RunContext[AgentDeps], question: str, options: list[str] | None = None
+) -> str:
+    """
+    Ask the user a question and wait for their answer.
+
+    Use this when the task cannot be carried out correctly without something
+    only the user can tell you: which of several things they meant, which
+    approach they want, or a decision the repository does not settle. Suggest up
+    to six answers if you can; the interface always offers the user the further
+    option of typing their own, so a question with no suggestions is fine too.
+
+    Do not use it to ask permission for work you have already been asked to do,
+    and do not use it in place of reading the repository to find something out.
+    """
+    async with report_tool(ctx.deps.events, 'ask_user', {'question': question}) as report:
+        questioner: UserQuestioner | None = ctx.deps.questioner
+        if questioner is None:
+            return report.fail(
+                'There is no user to ask in this session, so this question cannot be put to '
+                'anyone. Continue with the most reasonable assumption and say in your summary '
+                'what you assumed.'
+            )
+
+        asked: str = question.strip()
+        if not asked:
+            return report.fail('ask_user was rejected: the question was empty.')
+
+        reply, truncated = await questioner.ask(asked, options or [])
+        if truncated:
+            return report.succeed(
+                f'Only the first {MAX_SUGGESTED_ANSWERS} suggested answers were shown; the rest '
+                f'were dropped. Suggest no more than {MAX_SUGGESTED_ANSWERS} next time. '
+                f'The user replied: {reply}'
+            )
+        return report.succeed(f'The user replied: {reply}')
+
+
+@coder_agent.tool
 async def complete_task(ctx: RunContext[AgentDeps], summary: str) -> str:
     """
     Signal that all the work for the task is finished.
@@ -507,24 +567,19 @@ async def complete_task(ctx: RunContext[AgentDeps], summary: str) -> str:
 
     async with report_tool(ctx.deps.events, 'complete_task', {}) as report:
         if not session.has_modified_files:
-            # Some tasks legitimately change nothing. Whether this was one of
-            # them is not a judgment the gate can make from counting files, so
-            # it is put to a subagent. A failure here is deliberately allowed to
-            # escape: guessing either way is worse than stopping.
-            decision: AdjudicationResult = await adjudicate_completion(session, summary)
-
-            if decision.changes_were_required:
+            # Whether finishing without a change is legitimate was settled before
+            # the task began, so there is no judgment to make here: a task
+            # classified as needing changes and offering none is simply refused.
+            if session.changes_are_required is not False:
                 return report.fail(
-                    f'complete_task was rejected: {decision.reason} '
-                    'Make the changes the task requires, verify them with run_test_command, '
-                    'and only then call complete_task.'
+                    'complete_task was rejected: this task was judged to require changing at '
+                    'least one file, and nothing has been modified. Make the changes the task '
+                    'requires, verify them with run_test_command, and only then call '
+                    'complete_task.'
                 )
 
             recorded_answer: str = session.accept_completion_without_changes(summary)
-            return report.succeed(
-                f'Task marked complete with no file changes. {decision.reason} '
-                f'Answer recorded: {recorded_answer}'
-            )
+            return report.succeed(f'Task marked complete with no file changes. Answer recorded: {recorded_answer}')
 
         try:
             recorded: str = session.request_completion(summary)
@@ -537,21 +592,45 @@ async def complete_task(ctx: RunContext[AgentDeps], summary: str) -> str:
         )
 
 
-async def adjudicate_completion(
-    session: SessionContext, summary: str
-) -> AdjudicationResult:
-    """
-    Ask whether the task could have been completed without changing any file.
+READ_ONLY_TOOLS: tuple[Any, ...] = (
+    ask_user,
+    search_code,
+    search_code_lexical,
+    get_symbol,
+    read_file,
+    web_search,
+    complete_task,
+)
+"""
+The tools a task needing no file changes is allowed to use.
 
-    Consulted only when nothing was modified. Runs on the reviewer's model, since
-    this is a judgment about the work rather than part of doing it.
+Asking the user a question is included: it changes nothing, and a task that can
+only be answered once an ambiguity is settled is better off asking than
+guessing.
 
-    :param session: The session context, carrying the task and reviewer model.
-    :param summary: The agent's account of what it did.
-    :returns: The adjudicator's verdict.
-    """
-    verdict: AgentRunResult[AdjudicationResult] = await adjudicator_agent.run(
-        build_adjudication_prompt(session.task, summary),
-        model=resolve_model(session.reviewer_model),
-    )
-    return verdict.output
+Everything absent from this list can alter the working tree: `create_file` and
+`edit_file` write and then commit, and `run_test_command` executes an arbitrary
+command inside a sandbox with the repository mounted. A task classified as
+needing no changes has nothing to write and nothing to verify, so none of them
+has a use it could put them to.
+"""
+
+
+answering_agent: Agent[AgentDeps, str] = Agent(
+    deps_type=AgentDeps,
+    output_type=str,
+    system_prompt=CODER_SYSTEM_PROMPT,
+)
+"""
+The agent used for a task classified as requiring no file changes.
+
+A separate agent rather than a filtered view of `coder_agent`, so that being
+unable to write is structural: the tools were never registered, so there is no
+switch to be left in the wrong position and no per-run state to get out of step
+between concurrent sessions. Telling the agent not to write, as the prompt also
+does, is worth having as well — but by the time an instruction is disobeyed the
+repository has already changed, which is exactly what this prevents.
+"""
+
+for _read_only_tool in READ_ONLY_TOOLS:
+    answering_agent.tool(_read_only_tool)

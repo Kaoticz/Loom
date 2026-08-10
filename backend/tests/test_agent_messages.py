@@ -53,6 +53,8 @@ def test_every_message_type_is_defined() -> None:
         'system',
         # Shown as a banner rather than added to the feed.
         'sandbox_unavailable',
+        # A question the agent put to the user, which the session waits on.
+        'question',
     }
 
 

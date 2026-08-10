@@ -20,6 +20,16 @@ describe('task status styling', () => {
         expect(taskStatusStyles.cancelled).not.toBe(taskStatusStyles.initialized);
     });
 
+    it('distinguishes an answered task from a completed or merged one', () => {
+        // Requirement 2.8. `completed` here means the reviewer approved and a
+        // merge is pending; `merged` means it happened. An answered task did
+        // neither, and a badge shared with either would say it had.
+        expect(taskStatusStyles.answered).not.toBe(taskStatusStyles.completed);
+        expect(taskStatusStyles.answered).not.toBe(taskStatusStyles.merged);
+        expect(taskStatusStyles.answered).not.toBe(taskStatusStyles.failed);
+        expect(taskStatusStyles.answered).not.toBe(taskStatusStyles.initialized);
+    });
+
     it('falls back for a status it does not recognise', () => {
         expect(taskStatusStyle('invented_by_a_newer_backend')).toBe(taskStatusStyles.initialized);
     });

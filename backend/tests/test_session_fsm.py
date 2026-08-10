@@ -11,6 +11,7 @@ from services.session_fsm import (
 )
 
 HAPPY_PATH: list[SessionState] = [
+    SessionState.classifying,
     SessionState.planning,
     SessionState.waiting_plan_approval,
     SessionState.executing,
@@ -114,25 +115,79 @@ def test_terminal_set() -> None:
     assert is_terminal(SessionState.completed) is False
 
 
-def test_execution_may_complete_without_review() -> None:
+def test_classification_precedes_planning() -> None:
     """
-    A task adjudicated as needing no file changes has no diff to review.
-
-    Requirement 10.5.
+    Requirement 2.1: nothing is planned before the task has been classified.
     """
     machine: SessionStateMachine = SessionStateMachine()
+
+    assert machine.can_transition_to(SessionState.planning) is False
+    assert machine.transition_to(SessionState.classifying) is SessionState.classifying
+    assert machine.transition_to(SessionState.planning) is SessionState.planning
+
+
+def test_a_task_needing_no_changes_takes_the_answering_route() -> None:
+    """
+    Requirement 2.4: classification leads to answering rather than planning.
+    """
+    machine: SessionStateMachine = SessionStateMachine()
+    machine.transition_to(SessionState.classifying)
+
+    assert machine.transition_to(SessionState.answering) is SessionState.answering
+    assert machine.transition_to(SessionState.answered) is SessionState.answered
+
+
+def test_an_answered_task_is_terminal() -> None:
+    """
+    Requirement 2.5: the answer ends the session. There is no branch to merge
+    and no review to run, so nothing may follow.
+    """
+    machine: SessionStateMachine = SessionStateMachine()
+    machine.transition_to(SessionState.classifying)
+    machine.transition_to(SessionState.answering)
+    machine.transition_to(SessionState.answered)
+
+    assert machine.is_terminal is True
+    assert is_terminal(SessionState.answered) is True
+    for target in SessionState:
+        assert is_valid_transition(SessionState.answered, target) is False
+
+
+def test_answering_can_escalate_into_planning() -> None:
+    """
+    Requirement 2.7: a task that turns out to need changes rejoins the ordinary
+    route rather than failing or finishing.
+    """
+    machine: SessionStateMachine = SessionStateMachine()
+    machine.transition_to(SessionState.classifying)
+    machine.transition_to(SessionState.answering)
+
+    assert machine.transition_to(SessionState.planning) is SessionState.planning
+
+
+def test_execution_no_longer_shortcuts_to_completion() -> None:
+    """
+    Requirement 2.6: the table must not claim a transition that cannot happen.
+
+    `executing -> completed` existed only for the completion-time judgement
+    that requirement 2.9 removes. A changeless finish is now decided before the
+    work starts and never passes through `executing` at all.
+    """
+    machine: SessionStateMachine = SessionStateMachine()
+    machine.transition_to(SessionState.classifying)
     machine.transition_to(SessionState.planning)
     machine.transition_to(SessionState.waiting_plan_approval)
     machine.transition_to(SessionState.executing)
 
-    assert machine.transition_to(SessionState.completed) is SessionState.completed
+    assert machine.can_transition_to(SessionState.completed) is False
 
 
 def test_execution_still_reaches_review() -> None:
     """
-    Adding the shortcut must not remove the ordinary route.
+    Requirement 2.3: the ordinary route is untouched.
     """
     machine: SessionStateMachine = SessionStateMachine()
+    machine.transition_to(SessionState.classifying)
     machine.transition_to(SessionState.planning)
     machine.transition_to(SessionState.waiting_plan_approval)
     machine.transition_to(SessionState.executing)

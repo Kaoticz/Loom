@@ -35,7 +35,9 @@ class FakeSocket {
         this.sent.push(data);
     }
 
-    close(): void {}
+    close(): void {
+        this.readyState = 3;
+    }
 
     /** Push one server message through the socket. */
     deliver(payload: object): void {
@@ -43,11 +45,17 @@ class FakeSocket {
     }
 }
 
+/** Where the layout connects the session; the page itself no longer does. */
+const WS_URL = 'ws://test/agent-session';
+
 let session = 0;
 
 beforeEach(() => {
     localStorage.clear();
     vi.stubGlobal('WebSocket', FakeSocket);
+    // The store is a singleton shared by every test in this file, so a session
+    // left open by the previous one would make the next connection a no-op.
+    agentStore.disconnect();
     // The page fetches the model list on mount; an empty list is a valid answer.
     vi.stubGlobal(
         'fetch',
@@ -58,11 +66,18 @@ beforeEach(() => {
     agentStore.updateConfig({ repoPath: `/test/page-${session}` });
 });
 
-/** Render the page and return the socket it connected through. */
+/**
+ * Render the page against an open session.
+ *
+ * The connection is established here rather than by the page, because since
+ * requirement 1.1 it belongs to the layout: the page is one of several views
+ * that come and go while the session stays.
+ */
 function renderPage() {
-    const rendered = render(Page);
+    agentStore.connect(WS_URL);
     const socket = FakeSocket.latest;
     socket?.onopen?.();
+    const rendered = render(Page);
     return { rendered, socket };
 }
 

@@ -5,6 +5,7 @@ from collections.abc import Awaitable, Callable
 from logging import Logger, getLogger
 
 from schemas.agent_commands import CommandAction, SessionCommand, parse_command
+from services.user_questions import ClientGone, StopRequested
 
 logger: Logger = getLogger(__name__)
 
@@ -24,6 +25,12 @@ class SessionInbox:
 
     One reader avoids that. It takes every message, diverts a stop into a flag
     the working loops can check, and queues the rest for whoever is waiting.
+
+    A reply to a question the agent asked is diverted too, to the tool awaiting
+    it. It must not reach the queue: the session reads that queue for answers to
+    its own questions, and a reply landing there would be resolved as a
+    rejection. The diversion runs the other way as well — an approval never
+    reaches a waiting tool, because only a `reply` is routed to one.
     """
 
     _receive: ReceiveText
@@ -32,6 +39,7 @@ class SessionInbox:
     _stop: asyncio.Event
     _closed: asyncio.Event
     _reader: asyncio.Task[None] | None
+    _pending_reply: asyncio.Future[str] | None
 
     def __init__(
         self, receive: ReceiveText, on_stop: Callable[[], Awaitable[None]] | None = None
@@ -50,6 +58,7 @@ class SessionInbox:
         self._stop = asyncio.Event()
         self._closed = asyncio.Event()
         self._reader = None
+        self._pending_reply = None
 
     @property
     def stop_requested(self) -> bool:
@@ -98,6 +107,50 @@ class SessionInbox:
             return SessionCommand(action=CommandAction.stop)
         raise ConnectionError('The client disconnected before answering.')
 
+    async def await_reply(self) -> str:
+        """
+        Wait for the user's answer to a question the agent asked.
+
+        Waits as long as an approval point does, rather than timing out: the
+        agent asked because it cannot proceed without an answer, and inventing
+        one after an interval would be worse than waiting.
+
+        :returns: What the user replied.
+        :raises StopRequested: If the user stopped the session while waiting.
+        :raises ClientGone: If the client disconnected while waiting.
+        :raises RuntimeError: If a question is already outstanding.
+        """
+        if self._pending_reply is not None and not self._pending_reply.done():
+            raise RuntimeError('A question is already awaiting a reply.')
+
+        # Checked before waiting as well as while waiting: a stop that arrived
+        # a moment ago would otherwise leave the tool waiting for a user who has
+        # already walked away.
+        if self._stop.is_set():
+            raise StopRequested()
+        if self._closed.is_set():
+            raise ClientGone()
+
+        pending: asyncio.Future[str] = asyncio.get_running_loop().create_future()
+        self._pending_reply = pending
+
+        stopped: asyncio.Task[bool] = asyncio.create_task(self._stop.wait())
+        closed: asyncio.Task[bool] = asyncio.create_task(self._closed.wait())
+        try:
+            done, waiting = await asyncio.wait(
+                (pending, stopped, closed), return_when=asyncio.FIRST_COMPLETED
+            )
+            for task in waiting:
+                task.cancel()
+
+            if pending in done:
+                return pending.result()
+            if self._stop.is_set():
+                raise StopRequested()
+            raise ClientGone()
+        finally:
+            self._pending_reply = None
+
     async def close(self) -> None:
         """
         Stop reading and release the reader task.
@@ -129,6 +182,10 @@ class SessionInbox:
             # rather than an error, so there is nothing to guard against here.
             command: SessionCommand = parse_command(text)
 
+            if command.resolved_action is CommandAction.reply:
+                self._deliver_reply(command.reply)
+                continue
+
             if command.resolved_action is CommandAction.stop:
                 self._stop.set()
                 if self._on_stop is not None:
@@ -141,3 +198,18 @@ class SessionInbox:
                 continue
 
             await self._queue.put(command)
+
+    def _deliver_reply(self, reply: str) -> None:
+        """
+        Hand a reply to the tool waiting for it.
+
+        A reply with nothing waiting is discarded rather than queued. Queueing
+        it would leave it to be read as the answer to some later approval, which
+        is the confusion this routing exists to prevent.
+
+        :param reply: What the user answered.
+        """
+        if self._pending_reply is None or self._pending_reply.done():
+            logger.warning('A reply arrived with no question outstanding; discarding it.')
+            return
+        self._pending_reply.set_result(reply)

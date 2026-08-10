@@ -69,6 +69,18 @@ const doneMessageSchema = z.object({
     total_commits: z.number().int().nonnegative().default(0)
 });
 
+/**
+ * A question the agent has put to the user.
+ *
+ * The suggestions are the agent's; the option to reply freely is added by the
+ * interface, so a question arriving with none is still answerable.
+ */
+const questionMessageSchema = z.object({
+    type: z.literal('question'),
+    question: z.string(),
+    options: z.array(z.string()).default([])
+});
+
 const errorMessageSchema = z.object({
     type: z.literal('error'),
     content: z.string()
@@ -88,8 +100,10 @@ const sessionBusyMessageSchema = z.object({
  */
 export const sessionStatusSchema = z.enum([
     'indexing',
+    'classifying',
     'planning',
     'executing',
+    'answering',
     'reviewing',
     're_working',
     'merging',
@@ -136,6 +150,7 @@ export const agentMessageSchema = z.discriminatedUnion('type', [
     diffMessageSchema,
     reviewMessageSchema,
     doneMessageSchema,
+    questionMessageSchema,
     errorMessageSchema,
     sessionBusyMessageSchema,
     systemMessageSchema,
@@ -146,6 +161,7 @@ export type AgentMessagePayload = z.infer<typeof agentMessageSchema>;
 export type ThoughtMessagePayload = z.infer<typeof thoughtMessageSchema>;
 export type SystemMessagePayload = z.infer<typeof systemMessageSchema>;
 export type SandboxUnavailablePayload = z.infer<typeof sandboxUnavailableMessageSchema>;
+export type QuestionMessagePayload = z.infer<typeof questionMessageSchema>;
 export type SandboxStage = z.infer<typeof sandboxStageSchema>;
 export type ActionMessagePayload = z.infer<typeof actionMessageSchema>;
 
@@ -154,6 +170,7 @@ export const taskStatusSchema = z.enum([
     'initialized',
     'running',
     'completed',
+    'answered',
     'merged',
     'failed',
     'cancelled'
@@ -217,6 +234,7 @@ export const commandActionSchema = z.enum([
     'merge',
     'abort',
     'stop',
+    'reply',
     'continue',
     'auto_approve'
 ]);
