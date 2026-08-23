@@ -19,6 +19,7 @@ from collections.abc import Sequence
 from services.symbol_patterns import build_rules, language_for
 from services.chunking import Chunk, SymbolSpan, build_chunks
 from services.indexing_progress import ProgressCallback, ProgressReporter
+from services.repository_files import list_indexable_files
 from subprocess import CompletedProcess
 import asyncio
 
@@ -105,14 +106,11 @@ class IndexingService:
         :param progress_callback: Where to report progress, if anywhere.
         """
         abs_repo_path: str = os.path.abspath(self.repo_path)
-        exclude_dirs: set[str] = {'.git', 'node_modules', '__pycache__', 'dist', 'build', '.venv', 'venv'}
-        
-        all_files: list[str] = []
-        for root, dirs, files in os.walk(abs_repo_path):
-            dirs[:] = [d for d in dirs if d not in exclude_dirs]
-            for file_name in files:
-                all_files.append(os.path.join(root, file_name))
-        
+        # What the repository ignores, it ignores here too. Embedding build
+        # output and generated artefacts costs time and money and then buries
+        # the code someone asked about underneath the things they never wrote.
+        all_files: list[str] = list_indexable_files(abs_repo_path)
+
         reporter: ProgressReporter = ProgressReporter(len(all_files), progress_callback)
         await reporter.start(f'Indexing {len(all_files)} files...')
 

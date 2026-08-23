@@ -3,7 +3,7 @@ from __future__ import annotations
 import subprocess
 from pathlib import Path
 from typing import Any
-from unittest.mock import MagicMock
+from unittest.mock import AsyncMock, MagicMock
 
 import pytest
 
@@ -805,3 +805,38 @@ async def test_an_unchanged_chunk_size_keeps_the_index(repo: str) -> None:
 
     kept: File | None = await File.get_or_none(file_path='a.py')
     assert kept is not None and kept.hash == 'unchanged'
+
+
+async def test_indexing_skips_what_the_repository_ignores(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """
+    The indexer obeys the ignore rules, not just the helper that reads them.
+
+    Asserted through `index_repository` rather than the listing alone, because
+    the wiring between the two is the part that was missing.
+    """
+    subprocess.run(['git', 'init', '-q', str(tmp_path)], capture_output=True, check=True)
+    Path(tmp_path, '.gitignore').write_text('build/\n')
+    Path(tmp_path, 'main.py').write_text('def real(): pass\n')
+    Path(tmp_path, 'build').mkdir()
+    Path(tmp_path, 'build', 'bundle.py').write_text('def generated(): pass\n')
+
+    seen: list[str] = []
+
+    service: IndexingService = IndexingService(repo_path=str(tmp_path), embedding=MagicMock())
+
+    async def record(
+        file_path: str, abs_repo_path: str, *args: Any, **kwargs: Any
+    ) -> None:
+        seen.append(Path(file_path).relative_to(abs_repo_path).as_posix())
+
+    monkeypatch.setattr(service, '_process_file', record)
+    monkeypatch.setattr(
+        type(service), 'resolve_embedding_model', AsyncMock(return_value=MagicMock())
+    )
+
+    await service.index_repository()
+
+    assert 'main.py' in seen
+    assert 'build/bundle.py' not in seen
