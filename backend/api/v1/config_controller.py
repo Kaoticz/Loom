@@ -4,7 +4,17 @@ from httpx import AsyncClient, Response
 from git import Repo, InvalidGitRepositoryError
 import os
 
+from dishka.integrations.fastapi import FromDishka, inject
+
+from schemas.index_maintenance import IndexDeletionResponse, IndexStatusResponse
 from services.embedding import EmbeddingService, ModelDescription
+from services.index_deletion import (
+    IndexDeletionSummary,
+    count_project_index,
+    delete_project_index,
+)
+from services.projects import normalise_project_path
+from services.session_registry import SessionRegistry
 
 router: APIRouter = APIRouter()
 
@@ -83,3 +93,96 @@ async def list_directories(path: str = '/') -> list[str]:
         return sorted(dirs)
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
+
+
+SESSION_ACTIVE_REASON: str = (
+    'A session is running. Deleting the index while an agent is working would leave its '
+    'searches returning nothing mid-task, so finish or stop the session first.'
+)
+NOTHING_INDEXED_REASON: str = 'Nothing is indexed for this project yet.'
+
+
+@router.get('/index/status', response_model=IndexStatusResponse)
+@inject
+async def index_status(
+    path: str,
+    registry: FromDishka[SessionRegistry],
+) -> IndexStatusResponse:
+    """
+    Report what is indexed for a project, and whether it can be removed.
+
+    The path comes from the caller rather than the environment. The settings
+    page is where a project is chosen, so it is the only thing that knows which
+    project the reader means; a backend reading its own configuration would
+    answer about whichever repository it was started with.
+    """
+    project: str = normalise_project_path(path)
+    indexed: int = await count_project_index(project)
+
+    if registry.is_busy:
+        return IndexStatusResponse(
+            project=project,
+            indexed_files=indexed,
+            can_delete=False,
+            blocked_reason=SESSION_ACTIVE_REASON,
+        )
+
+    if indexed == 0:
+        return IndexStatusResponse(
+            project=project,
+            indexed_files=0,
+            can_delete=False,
+            blocked_reason=NOTHING_INDEXED_REASON,
+        )
+
+    return IndexStatusResponse(project=project, indexed_files=indexed, can_delete=True)
+
+
+@router.delete('/index', response_model=IndexDeletionResponse)
+@inject
+async def delete_index(
+    path: str,
+    registry: FromDishka[SessionRegistry],
+) -> IndexDeletionResponse:
+    """
+    Remove everything indexed for a project.
+
+    Refused while a session is running: deleting the index underneath a working
+    agent does not raise anything it can report, it simply makes every search
+    come back empty, which reads as an unindexed repository rather than as a
+    deliberate act.
+
+    Re-indexing is not started here. It happens when a session next begins, and
+    the interface says so.
+    """
+    if registry.is_busy:
+        raise HTTPException(status_code=409, detail=SESSION_ACTIVE_REASON)
+
+    project: str = normalise_project_path(path)
+
+    try:
+        summary: IndexDeletionSummary = await delete_project_index(project)
+    except Exception as error:
+        # Reported rather than swallowed: a control that failed must not be able
+        # to look as though it succeeded.
+        raise HTTPException(
+            status_code=500, detail=f'The index could not be deleted: {error}'
+        ) from error
+
+    if summary.files_deleted == 0:
+        message: str = 'There was nothing indexed for this project, so nothing was removed.'
+    else:
+        message = (
+            f'Removed {summary.files_deleted} indexed '
+            f'{"file" if summary.files_deleted == 1 else "files"}, '
+            f'{summary.symbols_deleted} symbols and {summary.embeddings_deleted} embeddings. '
+            'The project is re-indexed when a session next starts.'
+        )
+
+    return IndexDeletionResponse(
+        project=project,
+        embeddings_deleted=summary.embeddings_deleted,
+        files_deleted=summary.files_deleted,
+        symbols_deleted=summary.symbols_deleted,
+        message=message,
+    )

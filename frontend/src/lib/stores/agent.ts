@@ -7,6 +7,8 @@ import {
     type AgentMessagePayload,
     type SystemMessagePayload,
     type CommandAction,
+    type PlanFormat,
+    type PlanStep,
     type SandboxStage,
     type ThoughtMessagePayload
 } from '$lib/schemas';
@@ -39,6 +41,15 @@ export interface Message {
     id: number;
     type: MessageType;
     content: string;
+    /**
+     * The steps of a plan, when this message is one.
+     *
+     * Kept beside `content` rather than replacing it: a plan that arrived as
+     * free text is shown as text, and the rendered form is what it shows.
+     */
+    planSteps?: PlanStep[];
+    /** Whether the plan arrived structured, and so how it should be shown. */
+    planFormat?: PlanFormat;
     timestamp: Date;
     /**
      * The feed slot this message occupies.
@@ -722,8 +733,10 @@ function createAgentStore() {
                     newMessage.content = `${data.message} (${data.commit_hash.slice(0, 7)})`;
                     break;
                 case 'plan':
+                    newMessage.planSteps = data.steps;
+                    newMessage.planFormat = data.format;
                     newMessage.content = data.steps
-                        .map((step, index) => `${index + 1}. ${step}`)
+                        .map((step, index) => `${index + 1}. ${step.title}`)
                         .join('\n');
                     if (data.requires_approval) {
                         nextState.status = 'waiting_approval';

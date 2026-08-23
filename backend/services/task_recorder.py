@@ -129,7 +129,16 @@ class TaskRecorder:
                     {'approved': event.approved, 'comments': event.comments},
                 )
             elif isinstance(event, PlanEvent):
-                await self.record(TaskLogEntryType.plan, {'steps': list(event.steps)})
+                # Stored structured. Flattening to titles here would lose the
+                # descriptions from the task history, where they are most useful
+                # long after the session that produced them has gone.
+                await self.record(
+                    TaskLogEntryType.plan,
+                    {
+                        'format': event.format.value,
+                        'steps': [step.model_dump() for step in event.steps],
+                    },
+                )
         except Exception as error:
             logger.warning('Could not record a %s entry: %s', type(event).__name__, error)
 

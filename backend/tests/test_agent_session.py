@@ -14,6 +14,7 @@ from agents.coder import AgentDeps
 from database.enums import TaskStatus
 from schemas.agent_messages import MessageType
 from services.code_search import CodeSearchService
+from services.projects import normalise_project_path
 from services.conversation_history import ConversationHistory
 from services.docker_sandbox import DockerSandboxManager
 from services.event_bus import (
@@ -33,7 +34,7 @@ from services.git_manager import FileChange, GitManagerService
 from services.session_context import SessionContext
 from services.session_fsm import SessionState, SessionStateMachine
 from services.session_limits import IterationLimits
-from tests.conftest import stub_embedding_service
+from tests.conftest import TEST_REPO_PATH, stub_embedding_service
 
 
 class FakeWebSocket:
@@ -163,6 +164,15 @@ class FakeIndexing:
     files: list[str]
     chunk_lines: int | None
 
+    @property
+    def project(self) -> str:
+        """
+        Mirror the real service, which derives this rather than caching it.
+
+        :returns: The normalised path identifying the current project.
+        """
+        return normalise_project_path(self.repo_path)
+
     def __init__(self) -> None:
         """
         Create an indexer that reports no work.
@@ -199,6 +209,7 @@ class FakeServices:
     docker: Any
     editor: Any
     embedding: Any
+    search: Any
 
     def __init__(self, git: FakeGit) -> None:
         """
@@ -211,6 +222,7 @@ class FakeServices:
         self.docker = MagicMock()
         self.editor = MagicMock()
         self.embedding = MagicMock()
+        self.search = MagicMock()
 
         async def spawn(
             session_id: str,
@@ -265,7 +277,7 @@ def build_session(
     context: SessionContext = SessionContext()
     deps: AgentDeps = AgentDeps(
         docker=DockerSandboxManager(repo_path='/tmp/repo'),
-        search=CodeSearchService(),
+        search=CodeSearchService(repo_path=TEST_REPO_PATH),
         editor=FileEditorService(root_path='/tmp/repo'),
         git=GitManagerService(repo_path='/tmp/repo'),
         embedding=stub_embedding_service(),
@@ -703,6 +715,37 @@ async def test_repo_path_is_applied_to_every_service(
     assert services.editor.root_path == '/repos/project-b'
     assert services.git.repo_path == '/repos/project-b'
     assert services.indexing.repo_path == '/repos/project-b'
+    # The search service too. Left behind, the agent would read the project
+    # named by REPO_PATH while the indexer wrote to this one, and every search
+    # would come back empty rather than failing.
+    assert services.search.repo_path == '/repos/project-b'
+
+
+async def test_the_indexer_and_the_search_agree_on_the_project(
+    monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """
+    Whatever the session is pointed at, both sides name the same project.
+
+    They are repointed independently, so nothing but this stops them drifting
+    apart — and a drift produces empty searches rather than an error.
+    """
+    from services.code_search import CodeSearchService
+    from services.indexing import IndexingService
+    from unittest.mock import MagicMock as Mock
+
+    monkeypatch.delenv('REPO_PATH', raising=False)
+
+    indexing: IndexingService = IndexingService(repo_path='/repos/first', embedding=Mock())
+    search: CodeSearchService = CodeSearchService(repo_path='/repos/first')
+
+    assert indexing.project == search.project
+
+    # As a start message naming another repository would do.
+    indexing.repo_path = '/repos/second/'
+    search.repo_path = '/repos/second'
+
+    assert indexing.project == search.project, 'a cached project would still name the first'
 
 
 async def test_failure_leaves_the_machine_in_the_failed_state(
@@ -1658,3 +1701,108 @@ async def test_the_branch_is_created_only_once(
     await session._ensure_branch()
 
     assert services.git.created_branches == ['ai-task-testsess']
+
+
+@pytest.mark.usefixtures('db')
+async def test_an_empty_repository_is_judged_per_project(
+    monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """
+    Another project being indexed says nothing about this one.
+
+    Before the index was scoped, one file anywhere made every repository look
+    non-empty. The session would then plan against nothing and give no
+    indication why, which is the situation this check exists to prevent.
+    """
+    from database.models.file import File
+
+    monkeypatch.delenv('REPO_PATH', raising=False)
+
+    session, _, _, services = build_session([json.dumps({'prompt': 'do something'})])
+    services.indexing.repo_path = '/repos/mine'
+
+    # Somebody else's project is fully indexed.
+    await File.create(
+        project=normalise_project_path('/repos/theirs'),
+        file_path='src/main.py',
+        raw_content='theirs\n',
+        hash='h1',
+    )
+
+    assert await session._repository_is_empty() is True
+
+    await File.create(
+        project=normalise_project_path('/repos/mine'),
+        file_path='src/main.py',
+        raw_content='mine\n',
+        hash='h2',
+    )
+
+    assert await session._repository_is_empty() is False
+
+
+async def test_planning_falls_back_to_text_when_structure_fails(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """
+    A planner that cannot produce structure must not cost us the plan.
+
+    This is the requirement most easily lost, because everything looks correct
+    for as long as the model cooperates — and the small models this runs against
+    frequently will not. Asserted by making the structured attempt fail outright
+    and requiring a usable plan to arrive anyway.
+    """
+    import agents.planner as planner_module
+    from services.plan_parser import PlanFormat
+
+    async def refuse(*_: object, **__: object) -> object:
+        raise RuntimeError('this model does not do structured output')
+
+    monkeypatch.setattr(planner_module.planner_agent, 'run', refuse)
+
+    session, _, _, _ = build_session([json.dumps({'prompt': 'do something'})])
+
+    async def coder_text(_self: object, _prompt: str) -> str:
+        return '1. Read the file.\n2. Edit it.\nPLAN_COMPLETE'
+
+    monkeypatch.setattr(type(session), '_run_coder', coder_text)
+
+    plan = await session._plan_structured('irrelevant')
+
+    assert plan.titles == ['Read the file.', 'Edit it.']
+    # Marked as text, so the reader is shown text rather than empty accordions.
+    assert plan.format is PlanFormat.text
+
+
+async def test_structure_that_says_nothing_falls_back_too(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """
+    Structure that arrives empty is no better than structure that fails.
+
+    A planner returning zero steps would otherwise produce an empty plan and end
+    the round, when the text path might still recover something.
+    """
+    import agents.planner as planner_module
+    from agents.planner import StructuredPlan
+    from services.plan_parser import PlanFormat
+
+    class EmptyResult:
+        output: StructuredPlan = StructuredPlan(steps=[])
+
+    async def empty(*_: object, **__: object) -> EmptyResult:
+        return EmptyResult()
+
+    monkeypatch.setattr(planner_module.planner_agent, 'run', empty)
+
+    session, _, _, _ = build_session([json.dumps({'prompt': 'do something'})])
+
+    async def coder_text(_self: object, _prompt: str) -> str:
+        return '1. Recovered step.'
+
+    monkeypatch.setattr(type(session), '_run_coder', coder_text)
+
+    plan = await session._plan_structured('irrelevant')
+
+    assert plan.titles == ['Recovered step.']
+    assert plan.format is PlanFormat.text

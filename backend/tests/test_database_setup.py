@@ -11,10 +11,7 @@ import pytest_asyncio
 
 from database.setup import SchemaSetupError, apply_migrations, ensure_vector_extension
 
-pytestmark = pytest.mark.skipif(
-    not os.getenv('TEST_DATABASE_URL'),
-    reason='migrations run against Postgres; set TEST_DATABASE_URL to run',
-)
+pytestmark = pytest.mark.usefixtures('require_database')
 
 SCRATCH_DATABASE: str = 'loom_migration_test'
 MIGRATIONS_DIRECTORY: Path = (

@@ -1,4 +1,5 @@
 <script lang="ts">
+    import PlanSteps from '$lib/components/PlanSteps.svelte';
     import type { Message } from '$lib/stores/agent';
     import { onDestroy } from 'svelte';
     import {
@@ -44,7 +45,14 @@
             {formatMessageTime(message.timestamp)}
         </time>
     </div>
-    {#if MARKDOWN_TYPES.includes(message.type)}
+    {#if message.planFormat === 'structured' && message.planSteps?.length}
+        <!--
+            Only a structured plan gets accordions. A plan recovered from free
+            text falls through to the plain rendering below: showing it as
+            accordions would promise descriptions it never had.
+        -->
+        <PlanSteps steps={message.planSteps} />
+    {:else if MARKDOWN_TYPES.includes(message.type)}
         <div class="markdown-body text-sm leading-relaxed">
             <!-- renderMarkdown runs its output through DOMPurify, so the markup
                  inserted here has already been sanitised. -->

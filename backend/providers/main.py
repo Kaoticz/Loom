@@ -57,9 +57,10 @@ class MainProvider(Provider):
     @provide
     def get_code_search_service(self) -> CodeSearchService:
         """
-        Provide an instance of CodeSearchService.
+        Provide an instance of CodeSearchService, bound to the current project.
         """
-        return CodeSearchService()
+        repo_path: str = os.getenv('REPO_PATH', '/tmp/repo')
+        return CodeSearchService(repo_path=repo_path)
 
     @provide
     def get_file_editor_service(self) -> FileEditorService:

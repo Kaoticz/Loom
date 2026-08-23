@@ -8,56 +8,16 @@ import pytest_asyncio
 from tortoise import Tortoise
 
 from services.code_search import CodeSearchService
+from tests.conftest import TEST_PROJECT, TEST_REPO_PATH
+from tests.test_code_search import OTHER_PROJECT
 
-pytestmark = pytest.mark.skipif(
-    not os.getenv('TEST_DATABASE_URL'),
-    reason='set TEST_DATABASE_URL to a Postgres instance with pgvector to run these',
-)
-
-
-@pytest_asyncio.fixture
-async def pg_db() -> AsyncIterator[None]:
-    """
-    Provide a Postgres database with the pgvector-aware client installed.
-
-    Importing `database.tortoise_config` is what registers the pgvector codecs,
-    so it must happen before the connection is opened.
-
-    :returns: An iterator yielding once the schema is ready and cleaned.
-    """
-    from tests.conftest import postgres_config
-    from tortoise.backends.base.executor import EXECUTOR_CACHE
-
-    # Tortoise caches a compiled insert query per model per dialect. A process
-    # that has already talked to SQLite would otherwise send SQLite SQL to
-    # Postgres and fail with a syntax error.
-    EXECUTOR_CACHE.clear()
-    await Tortoise.init(config=postgres_config(os.environ['TEST_DATABASE_URL']))
-
-    # Rebuild from scratch: generate_schemas only creates missing tables, so a
-    # database left over from an earlier schema would silently lack new columns.
-    connection = Tortoise.get_connection('default')
-    await connection.execute_script(
-        'DROP TABLE IF EXISTS code_embeddings, symbols, task_memory, files, embedding_models CASCADE;'
-    )
-    await Tortoise.generate_schemas(safe=True)
-
-    from database.models.code_embedding import CodeEmbedding
-    from database.models.embedding_model import EmbeddingModel
-    from database.models.file import File
-
-    await CodeEmbedding.all().delete()
-    await File.all().delete()
-    await EmbeddingModel.all().delete()
-    yield
-    await CodeEmbedding.all().delete()
-    await File.all().delete()
-    await EmbeddingModel.all().delete()
-    await Tortoise.close_connections()
-    EXECUTOR_CACHE.clear()
+pytestmark = pytest.mark.usefixtures('require_database')
 
 
-@pytest.mark.usefixtures('pg_db')
+# `db` now lives in conftest, so more than one module can use it.
+
+
+@pytest.mark.usefixtures('db')
 async def test_vectors_insert_and_rank_by_distance(search: CodeSearchService) -> None:
     """
     Embeddings store as vectors and semantic search orders by distance.
@@ -67,8 +27,8 @@ async def test_vectors_insert_and_rank_by_distance(search: CodeSearchService) ->
     from database.models.file import File
 
     model: EmbeddingModel = await EmbeddingModel.create(model_name='probe-3', dimensions=3)
-    users: File = await File.create(file_path='repo/users.py', raw_content='def find_user(): pass\n', hash='h1')
-    orders: File = await File.create(file_path='repo/orders.py', raw_content='def place_order(): pass\n', hash='h2')
+    users: File = await File.create(project=TEST_PROJECT, file_path='repo/users.py', raw_content='def find_user(): pass\n', hash='h1')
+    orders: File = await File.create(project=TEST_PROJECT, file_path='repo/orders.py', raw_content='def place_order(): pass\n', hash='h2')
     await CodeEmbedding.create(model=model, file=users, chunk_text='def find_user(uid): ...', embedding=[1.0, 0.0, 0.0], start_line=7)
     await CodeEmbedding.create(model=model, file=orders, chunk_text='def place_order(o): ...', embedding=[0.0, 1.0, 0.0], start_line=3)
 
@@ -82,7 +42,7 @@ async def test_vectors_insert_and_rank_by_distance(search: CodeSearchService) ->
     assert far[0].file.file_path == 'repo/orders.py'
 
 
-@pytest.mark.usefixtures('pg_db')
+@pytest.mark.usefixtures('db')
 async def test_unknown_model_returns_no_results(search: CodeSearchService) -> None:
     """
     Searching with a model that was never registered yields nothing, not an error.
@@ -90,7 +50,7 @@ async def test_unknown_model_returns_no_results(search: CodeSearchService) -> No
     assert await search.search_code_semantic([0.1, 0.2, 0.3], 'never-registered') == []
 
 
-@pytest.mark.usefixtures('pg_db')
+@pytest.mark.usefixtures('db')
 async def test_mixed_dimensions_no_longer_break_search(search: CodeSearchService) -> None:
     """
     Vectors from a differently sized model are excluded rather than fatal.
@@ -105,7 +65,7 @@ async def test_mixed_dimensions_no_longer_break_search(search: CodeSearchService
 
     small: EmbeddingModel = await EmbeddingModel.create(model_name='small-3', dimensions=3)
     large: EmbeddingModel = await EmbeddingModel.create(model_name='large-4', dimensions=4)
-    file_obj: File = await File.create(file_path='a.py', raw_content='x', hash='h')
+    file_obj: File = await File.create(project=TEST_PROJECT, file_path='a.py', raw_content='x', hash='h')
 
     await CodeEmbedding.create(model=small, file=file_obj, chunk_text='three', embedding=[1.0, 0.0, 0.0], start_line=1)
     await CodeEmbedding.create(model=large, file=file_obj, chunk_text='four', embedding=[1.0, 0.0, 0.0, 0.5], start_line=2)
@@ -119,7 +79,7 @@ async def test_mixed_dimensions_no_longer_break_search(search: CodeSearchService
     assert other[0].chunk_text == 'four'
 
 
-@pytest.mark.usefixtures('pg_db')
+@pytest.mark.usefixtures('db')
 async def test_deleting_a_model_cascades_to_its_embeddings(search: CodeSearchService) -> None:
     """
     Removing a model removes the embeddings that only it can interpret.
@@ -129,14 +89,14 @@ async def test_deleting_a_model_cascades_to_its_embeddings(search: CodeSearchSer
     from database.models.file import File
 
     model: EmbeddingModel = await EmbeddingModel.create(model_name='doomed', dimensions=3)
-    file_obj: File = await File.create(file_path='a.py', raw_content='x', hash='h')
+    file_obj: File = await File.create(project=TEST_PROJECT, file_path='a.py', raw_content='x', hash='h')
     await CodeEmbedding.create(model=model, file=file_obj, chunk_text='c', embedding=[1.0, 0.0, 0.0], start_line=1)
 
     await model.delete()
     assert await CodeEmbedding.all().count() == 0
 
 
-@pytest.mark.usefixtures('pg_db')
+@pytest.mark.usefixtures('db')
 async def test_deleting_a_file_cascades_to_its_embeddings() -> None:
     """
     Removing a file removes its chunks' embeddings.
@@ -146,7 +106,7 @@ async def test_deleting_a_file_cascades_to_its_embeddings() -> None:
     from database.models.file import File
 
     model: EmbeddingModel = await EmbeddingModel.create(model_name='keeper', dimensions=3)
-    file_obj: File = await File.create(file_path='a.py', raw_content='x', hash='h')
+    file_obj: File = await File.create(project=TEST_PROJECT, file_path='a.py', raw_content='x', hash='h')
     await CodeEmbedding.create(model=model, file=file_obj, chunk_text='c', embedding=[1.0, 0.0, 0.0], start_line=1)
 
     await file_obj.delete()
@@ -154,23 +114,23 @@ async def test_deleting_a_file_cascades_to_its_embeddings() -> None:
     assert await EmbeddingModel.all().count() == 1
 
 
-@pytest.mark.usefixtures('pg_db')
+@pytest.mark.usefixtures('db')
 async def test_ilike_is_case_insensitive_on_postgres(search: CodeSearchService) -> None:
     """
     Lexical search is case-insensitive on Postgres, where LIKE is not.
 
-    SQLite's LIKE is case-insensitive for ASCII by default, so this can only be
+    Asserted against PostgreSQL, whose LIKE is case-sensitive, so this can only be
     proven against a real Postgres instance.
     """
     from database.models.file import File
 
-    await File.create(file_path='repo/users.py', raw_content='def find_user(): pass\n', hash='h1')
+    await File.create(project=TEST_PROJECT, file_path='repo/users.py', raw_content='def find_user(): pass\n', hash='h1')
     hits = await search.search_code_lexical('FIND_USER')
     assert len(hits) > 0
     assert hits[0].file_path == 'repo/users.py'
 
 
-@pytest.mark.usefixtures('pg_db')
+@pytest.mark.usefixtures('db')
 async def test_changed_vector_width_discards_stale_embeddings(repo: str) -> None:
     """
     A model that starts producing a different width has its entry corrected.
@@ -185,7 +145,7 @@ async def test_changed_vector_width_discards_stale_embeddings(repo: str) -> None
     from tests.conftest import stub_embedding_service
 
     model: EmbeddingModel = await EmbeddingModel.create(model_name='nomic-embed-text', dimensions=4)
-    file_obj: File = await File.create(file_path='a.py', raw_content='x', hash='h')
+    file_obj: File = await File.create(project=TEST_PROJECT, file_path='a.py', raw_content='x', hash='h')
     await CodeEmbedding.create(
         model=model, file=file_obj, chunk_text='stale', embedding=[1.0, 0.0, 0.0, 0.5], start_line=1
     )
@@ -200,7 +160,7 @@ async def test_changed_vector_width_discards_stale_embeddings(repo: str) -> None
     assert await EmbeddingModel.all().count() == 1
 
 
-@pytest.mark.usefixtures('pg_db')
+@pytest.mark.usefixtures('db')
 async def test_indexing_a_repository_end_to_end(
     tmp_path_factory: pytest.TempPathFactory, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -264,7 +224,7 @@ async def test_indexing_a_repository_end_to_end(
     assert await CodeEmbedding.all().count() == 6
 
 
-@pytest.mark.usefixtures('pg_db')
+@pytest.mark.usefixtures('db')
 async def test_changed_file_replaces_its_old_symbols(
     tmp_path_factory: pytest.TempPathFactory, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -311,3 +271,39 @@ async def test_changed_file_replaces_its_old_symbols(
     path.write_text('second\n')
     await indexing._process_file(str(path), str(repo), Semaphore(1), model, ProgressReporter(1, None))
     assert [s.symbol_name for s in await Symbol.all()] == ['second']
+
+
+@pytest.mark.usefixtures('db')
+async def test_semantic_search_never_returns_another_project(
+    search: CodeSearchService,
+) -> None:
+    """
+    The semantic path is scoped like every other read.
+
+    Tested separately from the lexical paths on purpose: scoping one and not
+    another produces no error, only another project's code appearing in the
+    results, which is worse than the collision this all exists to prevent.
+    """
+    from database.models.code_embedding import CodeEmbedding
+    from database.models.embedding_model import EmbeddingModel
+    from database.models.file import File
+
+    model: EmbeddingModel = await EmbeddingModel.create(model_name='probe-3', dimensions=3)
+    mine: File = await File.create(
+        project=TEST_PROJECT, file_path='src/main.py',
+        raw_content='def shared_name(): pass\n', hash='h1',
+    )
+    theirs: File = await File.create(
+        project=OTHER_PROJECT, file_path='src/main.py',
+        raw_content='def shared_name(): pass\n', hash='h2',
+    )
+    await CodeEmbedding.create(
+        model=model, file=mine, chunk_text='MINE', embedding=[1.0, 0.0, 0.0], start_line=1
+    )
+    await CodeEmbedding.create(
+        model=model, file=theirs, chunk_text='THEIRS', embedding=[1.0, 0.0, 0.0], start_line=1
+    )
+
+    found: list[CodeEmbedding] = await search.search_code_semantic([1.0, 0.0, 0.0], 'probe-3', limit=10)
+
+    assert [row.chunk_text for row in found] == ['MINE']

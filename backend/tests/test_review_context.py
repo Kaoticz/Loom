@@ -97,6 +97,66 @@ def test_small_files_are_preferred_over_one_huge_file() -> None:
     assert 'huge.py' in prompt
 
 
+def test_ordering_by_size_is_what_admits_the_small_diffs() -> None:
+    """
+    Smallest first, proven by a case where only the ordering can decide it.
+
+    The test above claims this property and cannot actually fail against it: it
+    gives the huge file a diff far larger than the whole budget, so the size
+    check excludes it whether or not anything was sorted, and the small files
+    appear either way.
+
+    Here every diff fits on its own and they cannot all fit together. Taken in
+    the given order the medium file is admitted first and consumes enough of the
+    budget that the last small file is turned away; taken smallest first, both
+    small files are admitted and the medium one is not. Only the ordering
+    separates those outcomes.
+    """
+    changes: list[FileChange] = [
+        FileChange(path='medium.py', insertions=500, deletions=0),
+        FileChange(path='tiny_a.py', insertions=1, deletions=0),
+        FileChange(path='tiny_b.py', insertions=1, deletions=0),
+    ]
+    diffs: dict[str, str] = {
+        'medium.py': 'm' * 2_500,
+        'tiny_a.py': 'a' * 300,
+        'tiny_b.py': 'b' * 300,
+    }
+
+    prompt: str = build_review_prompt('task', changes, diffs, budget_characters=3_000)
+
+    assert 'a' * 300 in prompt, 'the smallest diffs should be admitted first'
+    assert 'b' * 300 in prompt, 'and the second one should still fit'
+    assert 'm' * 2_500 not in prompt, 'the medium diff should be the one left out'
+
+
+async def test_fetching_is_ordered_so_one_big_file_stops_nothing() -> None:
+    """
+    A large change listed first must not shut out the small ones behind it.
+
+    The loop stops at the first diff that will not fit and treats everything
+    after it as omitted, so the order files arrive in decides what is read at
+    all. The test below passes its files already in ascending order, which makes
+    the sorting a no-op there and leaves the property unasserted — removing the
+    sort changed nothing it could see.
+
+    Here the largest is listed first, as `git` may well report it.
+    """
+    changes: list[FileChange] = [
+        FileChange(path='huge.py', insertions=10_000, deletions=0),
+        FileChange(path='tiny.py', insertions=1, deletions=0),
+    ]
+    bodies: dict[str, str] = {'huge.py': 'y' * 9_000, 'tiny.py': '+one\n'}
+
+    async def fetch(path: str) -> str:
+        return bodies[path]
+
+    diffs, omitted = await collect_review_diffs(changes, fetch, budget_characters=3_000)
+
+    assert 'tiny.py' in diffs, 'the small diff should be read despite the order given'
+    assert 'huge.py' in omitted
+
+
 async def test_only_affordable_diffs_are_fetched() -> None:
     """
     Diffs that could never fit the budget are not read at all.

@@ -162,3 +162,55 @@ describe('ChatMessage copy control', () => {
         expect(screen.getByRole('status')).toHaveTextContent('Copied');
     });
 });
+
+describe('plan rendering', () => {
+    /**
+     * Build a plan message as the store would have produced it.
+     *
+     * @param format Whether the plan arrived structured or as free text.
+     * @param steps The steps it carries.
+     */
+    function planMessage(
+        format: 'structured' | 'text',
+        steps: { title: string; description?: string }[]
+    ) {
+        return {
+            id: 1,
+            type: 'plan' as const,
+            content: steps.map((step, index) => `${index + 1}. ${step.title}`).join('\n'),
+            timestamp: new Date('2026-01-01T12:00:00Z'),
+            planFormat: format,
+            planSteps: steps.map((step) => ({
+                title: step.title,
+                description: step.description ?? ''
+            }))
+        };
+    }
+
+    it('gives a structured plan collapsible steps', async () => {
+        render(ChatMessage, {
+            message: planMessage('structured', [
+                { title: 'Add a timeout', description: 'In run_test_command.' }
+            ])
+        });
+
+        expect(screen.getByRole('button', { name: /add a timeout/i })).toBeInTheDocument();
+    });
+
+    it('renders a text plan as text, with no controls', async () => {
+        // The steps are present either way, so a test that only checked for the
+        // titles would pass against accordions here. What matters is that a plan
+        // recovered from free text is not dressed up as one that was not: the
+        // descriptions it would promise do not exist.
+        render(ChatMessage, {
+            message: planMessage('text', [{ title: 'Read the file' }, { title: 'Edit it' }])
+        });
+
+        expect(screen.queryByTestId('plan-steps')).not.toBeInTheDocument();
+        expect(screen.queryByRole('button', { name: /read the file/i })).not.toBeInTheDocument();
+        // The step text is still shown; markdown turns the numbering into a
+        // list marker, so the digit is not itself text to search for.
+        expect(screen.getByText('Read the file')).toBeInTheDocument();
+        expect(screen.getByText('Edit it')).toBeInTheDocument();
+    });
+});

@@ -5,6 +5,7 @@ from enum import Enum
 from pathlib import Path
 
 from database.enums import TaskLogEntryType, TaskStatus
+from services.plan_parser import PlanFormat
 from schemas.agent_commands import CommandAction
 from schemas.agent_messages import MessageType
 from services.event_bus import SandboxStage, SessionStatus, ToolStatus
@@ -52,6 +53,7 @@ def protocol_vocabulary() -> dict[str, list[str]]:
         'task_status': _values(TaskStatus),
         'task_log_entry_type': _values(TaskLogEntryType),
         'command_action': _values(CommandAction),
+        'plan_format': _values(PlanFormat),
     }
 
 

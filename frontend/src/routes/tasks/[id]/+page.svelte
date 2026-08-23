@@ -1,4 +1,5 @@
 <script lang="ts">
+    import { planEntrySteps } from '$lib/taskPresentation';
     import { onMount } from 'svelte';
 
     const apiBase = import.meta.env.VITE_API_BASE_URL || 'http://localhost:8000';
@@ -36,18 +37,13 @@
     }
 
     /** Read the plan steps out of a log entry's content. */
-    function steps(content: Record<string, unknown>): string[] {
-        const value = content.steps;
-        if (!Array.isArray(value)) return [];
-        return value.filter((step): step is string => typeof step === 'string');
-    }
 
     /** One-line description of a log entry, derived from its type. */
     function describe(entry: TaskLogEntry): string {
         const c = entry.content;
         switch (entry.entry_type) {
             case 'plan':
-                return steps(c)
+                return planEntrySteps(c)
                     .map((step, index) => `${index + 1}. ${step}`)
                     .join('\n');
             case 'tool_call':

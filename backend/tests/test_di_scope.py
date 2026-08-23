@@ -12,10 +12,7 @@ import pytest_asyncio
 from fastapi import WebSocket
 from fastapi.testclient import TestClient
 
-pytestmark = pytest.mark.skipif(
-    not os.getenv('TEST_DATABASE_URL'),
-    reason='building the app opens a database connection; set TEST_DATABASE_URL to run',
-)
+pytestmark = pytest.mark.usefixtures('require_database')
 
 
 APP_DATABASE: str = 'loom_app_test'
@@ -259,3 +256,96 @@ def test_health_fails_when_the_database_is_unreachable(
 
         assert response.status_code == 503
         assert 'unreachable' in response.json()['detail']
+
+
+@pytest.mark.usefixtures('app_database')
+def test_index_status_and_deletion_go_through_the_app() -> None:
+    """
+    The endpoints answer about the project the caller names, and delete it.
+
+    Exercised through the real app rather than by calling the functions, because
+    the wiring is the part that has gone wrong before: the endpoints read the
+    path from the request precisely so that a backend cannot answer about
+    whichever repository it happened to be started with.
+    """
+    import main
+    from database.models.file import File
+    from services.projects import normalise_project_path
+
+    mine: str = '/repos/mine'
+    theirs: str = '/repos/theirs'
+
+    with TestClient(main.app) as client:
+        # Always present inside the context manager; asserted rather than
+        # suppressed so the reason is on the page.
+        assert client.portal is not None
+
+        async def seed() -> None:
+            for project in (mine, theirs):
+                await File.create(
+                    project=normalise_project_path(project),
+                    file_path='src/main.py',
+                    raw_content='x\n',
+                    hash='h',
+                )
+
+        client.portal.call(seed)
+
+        status = client.get('/api/v1/index/status', params={'path': mine})
+        assert status.status_code == 200
+        assert status.json()['indexed_files'] == 1
+        assert status.json()['can_delete'] is True
+        assert status.json()['blocked_reason'] == ''
+
+        removed = client.request('DELETE', '/api/v1/index', params={'path': mine})
+        assert removed.status_code == 200
+        assert removed.json()['files_deleted'] == 1
+        # The reader is told that nothing re-indexes until a session starts.
+        assert 'session next starts' in removed.json()['message']
+
+        # Scoped: the other project is untouched and still deletable.
+        other = client.get('/api/v1/index/status', params={'path': theirs})
+        assert other.json()['indexed_files'] == 1
+
+        # And the emptied one now explains why it cannot be used.
+        after = client.get('/api/v1/index/status', params={'path': mine})
+        assert after.json()['can_delete'] is False
+        assert 'Nothing is indexed' in after.json()['blocked_reason']
+
+        # Repeating the delete is safe rather than confusing.
+        again = client.request('DELETE', '/api/v1/index', params={'path': mine})
+        assert again.status_code == 200
+        assert again.json()['files_deleted'] == 0
+        assert 'nothing was removed' in again.json()['message']
+
+
+@pytest.mark.usefixtures('app_database')
+def test_deletion_is_refused_while_a_session_is_running() -> None:
+    """
+    Refused rather than allowed, at the user's direction.
+
+    Deleting the index underneath a working agent raises nothing it can report:
+    every search simply returns empty, which reads as an unindexed repository.
+    The status endpoint says the same thing, so a disabled control can explain
+    itself with the same words rather than composing its own.
+    """
+    import main
+    from services.session_registry import SessionRegistry
+
+    with TestClient(main.app) as client:
+        assert client.portal is not None
+        registry: SessionRegistry = client.portal.call(
+            main.app.state.dishka_container.get, SessionRegistry
+        )
+        client.portal.call(registry.acquire, 'session-1')
+
+        try:
+            status = client.get('/api/v1/index/status', params={'path': '/repos/mine'})
+            assert status.json()['can_delete'] is False
+            assert 'session is running' in status.json()['blocked_reason']
+
+            refused = client.request('DELETE', '/api/v1/index', params={'path': '/repos/mine'})
+            assert refused.status_code == 409
+            assert 'session is running' in refused.json()['detail']
+        finally:
+            client.portal.call(registry.release, 'session-1')

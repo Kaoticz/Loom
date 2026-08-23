@@ -13,7 +13,7 @@ from database.models.file import File
 from database.models.symbol import Symbol
 from services.embedding import ChunkTooLargeForModel, EmbeddingError, EmbeddingInputTooLong
 from services.indexing import IndexingService, clamp_chunk_lines
-from tests.conftest import ast_grep_available, stub_embedding_service
+from tests.conftest import TEST_PROJECT, ast_grep_available, stub_embedding_service
 
 SAMPLE_SOURCE: str = '''import os
 
@@ -111,7 +111,7 @@ def test_line_range_extraction(match: dict[str, Any], expected: tuple[int, int] 
     assert IndexingService._extract_line_range(match) == expected
 
 
-@pytest.mark.usefixtures('sqlite_db')
+@pytest.mark.usefixtures('db')
 async def test_symbols_are_indexed_from_the_file(
     indexing: IndexingService, repo: str, ast_grep_bin: str, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -124,7 +124,7 @@ async def test_symbols_are_indexed_from_the_file(
 
     path: Path = Path(repo, 'sample.py')
     path.write_text(SAMPLE_SOURCE)
-    file_obj: File = await File.create(file_path='sample.py', raw_content=SAMPLE_SOURCE, hash='h')
+    file_obj: File = await File.create(project=TEST_PROJECT, file_path='sample.py', raw_content=SAMPLE_SOURCE, hash='h')
 
     await indexing._index_symbols(file_obj, str(path))
 
@@ -144,7 +144,7 @@ async def test_symbols_are_indexed_from_the_file(
         assert row.symbol_name in lines[row.line_start - 1], row.symbol_name
 
 
-@pytest.mark.usefixtures('sqlite_db')
+@pytest.mark.usefixtures('db')
 async def test_classes_with_and_without_bases_are_indexed_once(
     indexing: IndexingService, repo: str, ast_grep_bin: str, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -158,7 +158,7 @@ async def test_classes_with_and_without_bases_are_indexed_once(
     source: str = 'class Plain:\n    pass\n\n\nclass Derived(Plain):\n    pass\n'
     path: Path = Path(repo, 'classes.py')
     path.write_text(source)
-    file_obj: File = await File.create(file_path='classes.py', raw_content=source, hash='h')
+    file_obj: File = await File.create(project=TEST_PROJECT, file_path='classes.py', raw_content=source, hash='h')
 
     await indexing._index_symbols(file_obj, str(path))
 
@@ -189,7 +189,7 @@ def test_explicit_paths_bypass_ignore_rules(tmp_path: Path, ast_grep_bin: str) -
     assert 'Ignored' in process.stdout
 
 
-@pytest.mark.usefixtures('sqlite_db')
+@pytest.mark.usefixtures('db')
 async def test_registers_the_embedding_model_on_first_use(repo: str) -> None:
     """
     The configured model is recorded along with the width of its vectors.
@@ -206,7 +206,7 @@ async def test_registers_the_embedding_model_on_first_use(repo: str) -> None:
     assert await EmbeddingModel.all().count() == 1
 
 
-@pytest.mark.usefixtures('sqlite_db')
+@pytest.mark.usefixtures('db')
 async def test_reuses_an_already_registered_model(repo: str) -> None:
     """
     Re-indexing with the same model reuses its registry entry.
@@ -222,7 +222,7 @@ async def test_reuses_an_already_registered_model(repo: str) -> None:
     assert await EmbeddingModel.all().count() == 1
 
 
-@pytest.mark.usefixtures('sqlite_db')
+@pytest.mark.usefixtures('db')
 async def test_wrongly_sized_vector_is_refused(repo: str) -> None:
     """
     A vector that does not match the registered width is never stored.
@@ -236,13 +236,13 @@ async def test_wrongly_sized_vector_is_refused(repo: str) -> None:
     service: IndexingService = IndexingService(
         repo_path=repo, embedding=stub_embedding_service([0.1, 0.2, 0.3])
     )
-    file_obj: File = await File.create(file_path='a.py', raw_content='print(1)\n', hash='h')
+    file_obj: File = await File.create(project=TEST_PROJECT, file_path='a.py', raw_content='print(1)\n', hash='h')
 
     with pytest.raises(EmbeddingError, match='3-dimension vector'):
         await service._index_embeddings(file_obj, model)
 
 
-@pytest.mark.usefixtures('sqlite_db')
+@pytest.mark.usefixtures('db')
 async def test_annotated_definitions_are_indexed(
     indexing: IndexingService, repo: str, ast_grep_bin: str, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -276,7 +276,7 @@ async def test_annotated_definitions_are_indexed(
     )
     path: Path = Path(repo, 'annotated.py')
     path.write_text(source)
-    file_obj: File = await File.create(file_path='annotated.py', raw_content=source, hash='h')
+    file_obj: File = await File.create(project=TEST_PROJECT, file_path='annotated.py', raw_content=source, hash='h')
 
     await indexing._index_symbols(file_obj, str(path))
 
@@ -290,7 +290,7 @@ async def test_annotated_definitions_are_indexed(
     }
 
 
-@pytest.mark.usefixtures('sqlite_db')
+@pytest.mark.usefixtures('db')
 async def test_symbol_range_covers_the_whole_definition(
     indexing: IndexingService, repo: str, ast_grep_bin: str, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -304,7 +304,7 @@ async def test_symbol_range_covers_the_whole_definition(
     source: str = 'def widget(a: int) -> int:\n    x = 1\n    y = 2\n    return x + y + a\n'
     path: Path = Path(repo, 'widget.py')
     path.write_text(source)
-    file_obj: File = await File.create(file_path='widget.py', raw_content=source, hash='h')
+    file_obj: File = await File.create(project=TEST_PROJECT, file_path='widget.py', raw_content=source, hash='h')
 
     await indexing._index_symbols(file_obj, str(path))
 
@@ -312,7 +312,7 @@ async def test_symbol_range_covers_the_whole_definition(
     assert (symbol.line_start, symbol.line_end) == (1, 4)
 
 
-@pytest.mark.usefixtures('sqlite_db')
+@pytest.mark.usefixtures('db')
 async def test_derived_classes_are_recorded_once(
     indexing: IndexingService, repo: str, ast_grep_bin: str, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -326,7 +326,7 @@ async def test_derived_classes_are_recorded_once(
     source: str = 'class Plain:\n    pass\n\n\nclass Derived(Plain):\n    pass\n'
     path: Path = Path(repo, 'classes2.py')
     path.write_text(source)
-    file_obj: File = await File.create(file_path='classes2.py', raw_content=source, hash='h')
+    file_obj: File = await File.create(project=TEST_PROJECT, file_path='classes2.py', raw_content=source, hash='h')
 
     await indexing._index_symbols(file_obj, str(path))
 
@@ -334,7 +334,7 @@ async def test_derived_classes_are_recorded_once(
     assert names == ['Derived', 'Plain']
 
 
-@pytest.mark.usefixtures('sqlite_db')
+@pytest.mark.usefixtures('db')
 async def test_process_file_handles_each_kind_of_file(
     indexing: IndexingService, repo: str, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -381,7 +381,7 @@ async def test_process_file_handles_each_kind_of_file(
     assert (await File.all())[0].file_path == 'fresh.py'
 
 
-@pytest.mark.usefixtures('sqlite_db')
+@pytest.mark.usefixtures('db')
 async def test_unchanged_file_is_not_reindexed(
     indexing: IndexingService, repo: str, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -454,7 +454,7 @@ def test_size_limit_is_configurable(
     assert max_file_size_bytes() == expected
 
 
-@pytest.mark.usefixtures('sqlite_db')
+@pytest.mark.usefixtures('db')
 async def test_oversized_files_are_skipped(
     indexing: IndexingService, repo: str, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -486,7 +486,7 @@ async def test_oversized_files_are_skipped(
     assert [f.file_path for f in await File.all()] == ['small.py']
 
 
-@pytest.mark.usefixtures('sqlite_db')
+@pytest.mark.usefixtures('db')
 async def test_unlimited_size_indexes_everything(
     indexing: IndexingService, repo: str, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -563,31 +563,7 @@ class LengthLimitedEmbedding:
         return self.dimensions
 
 
-def without_vector_storage(monkeypatch: pytest.MonkeyPatch) -> None:
-    """
-    Let the embedding loop run without a vector store behind it.
-
-    `CodeEmbedding` is absent from the SQLite fixture because its column needs
-    pgvector. These tests are about which text reaches the model, so storage is
-    stubbed out rather than the tests being confined to a Postgres run.
-
-    :param monkeypatch: Fixture used to replace the create call.
-    """
-
-    async def stored(**kwargs: Any) -> None:
-        return None
-
-    class Discardable:
-        """A query that can be awaited away without a vector column behind it."""
-
-        async def delete(self) -> None:
-            """Discard the matching rows."""
-
-    monkeypatch.setattr(CodeEmbedding, 'create', stored)
-    monkeypatch.setattr(CodeEmbedding, 'filter', lambda **kwargs: Discardable())
-
-
-@pytest.mark.usefixtures('sqlite_db')
+@pytest.mark.usefixtures('db')
 async def test_an_over_long_chunk_is_split_and_retried(repo: str, monkeypatch: pytest.MonkeyPatch) -> None:
     """
     A refused chunk is divided until the model accepts it.
@@ -596,14 +572,13 @@ async def test_an_over_long_chunk_is_split_and_retried(repo: str, monkeypatch: p
     chunk costs depends on the model's tokenizer. Being refused is the only
     trustworthy signal, so it is treated as one.
     """
-    without_vector_storage(monkeypatch)
     embedding: LengthLimitedEmbedding = LengthLimitedEmbedding(budget=40)
     model: EmbeddingModel = await EmbeddingModel.create(
         model_name='nomic-embed-text', dimensions=3
     )
     service: IndexingService = IndexingService(repo_path=repo, embedding=embedding)  # type: ignore[arg-type]
     content: str = '\n'.join(f'line number {index} of the file' for index in range(12))
-    file_obj: File = await File.create(file_path='a.py', raw_content=content, hash='h')
+    file_obj: File = await File.create(project=TEST_PROJECT, file_path='a.py', raw_content=content, hash='h')
 
     await service._index_embeddings(file_obj, model)
 
@@ -612,12 +587,11 @@ async def test_an_over_long_chunk_is_split_and_retried(repo: str, monkeypatch: p
     assert all(len(text) <= 40 for text in embedding.accepted)
 
 
-@pytest.mark.usefixtures('sqlite_db')
+@pytest.mark.usefixtures('db')
 async def test_splitting_covers_the_whole_file(repo: str, monkeypatch: pytest.MonkeyPatch) -> None:
     """
     Dividing a chunk must not lose the lines it contained.
     """
-    without_vector_storage(monkeypatch)
     embedding: LengthLimitedEmbedding = LengthLimitedEmbedding(budget=40)
     model: EmbeddingModel = await EmbeddingModel.create(
         model_name='nomic-embed-text', dimensions=3
@@ -625,6 +599,7 @@ async def test_splitting_covers_the_whole_file(repo: str, monkeypatch: pytest.Mo
     service: IndexingService = IndexingService(repo_path=repo, embedding=embedding)  # type: ignore[arg-type]
     lines: list[str] = [f'line number {index} of the file' for index in range(12)]
     file_obj: File = await File.create(
+        project=TEST_PROJECT,
         file_path='a.py', raw_content='\n'.join(lines), hash='h'
     )
 
@@ -635,7 +610,7 @@ async def test_splitting_covers_the_whole_file(repo: str, monkeypatch: pytest.Mo
         assert line in embedded, f'{line!r} was lost when the chunk was split'
 
 
-@pytest.mark.usefixtures('sqlite_db')
+@pytest.mark.usefixtures('db')
 async def test_a_single_unacceptable_line_is_skipped_not_fatal(repo: str, monkeypatch: pytest.MonkeyPatch) -> None:
     """
     One pathological line must not cost the repository its index.
@@ -643,14 +618,13 @@ async def test_a_single_unacceptable_line_is_skipped_not_fatal(repo: str, monkey
     A minified file can hold a single line longer than any context. Losing that
     line's semantic search is a far smaller loss than losing every file's.
     """
-    without_vector_storage(monkeypatch)
     embedding: LengthLimitedEmbedding = LengthLimitedEmbedding(budget=30)
     model: EmbeddingModel = await EmbeddingModel.create(
         model_name='nomic-embed-text', dimensions=3
     )
     service: IndexingService = IndexingService(repo_path=repo, embedding=embedding)  # type: ignore[arg-type]
     content: str = 'short line\n' + 'x' * 500 + '\nanother short line'
-    file_obj: File = await File.create(file_path='a.py', raw_content=content, hash='h')
+    file_obj: File = await File.create(project=TEST_PROJECT, file_path='a.py', raw_content=content, hash='h')
 
     await service._index_embeddings(file_obj, model)
 
@@ -660,7 +634,7 @@ async def test_a_single_unacceptable_line_is_skipped_not_fatal(repo: str, monkey
     assert not any(len(text) > 30 for text in embedding.accepted)
 
 
-@pytest.mark.usefixtures('sqlite_db')
+@pytest.mark.usefixtures('db')
 async def test_an_unreachable_service_still_fails_the_run(repo: str) -> None:
     """
     Skipping is for text a model will not take, not for a broken backend.
@@ -679,7 +653,7 @@ async def test_an_unreachable_service_still_fails_the_run(repo: str) -> None:
         model_name='nomic-embed-text', dimensions=3
     )
     service: IndexingService = IndexingService(repo_path=repo, embedding=Unreachable())  # type: ignore[arg-type]
-    file_obj: File = await File.create(file_path='a.py', raw_content='print(1)\n', hash='h')
+    file_obj: File = await File.create(project=TEST_PROJECT, file_path='a.py', raw_content='print(1)\n', hash='h')
 
     with pytest.raises(EmbeddingError):
         await service._index_embeddings(file_obj, model)
@@ -711,7 +685,7 @@ def test_a_hand_set_chunk_size_is_held_within_bounds(
     assert clamp_chunk_lines(requested) == expected
 
 
-@pytest.mark.usefixtures('sqlite_db')
+@pytest.mark.usefixtures('db')
 async def test_a_hand_set_size_that_the_model_refuses_fails_the_run(
     repo: str, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -722,7 +696,6 @@ async def test_a_hand_set_size_that_the_model_refuses_fails_the_run(
     nothing, and skipping the chunk would leave a silently incomplete index that
     answers "no matches" for code that plainly exists.
     """
-    without_vector_storage(monkeypatch)
     embedding: LengthLimitedEmbedding = LengthLimitedEmbedding(budget=40)
     model: EmbeddingModel = await EmbeddingModel.create(
         model_name='nomic-embed-text', dimensions=3
@@ -731,7 +704,7 @@ async def test_a_hand_set_size_that_the_model_refuses_fails_the_run(
         repo_path=repo, embedding=embedding, chunk_lines=50  # type: ignore[arg-type]
     )
     content: str = '\n'.join(f'line number {index} of the file' for index in range(12))
-    file_obj: File = await File.create(file_path='big.py', raw_content=content, hash='h')
+    file_obj: File = await File.create(project=TEST_PROJECT, file_path='big.py', raw_content=content, hash='h')
 
     with pytest.raises(ChunkTooLargeForModel) as raised:
         await service._index_embeddings(file_obj, model)
@@ -743,26 +716,25 @@ async def test_a_hand_set_size_that_the_model_refuses_fails_the_run(
     assert 'Settings' in str(raised.value)
 
 
-@pytest.mark.usefixtures('sqlite_db')
+@pytest.mark.usefixtures('db')
 async def test_automatic_sizing_still_recovers(repo: str, monkeypatch: pytest.MonkeyPatch) -> None:
     """
     The failure is for a chosen size only; automatic sizing carries on splitting.
     """
-    without_vector_storage(monkeypatch)
     embedding: LengthLimitedEmbedding = LengthLimitedEmbedding(budget=40)
     model: EmbeddingModel = await EmbeddingModel.create(
         model_name='nomic-embed-text', dimensions=3
     )
     service: IndexingService = IndexingService(repo_path=repo, embedding=embedding)  # type: ignore[arg-type]
     content: str = '\n'.join(f'line number {index} of the file' for index in range(12))
-    file_obj: File = await File.create(file_path='a.py', raw_content=content, hash='h')
+    file_obj: File = await File.create(project=TEST_PROJECT, file_path='a.py', raw_content=content, hash='h')
 
     await service._index_embeddings(file_obj, model)
 
     assert embedding.accepted
 
 
-@pytest.mark.usefixtures('sqlite_db')
+@pytest.mark.usefixtures('db')
 async def test_changing_the_chunk_size_discards_the_old_embeddings(
     repo: str, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -773,13 +745,12 @@ async def test_changing_the_chunk_size_discards_the_old_embeddings(
     vectors and the hashes, every already-indexed file would keep its old
     chunking and the new value would only affect files that happened to change.
     """
-    without_vector_storage(monkeypatch)
     service: IndexingService = IndexingService(
         repo_path=repo, embedding=stub_embedding_service([0.1, 0.2, 0.3]), chunk_lines=100
     )
     first: EmbeddingModel = await service.resolve_embedding_model()
     assert first.chunk_lines == 100
-    await File.create(file_path='a.py', raw_content='print(1)\n', hash='unchanged')
+    await File.create(project=TEST_PROJECT, file_path='a.py', raw_content='print(1)\n', hash='unchanged')
 
     service.chunk_lines = 60
     second: EmbeddingModel = await service.resolve_embedding_model()
@@ -790,7 +761,7 @@ async def test_changing_the_chunk_size_discards_the_old_embeddings(
     assert stale is not None and stale.hash == '', 'the file should be indexed again'
 
 
-@pytest.mark.usefixtures('sqlite_db')
+@pytest.mark.usefixtures('db')
 async def test_an_unchanged_chunk_size_keeps_the_index(repo: str) -> None:
     """
     Re-indexing with the same settings must not throw the work away.
@@ -799,7 +770,7 @@ async def test_an_unchanged_chunk_size_keeps_the_index(repo: str) -> None:
         repo_path=repo, embedding=stub_embedding_service([0.1, 0.2, 0.3]), chunk_lines=100
     )
     await service.resolve_embedding_model()
-    await File.create(file_path='a.py', raw_content='print(1)\n', hash='unchanged')
+    await File.create(project=TEST_PROJECT, file_path='a.py', raw_content='print(1)\n', hash='unchanged')
 
     await service.resolve_embedding_model()
 
@@ -840,3 +811,94 @@ async def test_indexing_skips_what_the_repository_ignores(
 
     assert 'main.py' in seen
     assert 'build/bundle.py' not in seen
+
+
+@pytest.mark.usefixtures('db')
+async def test_two_projects_sharing_a_relative_path_both_survive(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """
+    Indexing a second project must not overwrite the first.
+
+    `file_path` is repository-relative, so `src/main.py` in one project and
+    `src/main.py` in another are the same string. With a globally unique path
+    the second index overwrites the first and cascades away its symbols and
+    embeddings — the first project's index quietly becomes the second's.
+
+    Written before the fix, to demonstrate the collision rather than assume it.
+    """
+
+    first: Path = tmp_path / 'alpha'
+    second: Path = tmp_path / 'beta'
+
+    for root, marker in ((first, 'ALPHA_ONLY'), (second, 'BETA_ONLY')):
+        (root / 'src').mkdir(parents=True)
+        (root / 'src' / 'main.py').write_text(f'value = "{marker}"\n')
+
+    for root in (first, second):
+        service: IndexingService = IndexingService(
+            repo_path=str(root), embedding=stub_embedding_service([0.1, 0.2, 0.3])
+        )
+        await service.index_repository()
+
+    rows: list[File] = await File.filter(file_path='src/main.py')
+
+    assert len(rows) == 2, 'each project should keep its own row for the shared path'
+    assert {row.raw_content.strip() for row in rows} == {
+        'value = "ALPHA_ONLY"',
+        'value = "BETA_ONLY"',
+    }
+
+
+@pytest.mark.usefixtures('db')
+async def test_reindexing_a_project_updates_rather_than_duplicates(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """
+    Indexing the same project twice leaves one row, carrying the newer content.
+    """
+
+    root: Path = tmp_path / 'alpha'
+    (root / 'src').mkdir(parents=True)
+    source: Path = root / 'src' / 'main.py'
+    source.write_text('value = "FIRST"\n')
+
+    async def index() -> None:
+        service: IndexingService = IndexingService(
+            repo_path=str(root), embedding=stub_embedding_service([0.1, 0.2, 0.3])
+        )
+        await service.index_repository()
+
+    await index()
+    source.write_text('value = "SECOND"\n')
+    await index()
+
+    rows: list[File] = await File.filter(file_path='src/main.py')
+
+    assert len(rows) == 1
+    assert 'SECOND' in rows[0].raw_content
+
+
+@pytest.mark.usefixtures('db')
+async def test_the_same_repository_spelled_differently_is_one_project(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """
+    A trailing separator must not fork one repository into two projects.
+
+    Left unnormalised, the second index would insert rather than update, and the
+    project would hold two copies of every file.
+    """
+
+    root: Path = tmp_path / 'alpha'
+    (root / 'src').mkdir(parents=True)
+    (root / 'src' / 'main.py').write_text('value = "ONLY"\n')
+
+    for spelling in (str(root), str(root) + '/', str(root) + '/./'):
+        service: IndexingService = IndexingService(
+            repo_path=spelling, embedding=stub_embedding_service([0.1, 0.2, 0.3])
+        )
+        await service.index_repository()
+
+    assert await File.filter(file_path='src/main.py').count() == 1
+    assert len({row.project for row in await File.all()}) == 1

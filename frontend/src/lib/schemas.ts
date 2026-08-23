@@ -21,11 +21,30 @@ const thoughtMessageSchema = z.object({
     stream_id: z.string().nullish()
 });
 
+/** One step of a plan: a title always, a description when the model gave one. */
+export const planStepSchema = z.object({
+    title: z.string(),
+    description: z.string().default('')
+});
+
+/**
+ * How a plan was produced, and so how it should be shown.
+ *
+ * Carried rather than inferred from whether descriptions are present: a
+ * structured plan whose descriptions came back empty is still structured, and
+ * inferring would show it as plain text.
+ */
+export const planFormatSchema = z.enum(['structured', 'text']);
+
 const planMessageSchema = z.object({
     type: z.literal('plan'),
-    steps: z.array(z.string()).default([]),
+    steps: z.array(planStepSchema).default([]),
+    format: planFormatSchema.default('text'),
     requires_approval: z.boolean().default(true)
 });
+
+export type PlanStep = z.infer<typeof planStepSchema>;
+export type PlanFormat = z.infer<typeof planFormatSchema>;
 
 const actionMessageSchema = z.object({
     type: z.literal('action'),
@@ -261,6 +280,32 @@ export const repoValidationSchema = z.object({
 
 /** The subdirectory names of a path. */
 export const directoryListingSchema = z.array(z.string());
+
+/**
+ * What is indexed for a project, and whether it can be removed right now.
+ *
+ * `blockedReason` comes from the server rather than being composed here, so the
+ * explanation a disabled control shows cannot drift from the condition that
+ * caused it.
+ */
+export const indexStatusSchema = z.object({
+    project: z.string(),
+    indexed_files: z.number().int().nonnegative(),
+    can_delete: z.boolean(),
+    blocked_reason: z.string().default('')
+});
+
+/** The outcome of removing a project's index. */
+export const indexDeletionSchema = z.object({
+    project: z.string(),
+    embeddings_deleted: z.number().int().nonnegative(),
+    files_deleted: z.number().int().nonnegative(),
+    symbols_deleted: z.number().int().nonnegative(),
+    message: z.string()
+});
+
+export type IndexStatus = z.infer<typeof indexStatusSchema>;
+export type IndexDeletion = z.infer<typeof indexDeletionSchema>;
 
 export type Task = z.infer<typeof taskSchema>;
 export type TaskStatus = z.infer<typeof taskStatusSchema>;

@@ -13,7 +13,7 @@ import agents.coder as coder_module
 from agents.coder import AgentDeps, coder_agent
 from database.models.file import File
 from database.models.symbol import Symbol
-from services.code_search import CodeSearchService
+from services.code_search import CodeSearchService, LexicalMatchMode
 from services.docker_sandbox import DockerSandboxManager
 from services.event_bus import (
     AgentEvent,
@@ -28,7 +28,7 @@ from services.file_editor import FileEditorService
 from services.git_manager import GitManagerService
 from services.session_context import SessionContext
 from services.user_questions import UserQuestioner
-from tests.conftest import git_log, stub_embedding_service
+from tests.conftest import TEST_PROJECT, TEST_REPO_PATH, git_log, stub_embedding_service
 
 EXPECTED_TOOLS: set[str] = {
     'ask_user',
@@ -69,7 +69,7 @@ def deps(git_repo: GitManagerService, session: SessionContext, events: EventBus)
     root: str = git_repo.repo_path
     return AgentDeps(
         docker=DockerSandboxManager(repo_path=root),
-        search=CodeSearchService(),
+        search=CodeSearchService(repo_path=TEST_REPO_PATH),
         editor=FileEditorService(root_path=root),
         git=git_repo,
         embedding=stub_embedding_service(),
@@ -157,28 +157,156 @@ async def test_run_test_command_reports_the_verdict(deps: AgentDeps) -> None:
     assert deps.session.last_verification_passed is False
 
 
-@pytest.mark.usefixtures('sqlite_db')
+@pytest.mark.usefixtures('db')
 async def test_lexical_tool_formats_results(deps: AgentDeps) -> None:
     """
     The lexical tool renders hits and reports cleanly when there are none.
     """
-    await File.create(file_path='repo/users.py', raw_content='def find_user():\n    pass\n', hash='h')
+    await File.create(project=TEST_PROJECT, file_path='repo/users.py', raw_content='def find_user():\n    pass\n', hash='h')
 
-    output: str = await invoke('search_code_lexical', deps, keyword='find_user')
+    output: str = await invoke('search_code_lexical', deps, keywords=['find_user'])
     assert 'repo/users.py:' in output
     assert 'def find_user' in output
 
-    assert 'No occurrences' in await invoke('search_code_lexical', deps, keyword='absent_xyz')
+    assert 'No occurrences' in await invoke(
+        'search_code_lexical', deps, keywords=['absent_xyz']
+    )
 
 
-@pytest.mark.usefixtures('sqlite_db')
+@pytest.mark.usefixtures('db')
+async def test_lexical_tool_searches_several_keywords_at_once(deps: AgentDeps) -> None:
+    """
+    Three unrelated names in one call return matches for each.
+
+    This is the reported failure that prompted the capability: the agent wanted
+    three symbols at once, and a single joined string found nothing because no
+    line contained all three.
+    """
+    await File.create(project=TEST_PROJECT, file_path='repo/a.py', raw_content='def alpha():\n    pass\n', hash='a')
+    await File.create(project=TEST_PROJECT, file_path='repo/b.py', raw_content='def beta():\n    pass\n', hash='b')
+    await File.create(project=TEST_PROJECT, file_path='repo/c.py', raw_content='def gamma():\n    pass\n', hash='c')
+
+    output: str = await invoke(
+        'search_code_lexical', deps, keywords=['alpha', 'beta', 'gamma']
+    )
+
+    assert 'def alpha' in output
+    assert 'def beta' in output
+    assert 'def gamma' in output
+
+
+@pytest.mark.usefixtures('db')
+async def test_lexical_tool_all_mode_requires_every_keyword_on_one_line(
+    deps: AgentDeps,
+) -> None:
+    """
+    In *all* mode a line needs every keyword, and the failure suggests *any*.
+    """
+    await File.create(
+        project=TEST_PROJECT,
+        file_path='repo/mixed.py',
+        raw_content='alpha_and_beta_together = 1\nalpha_alone = 2\n',
+        hash='m',
+    )
+
+    both: str = await invoke(
+        'search_code_lexical', deps, keywords=['alpha', 'beta'], mode=LexicalMatchMode.all_of
+    )
+    # Asserted by line number: the non-matching line still appears in the
+    # matching line's context, so searching the text for it proves nothing.
+    assert 'repo/mixed.py:1' in both
+    assert 'repo/mixed.py:2' not in both
+
+    missing: str = await invoke(
+        'search_code_lexical', deps, keywords=['alpha', 'zzz_absent'],
+        mode=LexicalMatchMode.all_of,
+    )
+    assert 'No single line contains all of' in missing
+    # The other mode is worth suggesting unprompted; *all* fails often.
+    assert 'mode="any"' in missing
+
+
+@pytest.mark.usefixtures('db')
+async def test_lexical_tool_names_the_keywords_it_tried(deps: AgentDeps) -> None:
+    """
+    A fruitless search says what was searched for, not merely that it failed.
+    """
+    output: str = await invoke(
+        'search_code_lexical', deps, keywords=['absent_one', 'absent_two']
+    )
+
+    assert 'absent_one' in output
+    assert 'absent_two' in output
+
+
+@pytest.mark.usefixtures('db')
+@pytest.mark.parametrize(
+    'keywords',
+    [[], ['   '], ['', '  ']],
+    ids=['no_keywords', 'one_blank', 'all_blank'],
+)
+async def test_lexical_tool_refuses_an_empty_keyword_list(
+    deps: AgentDeps, keywords: list[str]
+) -> None:
+    """
+    Nothing usable is refused with an explanation, not searched for.
+
+    Searching for an empty string would match every line in the repository,
+    which is the opposite of what the caller wanted.
+    """
+    await File.create(project=TEST_PROJECT, file_path='repo/users.py', raw_content='def find_user():\n', hash='h')
+
+    output: str = await invoke('search_code_lexical', deps, keywords=keywords)
+
+    assert 'No keywords were given' in output
+    assert 'find_user' not in output
+
+
+@pytest.mark.usefixtures('db')
+async def test_lexical_tool_reports_keywords_beyond_the_cap(deps: AgentDeps) -> None:
+    """
+    Surplus keywords are named back, not dropped in silence.
+
+    An agent told nothing would read the absence of a term as proof it is not in
+    the repository, when in fact it was never looked for.
+    """
+    await File.create(project=TEST_PROJECT, file_path='repo/users.py', raw_content='def find_user():\n', hash='h')
+
+    surplus: list[str] = [f'extra_{index}' for index in range(3)]
+    output: str = await invoke(
+        'search_code_lexical',
+        deps,
+        keywords=['find_user', *[f'absent_{index}' for index in range(9)], *surplus],
+    )
+
+    for keyword in surplus:
+        assert keyword in output
+
+    # The results that were found still come back alongside the notice.
+    assert 'def find_user' in output
+
+
+@pytest.mark.usefixtures('db')
+async def test_lexical_tool_is_quiet_when_nothing_was_dropped(deps: AgentDeps) -> None:
+    """
+    A call within the cap carries no notice about surplus keywords.
+    """
+    await File.create(project=TEST_PROJECT, file_path='repo/users.py', raw_content='def find_user():\n', hash='h')
+
+    output: str = await invoke('search_code_lexical', deps, keywords=['find_user'])
+
+    assert 'were not' not in output
+    assert 'batches' not in output
+
+
+@pytest.mark.usefixtures('db')
 async def test_search_code_is_quiet_when_a_model_has_no_embeddings(deps: AgentDeps) -> None:
     """
     An unindexed model yields lexical results without a scary warning.
 
     No embeddings for the configured model is an ordinary state, not a fault.
     """
-    await File.create(file_path='repo/users.py', raw_content='def find_user():\n    pass\n', hash='h')
+    await File.create(project=TEST_PROJECT, file_path='repo/users.py', raw_content='def find_user():\n    pass\n', hash='h')
 
     output: str = await invoke('search_code', deps, query='find_user')
 
@@ -187,7 +315,7 @@ async def test_search_code_is_quiet_when_a_model_has_no_embeddings(deps: AgentDe
     assert 'Semantic search is unavailable' not in output
 
 
-@pytest.mark.usefixtures('sqlite_db')
+@pytest.mark.usefixtures('db')
 async def test_search_code_degrades_visibly_when_semantic_fails(
     deps: AgentDeps, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -197,7 +325,7 @@ async def test_search_code_degrades_visibly_when_semantic_fails(
     Silently returning lexical-only results would make a broken vector index
     look like a sparsely indexed repository.
     """
-    await File.create(file_path='repo/users.py', raw_content='def find_user():\n    pass\n', hash='h')
+    await File.create(project=TEST_PROJECT, file_path='repo/users.py', raw_content='def find_user():\n    pass\n', hash='h')
 
     async def broken(*args: Any, **kwargs: Any) -> list[Any]:
         raise RuntimeError('vector backend is down')
@@ -304,7 +432,7 @@ def collect(events: EventBus) -> list[AgentEvent]:
     ],
     ids=['read_file', 'get_symbol', 'complete_task'],
 )
-@pytest.mark.usefixtures('sqlite_db')
+@pytest.mark.usefixtures('db')
 async def test_every_tool_self_reports(
     deps: AgentDeps,
     events: EventBus,
@@ -326,7 +454,143 @@ async def test_every_tool_self_reports(
     assert [event.tool_name for event in observations] == [tool_name]
 
 
-async def test_write_tools_never_report_file_contents(deps: AgentDeps, events: EventBus) -> None:
+async def observation_for(
+    tool_name: str, deps: AgentDeps, events: EventBus, **kwargs: Any
+) -> tuple[str, str]:
+    """
+    Invoke a tool and capture both of its outputs.
+
+    :param tool_name: The tool to call.
+    :param deps: The dependencies to expose to it.
+    :param events: The bus the observation is emitted on.
+    :param kwargs: Arguments forwarded to the tool.
+    :returns: What the agent received, and what the reader was shown.
+    """
+    seen: list[AgentEvent] = collect(events)
+    returned: str = await invoke(tool_name, deps, **kwargs)
+    observations = [event for event in seen if isinstance(event, ToolObservationEvent)]
+
+    assert len(observations) == 1
+    return returned, observations[0].result
+
+
+@pytest.mark.usefixtures('db')
+async def test_search_code_shows_paths_to_the_reader_and_code_to_the_agent(
+    deps: AgentDeps, events: EventBus
+) -> None:
+    """
+    The two outputs must diverge: paths for the feed, snippets for the agent.
+
+    Both halves are asserted deliberately. A test that only checked the
+    observation had no code in it would pass just as well if the change had
+    gutted the tool's result too, which is precisely what must not happen.
+    """
+    await File.create(
+        project=TEST_PROJECT,
+        file_path='repo/users.py',
+        raw_content='def find_user():\n    SECRET_MARKER = 1\n    return SECRET_MARKER\n',
+        hash='h',
+    )
+
+    returned, observation = await observation_for(
+        'search_code', deps, events, query='find_user'
+    )
+
+    # The agent still gets the code.
+    assert 'SECRET_MARKER' in returned
+    assert 'def find_user' in returned
+
+    # The reader gets the file, and none of its contents.
+    assert 'repo/users.py' in observation
+    assert 'SECRET_MARKER' not in observation
+    assert 'def find_user' not in observation
+
+
+@pytest.mark.usefixtures('db')
+async def test_lexical_search_shows_paths_to_the_reader_and_code_to_the_agent(
+    deps: AgentDeps, events: EventBus
+) -> None:
+    """
+    The lexical tool renders context lines, so it floods the feed just as badly.
+    """
+    await File.create(
+        project=TEST_PROJECT,
+        file_path='repo/users.py',
+        raw_content='def find_user():\n    SECRET_MARKER = 1\n    return SECRET_MARKER\n',
+        hash='h',
+    )
+
+    returned, observation = await observation_for(
+        'search_code_lexical', deps, events, keywords=['find_user']
+    )
+
+    assert 'SECRET_MARKER' in returned
+    assert 'repo/users.py' in observation
+    assert 'SECRET_MARKER' not in observation
+
+
+@pytest.mark.usefixtures('db')
+async def test_a_file_matching_many_times_is_shown_once(
+    deps: AgentDeps, events: EventBus
+) -> None:
+    """
+    Nine matching lines in one file is one file to the reader.
+    """
+    await File.create(
+        project=TEST_PROJECT,
+        file_path='repo/repeats.py',
+        raw_content='\n'.join(f'target_{index} = target' for index in range(9)),
+        hash='h',
+    )
+
+    _, observation = await observation_for(
+        'search_code_lexical', deps, events, keywords=['target']
+    )
+
+    assert observation.count('repo/repeats.py') == 1
+    assert 'Matched 1 file' in observation
+
+
+@pytest.mark.usefixtures('db')
+async def test_a_search_matching_nothing_says_so(deps: AgentDeps, events: EventBus) -> None:
+    """
+    An empty result reads as a sentence, not as an empty list.
+    """
+    _, observation = await observation_for(
+        'search_code', deps, events, query='absent_xyz'
+    )
+
+    assert 'No files matched' in observation
+    assert observation.strip() != ''
+
+
+@pytest.mark.usefixtures('db')
+async def test_a_half_failed_search_says_so_in_the_feed(
+    deps: AgentDeps, events: EventBus, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """
+    A search whose semantic half died must not read as a complete one.
+
+    Showing only 'Matched 1 file' would let a broken vector index look like a
+    thin repository, which is the mistake this notice exists to prevent.
+    """
+    await File.create(project=TEST_PROJECT, file_path='repo/users.py', raw_content='def find_user():\n', hash='h')
+
+    async def explode(*_: Any, **__: Any) -> list[Any]:
+        raise RuntimeError('vector backend down')
+
+    monkeypatch.setattr(deps.search, 'search_code_semantic', explode)
+
+    _, observation = await observation_for(
+        'search_code', deps, events, query='find_user'
+    )
+
+    assert 'Semantic search is unavailable' in observation
+    # The caveat has to arrive before the count, or it reads as a footnote.
+    assert observation.index('Semantic search is unavailable') < observation.index('Matched')
+
+
+
     """
     Bulky arguments are kept off the wire.
 
@@ -682,7 +946,7 @@ async def test_a_failed_read_still_says_why(deps: AgentDeps, events: EventBus) -
     assert 'does not exist' in observations[0].result
 
 
-@pytest.mark.usefixtures('sqlite_db')
+@pytest.mark.usefixtures('db')
 async def test_get_symbol_returns_the_definition_itself(deps: AgentDeps) -> None:
     """
     The agent asks for a definition and must receive one.
@@ -693,6 +957,7 @@ async def test_get_symbol_returns_the_definition_itself(deps: AgentDeps) -> None
     failed silently: the agent would simply find it useless.
     """
     file_obj = await File.create(
+        project=TEST_PROJECT,
         file_path='repo/users.py',
         raw_content='import os\n\n\ndef find_user(name):\n    return name\n',
         hash='h',
@@ -711,13 +976,14 @@ async def test_get_symbol_returns_the_definition_itself(deps: AgentDeps) -> None
     assert 'object at 0x' not in returned
 
 
-@pytest.mark.usefixtures('sqlite_db')
+@pytest.mark.usefixtures('db')
 async def test_get_symbol_reports_every_declaration(deps: AgentDeps) -> None:
     """
     A name declared twice is worth seeing twice, not resolved arbitrarily.
     """
     for path in ('repo/a.py', 'repo/b.py'):
         file_obj = await File.create(
+            project=TEST_PROJECT,
             file_path=path, raw_content='def handler():\n    pass\n', hash='h'
         )
         await Symbol.create(
@@ -730,7 +996,7 @@ async def test_get_symbol_reports_every_declaration(deps: AgentDeps) -> None:
     assert 'repo/b.py:1-2' in returned
 
 
-@pytest.mark.usefixtures('sqlite_db')
+@pytest.mark.usefixtures('db')
 async def test_get_symbol_says_plainly_when_nothing_is_indexed(deps: AgentDeps) -> None:
     """
     An empty result must read as an answer, not as a malfunction.
@@ -741,7 +1007,7 @@ async def test_get_symbol_says_plainly_when_nothing_is_indexed(deps: AgentDeps) 
     assert 'nowhere' in returned
 
 
-@pytest.mark.usefixtures('sqlite_db')
+@pytest.mark.usefixtures('db')
 async def test_get_symbol_reports_a_count_rather_than_the_source(
     deps: AgentDeps, events: EventBus
 ) -> None:
@@ -749,6 +1015,7 @@ async def test_get_symbol_reports_a_count_rather_than_the_source(
     The definitions are for the agent; the reader wants to know it was found.
     """
     file_obj = await File.create(
+        project=TEST_PROJECT,
         file_path='repo/users.py',
         raw_content='def find_user(name):\n    return name\n',
         hash='h',

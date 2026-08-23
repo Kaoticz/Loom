@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import re
+from enum import Enum
 from typing import Annotated, ClassVar
 
 from pydantic import BaseModel, ConfigDict, Field
@@ -13,6 +14,37 @@ NO_STEPS_CORRECTION: str = (
 )
 
 
+class PlanFormat(str, Enum):
+    """
+    How a plan was produced, and therefore how it should be shown.
+
+    Carried explicitly rather than inferred from whether descriptions happen to
+    be present. A structured plan whose descriptions all came back empty is
+    still a structured plan, and inferring the format would render it as plain
+    text — a disagreement between what was produced and what is shown, which is
+    the failure mode that keeps appearing in this project.
+    """
+
+    structured = 'structured'
+    text = 'text'
+
+
+class PlanStep(BaseModel):
+    """
+    One step of a plan.
+
+    The description is optional because a model asked for one may return an
+    empty string, and because a plan recovered from free text has titles only.
+    """
+
+    model_config: ClassVar[ConfigDict] = ConfigDict(frozen=True)
+
+    title: Annotated[str, Field(description='A short name for the step.')]
+    description: Annotated[
+        str, Field(default='', description='What the step involves, if the model gave one.')
+    ] = ''
+
+
 class ParsedPlan(BaseModel):
     """
     The steps recovered from an agent's plan output.
@@ -20,8 +52,13 @@ class ParsedPlan(BaseModel):
 
     model_config: ClassVar[ConfigDict] = ConfigDict(frozen=True)
 
-    steps: Annotated[list[str], Field(default_factory=list, description='The actionable steps, in order.')]
+    steps: Annotated[
+        list[PlanStep], Field(default_factory=list, description='The actionable steps, in order.')
+    ]
     used_fallback: Annotated[bool, Field(description='Whether the output had no numbered steps and was taken as a single step.')] = False
+    format: Annotated[
+        PlanFormat, Field(description='Whether the plan came back structured or as free text.')
+    ] = PlanFormat.text
 
     @property
     def is_empty(self) -> bool:
@@ -31,6 +68,15 @@ class ParsedPlan(BaseModel):
         :returns: True if no steps were recovered.
         """
         return len(self.steps) == 0
+
+    @property
+    def titles(self) -> list[str]:
+        """
+        The step titles, in order.
+
+        :returns: One title per step.
+        """
+        return [step.title for step in self.steps]
 
 
 def parse_plan(output: str) -> ParsedPlan:
@@ -71,20 +117,40 @@ def parse_plan(output: str) -> ParsedPlan:
 
     steps = [step for step in steps if step]
     if steps:
-        return ParsedPlan(steps=steps, used_fallback=False)
+        # Free text carries no descriptions, so each recovered step is a title
+        # on its own. The format says so, rather than leaving the reader to
+        # infer it from the empty descriptions.
+        return ParsedPlan(
+            steps=[PlanStep(title=step) for step in steps],
+            used_fallback=False,
+            format=PlanFormat.text,
+        )
 
     remainder: str = ' '.join(line.strip() for line in body.splitlines() if line.strip())
     if remainder:
-        return ParsedPlan(steps=[remainder], used_fallback=True)
+        return ParsedPlan(
+            steps=[PlanStep(title=remainder)], used_fallback=True, format=PlanFormat.text
+        )
 
-    return ParsedPlan(steps=[], used_fallback=False)
+    return ParsedPlan(steps=[], used_fallback=False, format=PlanFormat.text)
 
 
 def render_plan(plan: ParsedPlan) -> str:
     """
     Render a plan back into numbered text, for inclusion in a later prompt.
 
+    Descriptions are included where they exist. They are the reason for asking
+    for structure at all: a plan whose descriptions never reach the prompt that
+    executes it has gained nothing but a nicer display.
+
     :param plan: The plan to render.
     :returns: The rendered plan, or an empty string if it has no steps.
     """
-    return '\n'.join(f'{index}. {step}' for index, step in enumerate(plan.steps, start=1))
+    lines: list[str] = []
+
+    for index, step in enumerate(plan.steps, start=1):
+        lines.append(f'{index}. {step.title}')
+        if step.description:
+            lines.append(f'   {step.description}')
+
+    return '\n'.join(lines)

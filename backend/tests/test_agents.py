@@ -13,6 +13,52 @@ def test_coder_prompt_covers_the_required_rules() -> None:
         assert fragment in CODER_SYSTEM_PROMPT
 
 
+def test_coder_prompt_describes_multi_keyword_lexical_search() -> None:
+    """
+    The prompt must offer the capability the tool provides.
+
+    There is history here: a previous requirement shipped entirely unreachable
+    because the prompt forbade what the tool allowed, and every test passed
+    because the tests called the tool directly. The tool's own description and
+    this prompt are the only things the model ever sees, so both are asserted.
+    """
+    understanding: str = unwrapped(
+        CODER_SYSTEM_PROMPT.split('# 2. Understand before you change')[1].split('# 3.')[0]
+    )
+
+    # That several keywords may go in one call, which is the whole capability.
+    assert 'list of keywords' in understanding
+    assert 'single call' in understanding
+
+    # That the modes exist, and which one is the default.
+    assert 'any of them' in understanding
+    assert 'mode="all"' in understanding
+
+    # That `all` disappoints often, so the agent is not left assuming it failed.
+    assert 'different lines' in understanding
+
+
+def test_coder_lexical_tool_description_matches_the_prompt() -> None:
+    """
+    The tool's own description carries the same offer as the prompt.
+
+    The description is what reaches the model alongside the schema; a capability
+    documented only in the prompt is easy to miss, and one documented only here
+    can be contradicted by the prompt.
+    """
+    description: str = unwrapped(
+        coder_agent._function_toolset.tools['search_code_lexical'].function.__doc__ or ''
+    )
+
+    assert 'as many keywords as you like in one call' in description
+    assert '"any" returns lines containing at least one' in description
+    assert '"all" returns only lines containing every keyword' in description
+    # The default has to be stated, or the agent cannot know what it is getting.
+    assert 'defaults to "any"' in description
+    # And that an entry with spaces is a phrase rather than several keywords.
+    assert 'single entry to search for a phrase' in description
+
+
 def unwrapped(text: str) -> str:
     """
     Collapse runs of whitespace, so an assertion is about wording not wrapping.

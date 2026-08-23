@@ -81,7 +81,11 @@ function renderChat() {
 
 /** Put the session in front of a plan awaiting approval, and let it render. */
 async function awaitPlan(socket: FakeSocket): Promise<void> {
-    socket.deliver({ type: 'plan', steps: ['Read the file', 'Edit it'], requires_approval: true });
+    socket.deliver({
+        type: 'plan',
+        steps: [{ title: 'Read the file' }, { title: 'Edit it' }],
+        requires_approval: true
+    });
     await tick();
 }
 

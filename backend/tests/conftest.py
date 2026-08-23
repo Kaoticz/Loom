@@ -12,6 +12,7 @@ from httpx import AsyncClient, MockTransport, Request, Response
 from tortoise import Tortoise
 
 from services.code_search import CodeSearchService
+from services.projects import normalise_project_path
 from services.docker_sandbox import DockerSandboxManager
 from services.embedding import EmbeddingService
 from services.event_bus import EventBus
@@ -19,12 +20,19 @@ from services.file_editor import FileEditorService
 from services.git_manager import GitManagerService
 from services.session_context import SessionContext
 
-SQLITE_MODELS: list[str] = [
-    'database.models.embedding_model',
-    'database.models.file',
-    'database.models.symbol',
-    'database.models.task_memory',
-]
+
+TEST_REPO_PATH: str = '/tmp/loom-test-project'
+"""
+The repository path tests index and search under.
+
+Files created directly by a test must carry `TEST_PROJECT`, or a search bound to
+this path will not see them — which is exactly the silent mismatch that scoping
+is meant to make impossible in production, so it is worth one shared constant
+here rather than a literal per test.
+"""
+
+TEST_PROJECT: str = normalise_project_path(TEST_REPO_PATH)
+"""The normalised form of :data:`TEST_REPO_PATH`, as stored on a row."""
 
 
 def postgres_config(dsn: str) -> dict[str, Any]:
@@ -97,19 +105,116 @@ def stub_embedding_service(vector: list[float] | None = None) -> EmbeddingServic
     return EmbeddingService('http://ollama:11434', client=AsyncClient(transport=MockTransport(handler)))
 
 
-@pytest_asyncio.fixture
-async def sqlite_db() -> AsyncIterator[None]:
-    """
-    Provide an in-memory SQLite database with the non-vector models.
+DB_REQUIRED_MESSAGE: str = (
+    'These tests need PostgreSQL with pgvector. Set TEST_DATABASE_URL to a database '
+    'you do not mind being emptied, for example '
+    'postgres://loom:loom_password@localhost:5432/loom_test'
+)
 
-    The `code_embeddings` table is excluded because pgvector columns cannot be
-    bound by SQLite; vector behaviour is covered by the Postgres suite.
-
-    :returns: An iterator yielding once the schema is ready.
+def managed_tables() -> list[str]:
     """
-    await Tortoise.init(db_url='sqlite://:memory:', modules={'models': SQLITE_MODELS})
-    await Tortoise.generate_schemas()
+    Every table the suite may write to, read from the registered models.
+
+    Derived rather than listed. A hand-written list is a second place that has to
+    agree with the schema, and it did not: `tasks` was missing from it, so task
+    rows survived from one test into the next with nothing to indicate it. The
+    comment that stood here claimed such an omission would fail visibly. It would
+    not — it leaked in silence, which is why this reads the models instead.
+
+    :returns: The table names, for truncation and for rebuilding the schema.
+    """
+    if not Tortoise.apps:
+        raise RuntimeError('managed_tables needs Tortoise initialised; depend on `db` first')
+
+    return [
+        model._meta.db_table
+        # Guarded: an app registered but not yet populated appears as None, and
+        # reading it would fail here rather than where the mistake was made.
+        for app in Tortoise.apps.values()
+        if app
+        for model in app.values()
+    ]
+
+
+@pytest.fixture
+def require_database() -> None:
+    """
+    Refuse to run without a database, rather than skipping.
+
+    For suites that manage their own databases and so do not take `db`. A skip
+    reports success while never reaching the engine the product runs on, which
+    is the thing this arrangement exists to prevent.
+    """
+    if not os.getenv('TEST_DATABASE_URL'):
+        raise RuntimeError(DB_REQUIRED_MESSAGE)
+
+
+@pytest_asyncio.fixture(scope='session', loop_scope='session')
+async def _database_schema() -> AsyncIterator[None]:
+    """
+    Build the schema once for the whole session.
+
+    Creating it per test meant DDL per test, which was affordable for the
+    handful of suites that used PostgreSQL and is not now that every suite does.
+
+    :returns: An iterator yielding once the schema exists.
+    """
+    dsn: str | None = os.getenv('TEST_DATABASE_URL')
+
+    if not dsn:
+        # Raised rather than skipped. A suite that skips its database tests
+        # reports success while never touching the engine the product runs on,
+        # which is what this phase exists to end.
+        raise RuntimeError(DB_REQUIRED_MESSAGE)
+
+    await Tortoise.init(config=postgres_config(dsn))
+
+    # Rebuilt from scratch: generate_schemas only adds missing tables, so a
+    # database left from an earlier schema would silently lack new columns.
+    connection = Tortoise.get_connection('default')
+    await connection.execute_script(
+        f'DROP TABLE IF EXISTS {", ".join(managed_tables())} CASCADE;'
+    )
+    await Tortoise.generate_schemas(safe=True)
+
     yield
+
+    await Tortoise.close_connections()
+
+
+@pytest_asyncio.fixture
+async def db(_database_schema: None) -> AsyncIterator[None]:
+    """
+    Provide an empty database for one test.
+
+    Emptied by truncation rather than by rolling back a transaction. Rollback is
+    faster, but Tortoise hands out connections from a pool, so code under test
+    that opens its own connection would do its work outside the test's
+    transaction and see an empty database — and code that commits would escape
+    the rollback entirely. Truncation is correct regardless of what the code
+    under test does with connections.
+
+    `RESTART IDENTITY` matters: PostgreSQL sequences do not reset on their own,
+    so without it a test asserting on a specific primary key would pass alone and
+    fail in a suite.
+
+    :returns: An iterator yielding once the database is empty.
+    """
+    # Connected per test rather than sharing the session's connection. Other
+    # suites in this process initialise Tortoise against databases of their own
+    # and close connections when they finish, so a shared handle is not reliably
+    # open — nor reliably pointing at this database, which is worse. Opening a
+    # pool costs a few milliseconds; creating the schema, which is the expensive
+    # part, still happens once.
+    await Tortoise.init(config=postgres_config(os.environ['TEST_DATABASE_URL']))
+
+    connection = Tortoise.get_connection('default')
+    await connection.execute_script(
+        f'TRUNCATE {", ".join(managed_tables())} RESTART IDENTITY CASCADE;'
+    )
+
+    yield
+
     await Tortoise.close_connections()
 
 
@@ -171,11 +276,11 @@ def events() -> EventBus:
 @pytest.fixture
 def search() -> CodeSearchService:
     """
-    Provide a code search service.
+    Provide a code search service bound to the shared test project.
 
     :returns: The code search service.
     """
-    return CodeSearchService()
+    return CodeSearchService(repo_path=TEST_REPO_PATH)
 
 
 @pytest.fixture

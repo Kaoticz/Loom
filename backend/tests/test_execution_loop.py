@@ -23,6 +23,7 @@ from services.event_bus import (
 from services.git_manager import GitManagerService
 from services.session_fsm import SessionState
 from tests.test_agent_session import FakeGit, build_session, opening
+from services.plan_parser import ParsedPlan, PlanStep
 
 
 def scripted_model(responses: list[ModelResponse]) -> FunctionModel:
@@ -97,7 +98,10 @@ def prepare(
     session._task = 'Add a marker file'
     session._deps.git = git_repo
     session._deps.editor.root_path = git_repo.repo_path
-    session._plan = session._plan.model_copy(update={'steps': ['Create the marker file']})
+    # Built rather than copied with a raw list: `model_copy(update=...)` skips
+    # validation, so a string here would sit in the field untyped and only fail
+    # much later, wherever the step was first treated as a step.
+    session._plan = ParsedPlan(steps=[PlanStep(title='Create the marker file')])
     return session, events
 
 

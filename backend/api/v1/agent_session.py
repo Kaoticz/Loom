@@ -42,8 +42,17 @@ from services.event_bus import (
 from services.docker_sandbox import DockerSandboxManager, SandboxError
 from services.file_editor import FileEditorService
 from services.git_manager import FileChange, GitManagerService
+from services.code_search import CodeSearchService
 from services.indexing import IndexingService, clamp_chunk_lines
-from services.plan_parser import NO_STEPS_CORRECTION, ParsedPlan, parse_plan, render_plan
+from agents.planner import StructuredPlan, planner_agent
+from services.plan_parser import (
+    NO_STEPS_CORRECTION,
+    ParsedPlan,
+    PlanFormat,
+    PlanStep,
+    parse_plan,
+    render_plan,
+)
 from services.review_context import build_review_prompt, collect_review_diffs
 from services.model_resolution import resolve_model
 from services.session_context import SessionContext
@@ -105,6 +114,7 @@ class SessionServices(Protocol):
     git: GitManagerService
     indexing: IndexingService
     embedding: EmbeddingService
+    search: CodeSearchService
 
 CONTEXT_TOKEN_BUDGET: int = 4096
 DEFAULT_MODEL: str = 'ollama:llama3'
@@ -375,6 +385,10 @@ class AgentSession:
             self._services.editor.root_path = repo_path
             self._services.git.repo_path = repo_path
             self._services.indexing.repo_path = repo_path
+            # Repointed with the rest. Left behind, the agent would search the
+            # project named by REPO_PATH while the indexer wrote to this one,
+            # and every search would come back empty rather than failing.
+            self._services.search.repo_path = repo_path
 
         self._history.add(TurnRole.user, self._task)
 
@@ -496,7 +510,9 @@ class AgentSession:
         :returns: True if no file was indexed.
         """
         try:
-            return await File.all().count() == 0
+            # Scoped to this project: another project's index says nothing about
+            # whether this repository had anything to work with.
+            return await File.filter(project=self._services.indexing.project).count() == 0
         except Exception as error:
             logger.warning('Could not check whether the repository is empty: %s', error)
             return False
@@ -799,10 +815,13 @@ class AgentSession:
         self._history.advance_iteration()
 
         prompt: str = self._build_planning_prompt()
-        plan: ParsedPlan = parse_plan(await self._run_coder(prompt))
+        plan: ParsedPlan = await self._plan_structured(prompt)
 
         if plan.is_empty:
-            # One corrective attempt before giving up on this round.
+            # One corrective attempt before giving up on this round. The coder is
+            # used here rather than the planner: if structure did not come back
+            # the first time, asking the same way again is unlikely to help, and
+            # the parser exists precisely for models that will not comply.
             plan = parse_plan(await self._run_coder(f'{prompt}\n\n{NO_STEPS_CORRECTION}'))
 
         if plan.is_empty:
@@ -814,6 +833,40 @@ class AgentSession:
         self._plan = plan
         self._history.add(TurnRole.agent, render_plan(plan))
         return SessionState.waiting_plan_approval
+
+    async def _plan_structured(self, prompt: str) -> ParsedPlan:
+        """
+        Ask the planner for a structured plan, falling back to free text.
+
+        The fallback is not a formality. Small models frequently ignore a
+        requested output shape, and a plan that fails to arrive as structure is
+        still worth having as text — which is why the parser exists at all. A
+        failure here is logged rather than raised, because the caller has a
+        second attempt to make and an unusable plan is not an unusable session.
+
+        :param prompt: The planning prompt.
+        :returns: The plan, structured if it could be, parsed from text if not.
+        """
+        try:
+            result: AgentRunResult[StructuredPlan] = await planner_agent.run(
+                prompt, model=resolve_model(self._coder_model)
+            )
+        except Exception as error:
+            logger.warning('Structured planning failed, falling back to text: %s', error)
+            return parse_plan(await self._run_coder(prompt))
+
+        steps: list[PlanStep] = [
+            PlanStep(title=step.title.strip(), description=step.description.strip())
+            for step in result.output.steps
+            if step.title.strip()
+        ]
+
+        if not steps:
+            # Structure arrived but said nothing, which the text path may still
+            # recover something from.
+            return parse_plan(await self._run_coder(prompt))
+
+        return ParsedPlan(steps=steps, used_fallback=False, format=PlanFormat.structured)
 
     async def _run_coder(self, prompt: str) -> str:
         """
@@ -840,7 +893,7 @@ class AgentSession:
         sections: list[str] = [f'Task: {self._task}']
         if context:
             sections.append(f'What has happened so far:\n{context}')
-        sections.append('Produce a step-by-step plan for this task. Do not call any tools yet.')
+        sections.append('Produce a step-by-step plan for this task.')
         return '\n\n'.join(sections)
 
     async def _handle_waiting_plan_approval(self) -> SessionState:
@@ -850,7 +903,11 @@ class AgentSession:
         :returns: The next state.
         """
         await self._events.emit(
-            PlanEvent(steps=list(self._plan.steps), requires_approval=not self._auto_approve)
+            PlanEvent(
+                steps=list(self._plan.steps),
+                format=self._plan.format,
+                requires_approval=not self._auto_approve,
+            )
         )
 
         if self._auto_approve:

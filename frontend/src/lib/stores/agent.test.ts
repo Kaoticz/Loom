@@ -140,7 +140,7 @@ describe('message handling', () => {
 
         socket.deliver({
             type: 'plan',
-            steps: ['Read the file', 'Edit it'],
+            steps: [{ title: 'Read the file' }, { title: 'Edit it' }],
             requires_approval: true
         });
 
@@ -982,7 +982,7 @@ describe('inbound validation', () => {
     it('applies the schema defaults the backend would have sent', async () => {
         const { store, socket } = await connected();
 
-        socket.deliver({ type: 'plan', steps: ['One', 'Two'] });
+        socket.deliver({ type: 'plan', steps: [{ title: 'One' }, { title: 'Two' }] });
 
         expect(get(store).status).toBe('waiting_approval');
         expect(latest(store).content).toBe('1. One\n2. Two');

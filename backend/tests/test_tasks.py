@@ -17,11 +17,9 @@ from schemas.task_request import TaskRequest
 from schemas.task_response import TaskPatchRequest
 from services.event_bus import CommitEvent, PlanEvent, ReviewEvent, ThoughtEvent, ToolObservationEvent, ToolStatus
 from services.task_recorder import TaskRecorder
+from services.plan_parser import PlanStep
 
-pytestmark = pytest.mark.skipif(
-    not os.getenv('TEST_DATABASE_URL'),
-    reason='task tables use JSONB and a UUID key; set TEST_DATABASE_URL to run',
-)
+pytestmark = pytest.mark.usefixtures('require_database')
 
 
 @pytest_asyncio.fixture
@@ -188,7 +186,7 @@ async def test_recorder_persists_events_from_the_bus() -> None:
     task = await make_task()
     recorder = TaskRecorder(task)
 
-    await recorder.handle_event(PlanEvent(steps=['read', 'edit']))
+    await recorder.handle_event(PlanEvent(steps=[PlanStep(title='read'), PlanStep(title='edit')]))
     await recorder.handle_event(
         ToolObservationEvent(tool_name='edit_file', result='Edited a.py')
     )

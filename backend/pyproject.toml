@@ -76,7 +76,13 @@ dev = [
 [tool.pytest.ini_options]
 testpaths = ["tests"]
 asyncio_mode = "auto"
-asyncio_default_fixture_loop_scope = "function"
+# One event loop for the whole session. asyncpg binds a connection to the loop
+# that opened it, so a schema built once and shared cannot live in a per-test
+# loop. This is a consequence of running the tests against the real database
+# rather than an in-memory one, and the alternative was rebuilding the schema for
+# every test.
+asyncio_default_fixture_loop_scope = "session"
+asyncio_default_test_loop_scope = "session"
 filterwarnings = [
     "ignore::DeprecationWarning",
     # Raised when a Tortoise connection made on one event loop is reused on

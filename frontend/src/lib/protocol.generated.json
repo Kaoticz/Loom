@@ -66,5 +66,9 @@
         "reply",
         "continue",
         "auto_approve"
+    ],
+    "plan_format": [
+        "structured",
+        "text"
     ]
 }

@@ -15,10 +15,7 @@ from fastapi.testclient import TestClient
 from pydantic_ai.messages import ModelMessage, ModelResponse, TextPart, ToolCallPart
 from pydantic_ai.models.function import AgentInfo, DeltaToolCall, FunctionModel
 
-pytestmark = pytest.mark.skipif(
-    not os.getenv('TEST_DATABASE_URL'),
-    reason='the full stack needs Postgres; set TEST_DATABASE_URL to run',
-)
+pytestmark = pytest.mark.usefixtures('require_database')
 
 INTEGRATION_DATABASE: str = 'loom_integration_test'
 
@@ -274,7 +271,8 @@ def test_a_whole_session_runs_against_real_infrastructure(project: str) -> None:
             to_plan: list[dict[str, Any]] = drain(websocket, {'plan', 'error'})
             plan: dict[str, Any] = to_plan[-1]
             assert plan['type'] == 'plan', f'session failed: {plan}'
-            assert plan['steps'] == ['Add a subtract function']
+            # Steps are objects now; their titles are what this asserts on.
+            assert [step['title'] for step in plan['steps']] == ['Add a subtract function']
             assert plan['requires_approval'] is True
 
             # Requirement 3 moved status announcements from `thought` to

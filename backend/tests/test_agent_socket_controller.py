@@ -14,7 +14,7 @@ from services.docker_sandbox import DockerSandboxManager
 from services.file_editor import FileEditorService
 from services.git_manager import GitManagerService
 from services.session_registry import SessionRegistry
-from tests.conftest import stub_embedding_service
+from tests.conftest import TEST_REPO_PATH, stub_embedding_service
 
 
 class RecordingSocket:
@@ -103,7 +103,7 @@ def build_controller(tmp_path: Path) -> tuple[AgentSocketController, list[str]]:
 
     controller: AgentSocketController = AgentSocketController(
         docker=docker,
-        search=CodeSearchService(),
+        search=CodeSearchService(repo_path=TEST_REPO_PATH),
         editor=FileEditorService(root_path=str(tmp_path)),
         git=GitManagerService(repo_path=str(tmp_path)),
         indexing=indexing,

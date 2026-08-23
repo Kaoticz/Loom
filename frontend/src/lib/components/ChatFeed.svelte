@@ -54,9 +54,23 @@
 
     // Requirement 4.4: measured afresh every time, so scrolling back to the
     // bottom resumes following without any flag needing to be reset.
+    //
+    // The follow must not animate. This element sets `scroll-behavior: smooth`,
+    // so assigning `scrollTop` starts an animation instead of moving the feed,
+    // and `scrollTop` reports an intermediate position until that animation
+    // finishes. The next message's `$effect.pre` would read that intermediate
+    // position, conclude the reader had scrolled away, and stop following for
+    // good. That is not hypothetical: with messages arriving faster than the
+    // animation completed, the feed latched off after the first one and sat
+    // thousands of pixels from the bottom for the rest of the session.
+    //
+    // `behavior: 'instant'` overrides the stylesheet and moves the element
+    // synchronously, so the next measurement sees where the feed really is.
     $effect(() => {
         void messages;
-        if (wasAtBottom && container) container.scrollTop = container.scrollHeight;
+        if (wasAtBottom && container) {
+            container.scrollTo({ top: container.scrollHeight, behavior: 'instant' });
+        }
     });
 </script>
 

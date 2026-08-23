@@ -5,6 +5,8 @@ from typing import Annotated, Any, ClassVar, Literal
 
 from pydantic import BaseModel, ConfigDict, Field
 
+from services.plan_parser import PlanFormat, PlanStep
+
 from services.event_bus import (
     BaseAgentEvent,
     CommitEvent,
@@ -116,7 +118,11 @@ class PlanMessage(BaseAgentMessage):
     """
 
     type: Annotated[Literal[MessageType.plan], Field()] = MessageType.plan
-    steps: Annotated[list[str], Field(default_factory=list)]
+    steps: Annotated[list[PlanStep], Field(default_factory=list)]
+    # Carried rather than inferred from whether descriptions are present: a
+    # structured plan whose descriptions came back empty is still structured,
+    # and inferring would show it as plain text.
+    format: Annotated[PlanFormat, Field()] = PlanFormat.text
     requires_approval: Annotated[bool, Field()] = True
 
 
@@ -288,7 +294,14 @@ def to_message(event: BaseAgentEvent) -> AgentMessage:
     if isinstance(event, ThoughtEvent):
         return ThoughtMessage(content=event.content, stream_id=event.stream_id)
     if isinstance(event, PlanEvent):
-        return PlanMessage(steps=list(event.steps), requires_approval=event.requires_approval)
+        return PlanMessage(
+            steps=list(event.steps),
+            # Dropped here once, which left every structured plan arriving as
+            # `text` and rendering without its descriptions: the whole feature was
+            # unreachable while every test stayed green.
+            format=event.format,
+            requires_approval=event.requires_approval,
+        )
     if isinstance(event, ToolActionEvent):
         return ActionMessage(
             tool_name=event.tool_name,

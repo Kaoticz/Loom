@@ -8,7 +8,19 @@ from httpx import AsyncClient, HTTPError, Response
 from pydantic import BaseModel, ConfigDict
 from pydantic_ai import Agent, RunContext
 
-from services.code_search import CodeSearchService, LexicalMatch, SymbolDefinition
+from services.code_search import (
+    DEFAULT_LEXICAL_MODE,
+    CodeSearchService,
+    CodeSearchOutcome,
+    LexicalMatch,
+    LexicalMatchMode,
+    SymbolDefinition,
+    describe_ignored_keywords,
+    describe_matched_files,
+    describe_no_lexical_matches,
+    normalise_keywords,
+    split_at_keyword_limit,
+)
 from services.docker_sandbox import CommandResult, DockerSandboxManager
 from services.embedding import EmbeddingService
 from services.event_bus import CommitEvent, DiffEvent, EventBus
@@ -54,6 +66,13 @@ PLAN_COMPLETE
 Before modifying any code you must first understand it.
 
 - Use `search_code` or `search_code_lexical` to locate the relevant area of the codebase.
+- `search_code_lexical` takes a list of keywords, not just one. When you are looking for
+  several things — three function names, a class and the constant it uses — pass them all
+  in a single call rather than making a call for each. By default it returns lines matching
+  any of them; pass `mode="all"` to return only lines containing every one, bearing in mind
+  that related symbols usually sit on different lines, so `all` often finds nothing. Each
+  entry is one literal, so pass a phrase as a single entry. At most 10 keywords are
+  searched for per call; ask for more and the surplus is reported back unsearched.
 - Use `get_symbol` to look up the definition of a class or function by name.
 - Use `read_file` to read the exact current contents of any file you intend to change.
 
@@ -177,22 +196,32 @@ async def search_code(ctx: RunContext[AgentDeps], query: str) -> str:
     keyword matches are covered.
     """
     async with report_tool(ctx.deps.events, 'search_code', {'query': query}) as report:
-        return report.succeed(await _search_code(ctx, query))
+        outcome: CodeSearchOutcome = await _search_code(ctx, query)
+
+        # The agent gets the code; the reader gets the files it came from. The
+        # snippets are what the agent asked for and what floods the feed.
+        return report.succeed(
+            outcome.rendered,
+            observation=describe_matched_files(
+                f'Searched for {query!r}', outcome.file_paths, outcome.notices
+            ),
+        )
 
 
-async def _search_code(ctx: RunContext[AgentDeps], query: str) -> str:
+async def _search_code(ctx: RunContext[AgentDeps], query: str) -> CodeSearchOutcome:
     """
     Run the merged semantic and lexical search.
 
     :param ctx: The agent run context.
     :param query: The natural language query.
-    :returns: The rendered search results.
+    :returns: The rendered results, the files they came from, and any warnings.
     """
     embedding: list[float] = await ctx.deps.embedding.embed(query)
 
     sections: list[str] = []
     seen: set[str] = set()
     notices: list[str] = []
+    ordered_paths: list[str] = []
 
     semantic: list[Any] = []
     try:
@@ -210,6 +239,7 @@ async def _search_code(ctx: RunContext[AgentDeps], query: str) -> str:
         if path in seen:
             continue
         seen.add(path)
+        ordered_paths.append(path)
         sections.append(f'{path}:{chunk.start_line} (semantic)\n{chunk.chunk_text}')
 
     lexical: list[LexicalMatch] = await ctx.deps.search.search_code_lexical(query)
@@ -217,31 +247,92 @@ async def _search_code(ctx: RunContext[AgentDeps], query: str) -> str:
         if match.file_path in seen:
             continue
         seen.add(match.file_path)
+        ordered_paths.append(match.file_path)
         sections.append(f'{match.render()} (lexical)')
 
     if not sections:
-        notices.append(f'No code found for {query!r}. The repository may not be indexed yet.')
-        return '\n'.join(notices)
+        # Kept out of `notices`: the observation says as much in its own words,
+        # and repeating it there would read as two separate complaints.
+        empty: str = f'No code found for {query!r}. The repository may not be indexed yet.'
+        return CodeSearchOutcome(
+            rendered='\n'.join([*notices, empty]),
+            file_paths=[],
+            notices=notices,
+        )
 
     body: str = '\n\n'.join(sections)
-    return '\n\n'.join([*notices, body]) if notices else body
+    return CodeSearchOutcome(
+        rendered='\n\n'.join([*notices, body]) if notices else body,
+        file_paths=ordered_paths,
+        notices=notices,
+    )
 
 
 @coder_agent.tool
-async def search_code_lexical(ctx: RunContext[AgentDeps], keyword: str, limit: int = 10) -> str:
+async def search_code_lexical(
+    ctx: RunContext[AgentDeps],
+    keywords: list[str],
+    limit: int = 10,
+    mode: LexicalMatchMode = DEFAULT_LEXICAL_MODE
+) -> str:
     """
-    Search the codebase for an exact, case-insensitive piece of text.
+    Search the codebase for exact, case-insensitive text.
 
-    Use this when you know the literal string you are looking for, such as a
-    function name, an error message, or a configuration key.
+    Use this when you know the literal strings you are looking for, such as
+    function names, an error message, or a configuration key.
+
+    Pass as many keywords as you like in one call. Each entry is one literal,
+    spaces included, so use a single entry to search for a phrase such as
+    "connection refused", and separate entries to search for separate terms.
+
+    `mode` decides how they combine, and defaults to "any":
+
+    - "any" returns lines containing at least one of the keywords. Use it to
+      look for several unrelated things at once, such as three function names.
+    - "all" returns only lines containing every keyword. Use it to narrow down,
+      remembering that related symbols usually sit on different lines, so this
+      often finds nothing even when both keywords are present in the file.
+
+    `limit` caps the total number of lines returned across all keywords, and at
+    most 10 keywords are searched for in one call.
     """
-    async with report_tool(
-        ctx.deps.events, 'search_code_lexical', {'keyword': keyword, 'limit': limit}
-    ) as report:
-        matches: list[LexicalMatch] = await ctx.deps.search.search_code_lexical(keyword, limit=limit)
-        if not matches:
-            return report.succeed(f'No occurrences of {keyword!r} were found.')
-        return report.succeed('\n\n'.join(match.render() for match in matches))
+    searched: list[str]
+    ignored: list[str]
+    searched, ignored = split_at_keyword_limit(normalise_keywords(keywords))
+    arguments: dict[str, object] = {'keywords': searched, 'limit': limit, 'mode': mode.value}
+
+    async with report_tool(ctx.deps.events, 'search_code_lexical', arguments) as report:
+        if not searched:
+            return report.succeed(
+                'No keywords were given. Pass one or more non-empty strings, '
+                'for example ["parse_plan", "render_plan"].'
+            )
+
+        matches: list[LexicalMatch] = await ctx.deps.search.search_code_lexical(
+            searched, limit=limit, mode=mode
+        )
+        body: str = (
+            '\n\n'.join(match.render() for match in matches)
+            if matches
+            else describe_no_lexical_matches(searched, mode)
+        )
+
+        # Prepended rather than appended: the agent needs to know part of its
+        # request went unserved before it draws conclusions from the results.
+        notice: str = describe_ignored_keywords(ignored)
+        result: str = f'{notice}\n\n{body}' if notice else body
+
+        # Unique, in order: a file with nine matching lines is one file to the
+        # reader, however many times it appears in what the agent receives.
+        matched_paths: list[str] = list(dict.fromkeys(match.file_path for match in matches))
+        subject: str = 'Searched for ' + ', '.join(repr(keyword) for keyword in searched)
+
+        return report.succeed(
+            result,
+            observation=describe_matched_files(
+                subject, matched_paths, [notice] if notice else []
+            ),
+        )
 
 
 @coder_agent.tool

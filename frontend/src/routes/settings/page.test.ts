@@ -1,5 +1,5 @@
 import { beforeEach, describe, expect, it, vi } from 'vitest';
-import { fireEvent, render, screen } from '@testing-library/svelte';
+import { fireEvent, render, screen, waitFor } from '@testing-library/svelte';
 import { tick } from 'svelte';
 import Settings from './+page.svelte';
 import { agentStore } from '$lib/stores/agent';
@@ -132,5 +132,199 @@ describe('embedding model description', () => {
         // A missing description must not take the settings page down with it.
         expect(screen.getByTestId('embedding-model-description')).toBeInTheDocument();
         expect(screen.getByLabelText('Chunk Size')).toBeInTheDocument();
+    });
+});
+
+describe('removing indexed data', () => {
+    /**
+     * Reply to every endpoint the page calls, with a controllable index status.
+     *
+     * @param status What `/index/status` should report.
+     * @param onDelete What `DELETE /index` should return, or an Error to throw.
+     */
+    function respondWithIndex(status: unknown, onDelete?: () => unknown) {
+        vi.stubGlobal(
+            'fetch',
+            vi.fn(async (url: string, init?: RequestInit) => {
+                const target = String(url);
+                if (init?.method === 'DELETE') {
+                    const result = onDelete?.() ?? {
+                        project: '/repos/mine',
+                        embeddings_deleted: 4,
+                        files_deleted: 2,
+                        symbols_deleted: 3,
+                        message:
+                            'Removed 2 indexed files, 3 symbols and 4 embeddings. The project is re-indexed when a session next starts.'
+                    };
+                    if (result instanceof Error) throw result;
+                    return { ok: true, json: async () => result } as unknown as Response;
+                }
+                if (target.includes('/index/status')) {
+                    return { ok: true, json: async () => status } as unknown as Response;
+                }
+                if (target.includes('/description')) {
+                    return {
+                        ok: true,
+                        json: async () => ({ dimensions: 768, context_length: 2048 })
+                    } as unknown as Response;
+                }
+                return { ok: true, json: async () => ['nomic-embed-text'] } as unknown as Response;
+            })
+        );
+    }
+
+    const indexed = {
+        project: '/repos/mine',
+        indexed_files: 2,
+        can_delete: true,
+        blocked_reason: ''
+    };
+
+    /**
+     * Read the explanation the remove button points at.
+     *
+     * Read by id rather than by text: it is the element the button references
+     * with `aria-describedby`, so this asserts on the thing a screen reader
+     * would actually announce.
+     */
+    function reason(): string {
+        return document.getElementById('index-delete-reason')?.textContent?.trim() ?? '';
+    }
+
+    /** The remove button, which stays clickable even when marked disabled. */
+    function removeButton(): HTMLElement {
+        return screen.getByRole('button', { name: /remove indexed data/i });
+    }
+
+    /** Whether a DELETE has been sent. */
+    function deleteWasSent(): boolean {
+        const calls = (globalThis.fetch as ReturnType<typeof vi.fn>).mock.calls;
+        return calls.some(([, init]) => (init as RequestInit | undefined)?.method === 'DELETE');
+    }
+
+    it('says how much is indexed and offers to remove it', async () => {
+        respondWithIndex(indexed);
+        await renderSettings();
+
+        await waitFor(() => expect(reason()).toMatch(/2 files are indexed/i));
+        expect(removeButton()).toHaveAttribute('aria-disabled', 'false');
+    });
+
+    it('counts a single file as one file', async () => {
+        respondWithIndex({ ...indexed, indexed_files: 1 });
+        await renderSettings();
+
+        // Sloppy wording in something read constantly is worth one assertion.
+        await waitFor(() => expect(reason()).toMatch(/1 file is indexed/i));
+    });
+
+    it('asks for confirmation before removing anything', async () => {
+        respondWithIndex(indexed);
+        await renderSettings();
+        await waitFor(() => expect(reason()).toMatch(/2 files are indexed/i));
+
+        await fireEvent.click(removeButton());
+
+        // The confirmation is identified by its own action, not by prose that
+        // also appears in the section's description.
+        expect(screen.getByRole('button', { name: /yes, remove it/i })).toBeInTheDocument();
+        expect(deleteWasSent()).toBe(false);
+    });
+
+    it('reports what was removed, and that re-indexing waits for a session', async () => {
+        respondWithIndex(indexed);
+        await renderSettings();
+        await waitFor(() => expect(reason()).toMatch(/2 files are indexed/i));
+
+        await fireEvent.click(removeButton());
+        await fireEvent.click(screen.getByRole('button', { name: /yes, remove it/i }));
+
+        const outcome = await screen.findByRole('status');
+        expect(outcome).toHaveTextContent(/removed 2 indexed files/i);
+        expect(outcome).toHaveTextContent(/session next starts/i);
+    });
+
+    it('does not act when disabled, and says why where it can be read', async () => {
+        // The state the backend reports while a session is running.
+        respondWithIndex({
+            project: '/repos/mine',
+            indexed_files: 2,
+            can_delete: false,
+            blocked_reason: 'A session is running. Finish or stop the session first.'
+        });
+        await renderSettings();
+
+        // The reason is on the page rather than only in a tooltip, because
+        // keyboard and touch users never hover.
+        await waitFor(() => expect(reason()).toMatch(/a session is running/i));
+
+        const button = removeButton();
+        expect(button).toHaveAttribute('aria-disabled', 'true');
+        expect(button).toHaveAttribute('aria-describedby', 'index-delete-reason');
+
+        // Asserted as behaviour, not as an attribute: the button stays clickable
+        // on purpose so its explanation stays reachable, so what matters is that
+        // clicking it does nothing.
+        await fireEvent.click(button);
+
+        expect(screen.queryByRole('button', { name: /yes, remove it/i })).not.toBeInTheDocument();
+        expect(deleteWasSent()).toBe(false);
+    });
+
+    it('follows the repository path rather than describing the previous one', async () => {
+        // Two repositories with different indexes. The section must describe
+        // whichever is currently entered, because the remove button acts on that
+        // one — if they disagree, the count shown is about a project the button
+        // will not touch, and nothing says so.
+        vi.stubGlobal(
+            'fetch',
+            vi.fn(async (url: string) => {
+                const target = String(url);
+                if (target.includes('/index/status')) {
+                    const forSecond = target.includes('second');
+                    return {
+                        ok: true,
+                        json: async () => ({
+                            project: forSecond ? '/repos/second' : '/repos/first',
+                            indexed_files: forSecond ? 7 : 2,
+                            can_delete: true,
+                            blocked_reason: ''
+                        })
+                    } as unknown as Response;
+                }
+                if (target.includes('/repos/validate')) {
+                    return { ok: true, json: async () => ({ valid: true }) } as unknown as Response;
+                }
+                if (target.includes('/description')) {
+                    return {
+                        ok: true,
+                        json: async () => ({ dimensions: 768, context_length: 2048 })
+                    } as unknown as Response;
+                }
+                return { ok: true, json: async () => ['nomic-embed-text'] } as unknown as Response;
+            })
+        );
+
+        agentStore.updateConfig({ repoPath: '/repos/first' });
+        await renderSettings();
+        await waitFor(() => expect(reason()).toMatch(/2 files are indexed/i));
+
+        const input = screen.getByLabelText(/repository path/i);
+        await fireEvent.input(input, { target: { value: '/repos/second' } });
+        await fireEvent.blur(input);
+
+        await waitFor(() => expect(reason()).toMatch(/7 files are indexed/i));
+    });
+
+    it('surfaces a failure rather than looking as though it worked', async () => {
+        respondWithIndex(indexed, () => new Error('the database is unreachable'));
+        await renderSettings();
+        await waitFor(() => expect(reason()).toMatch(/2 files are indexed/i));
+
+        await fireEvent.click(removeButton());
+        await fireEvent.click(screen.getByRole('button', { name: /yes, remove it/i }));
+
+        expect(await screen.findByRole('alert')).toHaveTextContent(/was not removed/i);
+        expect(screen.queryByRole('status')).not.toBeInTheDocument();
     });
 });

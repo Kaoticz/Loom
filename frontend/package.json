@@ -41,6 +41,9 @@
         "vitest": "^4.1.10",
         "zod": "^3.24.1"
     },
+    "optionalDependencies": {
+        "playwright-core": "^1.62.1"
+    },
     "dependencies": {
         "@codemirror/lang-cpp": "^6.0.3",
         "@codemirror/lang-css": "^6.3.1",

@@ -8,6 +8,8 @@ from typing import Annotated, Any, ClassVar, Literal
 
 from pydantic import BaseModel, ConfigDict, Field
 
+from services.plan_parser import PlanFormat, PlanStep
+
 logger: Logger = getLogger(__name__)
 
 
@@ -131,7 +133,8 @@ class PlanEvent(BaseAgentEvent):
     """
 
     type: Annotated[Literal[AgentEventType.plan], Field()] = AgentEventType.plan
-    steps: Annotated[list[str], Field(default_factory=list)]
+    steps: Annotated[list[PlanStep], Field(default_factory=list)]
+    format: Annotated[PlanFormat, Field()] = PlanFormat.text
     requires_approval: Annotated[bool, Field()] = True
 
 

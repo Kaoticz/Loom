@@ -32,3 +32,34 @@ export const taskStatusStyles: Record<TaskStatus, string> = {
 export function taskStatusStyle(status: string): string {
     return taskStatusStyles[status as TaskStatus] ?? taskStatusStyles.initialized;
 }
+
+/**
+ * Read the steps out of a stored plan log entry.
+ *
+ * Task history is a record rather than derived data, so entries written before
+ * plans carried descriptions are still in the database holding plain strings.
+ * Both shapes have to be readable. Handling only the newer one filtered the
+ * older entries out completely, so an old task's plan rendered as nothing at all
+ * rather than as anything a reader could question.
+ *
+ * @param content The stored content of a plan entry.
+ * @returns One line per step, descriptions included where present.
+ */
+export function planEntrySteps(content: Record<string, unknown>): string[] {
+    const value = content.steps;
+
+    if (!Array.isArray(value)) return [];
+
+    return value.flatMap((step): string[] => {
+        if (typeof step === 'string') return [step];
+        if (step === null || typeof step !== 'object') return [];
+
+        const record = step as Record<string, unknown>;
+        const title = typeof record.title === 'string' ? record.title : '';
+
+        if (!title) return [];
+
+        const description = typeof record.description === 'string' ? record.description : '';
+        return [description ? `${title} — ${description}` : title];
+    });
+}

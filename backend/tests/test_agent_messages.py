@@ -36,6 +36,7 @@ from services.event_bus import (
     ToolObservationEvent,
     ToolStatus,
 )
+from services.plan_parser import PlanFormat, PlanStep
 
 ADAPTER: TypeAdapter[AgentMessage] = TypeAdapter(AgentMessage)
 
@@ -62,7 +63,7 @@ def test_every_message_type_is_defined() -> None:
     'event,expected',
     [
         (ThoughtEvent(content='thinking'), ThoughtMessage),
-        (PlanEvent(steps=['a', 'b']), PlanMessage),
+        (PlanEvent(steps=[PlanStep(title='a'), PlanStep(title='b')]), PlanMessage),
         (ToolActionEvent(tool_name='edit_file', arguments={'path': 'a.py'}), ActionMessage),
         (ToolObservationEvent(tool_name='edit_file', result='ok'), ObservationMessage),
         (CommitEvent(commit_hash='abc', message='m', files_changed=[]), CommitMessage),
@@ -131,7 +132,7 @@ def test_failure_status_survives_conversion() -> None:
     'event',
     [
         ThoughtEvent(content='thinking'),
-        PlanEvent(steps=['a']),
+        PlanEvent(steps=[PlanStep(title='a')]),
         ToolActionEvent(tool_name='t', arguments={}),
         ToolObservationEvent(tool_name='t', result='r'),
         CommitEvent(commit_hash='h', message='m', files_changed=[]),
@@ -356,3 +357,39 @@ def test_an_unlabelled_thought_stands_alone() -> None:
 
     assert isinstance(message, ThoughtMessage)
     assert message.stream_id is None
+
+
+def test_a_structured_plan_reaches_the_wire_as_structured() -> None:
+    """
+    Every field of a plan has to survive the conversion, not just the steps.
+
+    `format` was dropped here once. Nothing failed: the message was valid, the
+    steps were correct, and the field simply took its default of `text` — so
+    every structured plan arrived as plain text and rendered without its
+    descriptions. The feature was unreachable while the suite stayed green,
+    which is why this asserts the field rather than the shape.
+    """
+    event: PlanEvent = PlanEvent(
+        steps=[PlanStep(title='Add a timeout', description='In run_test_command.')],
+        format=PlanFormat.structured,
+    )
+
+    message = to_message(event)
+
+    assert isinstance(message, PlanMessage)
+    assert message.format is PlanFormat.structured
+    assert message.steps[0].description == 'In run_test_command.'
+
+
+def test_a_text_plan_reaches_the_wire_as_text() -> None:
+    """
+    The other direction of the same field, so neither value is assumed.
+    """
+    event: PlanEvent = PlanEvent(
+        steps=[PlanStep(title='Read the file')], format=PlanFormat.text
+    )
+
+    message = to_message(event)
+
+    assert isinstance(message, PlanMessage)
+    assert message.format is PlanFormat.text

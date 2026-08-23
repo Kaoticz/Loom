@@ -20,6 +20,7 @@ from services.symbol_patterns import build_rules, language_for
 from services.chunking import Chunk, SymbolSpan, build_chunks
 from services.indexing_progress import ProgressCallback, ProgressReporter
 from services.repository_files import list_indexable_files
+from services.projects import normalise_project_path
 from subprocess import CompletedProcess
 import asyncio
 
@@ -98,6 +99,20 @@ class IndexingService:
         self.repo_path = repo_path
         self.embedding = embedding
         self.chunk_lines = clamp_chunk_lines(chunk_lines)
+
+    @property
+    def project(self) -> str:
+        """
+        The project this service writes to.
+
+        Derived on each use rather than settled in the constructor: a session
+        repoints `repo_path` when a start message names a repository, and a
+        project cached before that would have every row written under the
+        previous repository's name.
+
+        :returns: The normalised path identifying the current project.
+        """
+        return normalise_project_path(self.repo_path)
 
     async def index_repository(self, progress_callback: ProgressCallback | None = None) -> None:
         """
@@ -181,6 +196,7 @@ class IndexingService:
             file_obj: File
             created: bool
             file_obj, created = await File.get_or_create(
+                project=self.project,
                 file_path=rel_path,
                 defaults={'raw_content': content, 'hash': file_hash}
             )
@@ -234,6 +250,11 @@ class IndexingService:
             )
 
         if model.dimensions != dimensions or model.chunk_lines != recorded_chunking:
+            # Both are deliberately unscoped. The model's embeddings are
+            # dropped for every project, so every project's files have to be
+            # re-embedded; scoping the hash reset to the current project would
+            # leave the others with no embeddings and unchanged hashes, so their
+            # next index would skip them and they would stay silently empty.
             await CodeEmbedding.filter(model=model).delete()
             await File.all().update(hash='')
             model.dimensions = dimensions
