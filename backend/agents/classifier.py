@@ -62,6 +62,7 @@ classifier_agent: Agent[None, ClassificationResult] = Agent(
     deps_type=type(None),
     output_type=ClassificationResult,
     system_prompt=CLASSIFIER_SYSTEM_PROMPT,
+    retries=5,
 )
 
 

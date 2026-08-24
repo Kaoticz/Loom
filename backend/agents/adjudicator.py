@@ -44,6 +44,7 @@ adjudicator_agent: Agent[None, AdjudicationResult] = Agent(
     deps_type=type(None),
     output_type=AdjudicationResult,
     system_prompt=ADJUDICATOR_SYSTEM_PROMPT,
+    retries=5,
 )
 
 

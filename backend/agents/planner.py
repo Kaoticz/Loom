@@ -65,6 +65,7 @@ planner_agent: Agent[None, StructuredPlan] = Agent(
     deps_type=type(None),
     output_type=StructuredPlan,
     system_prompt=PLANNER_SYSTEM_PROMPT,
+    retries=5,
 )
 """
 The planner.

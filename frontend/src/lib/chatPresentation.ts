@@ -40,7 +40,7 @@ export const typeStyles: Record<MessageType, string> = {
     thought: 'bg-gray-50 border-gray-200 text-gray-600 italic',
     action: 'bg-yellow-50 border-yellow-200 text-yellow-800 font-mono text-xs',
     observation: 'bg-green-50 border-green-200 text-green-800 font-mono text-xs',
-    plan: 'bg-purple-50 border-purple-200 text-purple-800',
+    plan: 'bg-purple-50 border-purple-200 text-purple-800 dark:border-purple-800 dark:bg-purple-950/30 dark:text-purple-200',
     review: 'bg-orange-50 border-orange-200 text-orange-800',
     commit: 'bg-slate-50 border-slate-200 text-slate-600 font-mono text-xs',
     done: 'bg-green-100 border-green-300 text-green-900 font-bold',

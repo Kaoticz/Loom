@@ -46,4 +46,5 @@ reviewer_agent: Agent[None, ReviewResult] = Agent(
     deps_type=type(None),
     output_type=ReviewResult,
     system_prompt=REVIEWER_SYSTEM_PROMPT,
+    retries=5,
 )

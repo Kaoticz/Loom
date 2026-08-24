@@ -183,6 +183,7 @@ coder_agent: Agent[AgentDeps, str] = Agent(
     deps_type=AgentDeps,
     output_type=str,
     system_prompt=CODER_SYSTEM_PROMPT,
+    retries=5,
 )
 
 
@@ -711,6 +712,7 @@ answering_agent: Agent[AgentDeps, str] = Agent(
     deps_type=AgentDeps,
     output_type=str,
     system_prompt=CODER_SYSTEM_PROMPT,
+    retries=5,
 )
 """
 The agent used for a task classified as requiring no file changes.
