@@ -11,7 +11,7 @@ from agents.classifier import (
 from agents.coder import AgentDeps, answering_agent, coder_agent
 from agents.reviewer import ReviewResult, reviewer_agent
 from fastapi import WebSocket
-from pydantic_ai import Agent, RunContext
+from pydantic_ai import Agent, RunContext, UsageLimits
 from pydantic_ai.agent import AgentRunResult
 from pydantic_ai.messages import (
     AgentStreamEvent,
@@ -639,6 +639,7 @@ class AgentSession:
             deps=self._deps,
             model=resolve_model(self._coder_model),
             event_stream_handler=stream_thoughts,
+            usage_limits=UsageLimits(request_limit=None),
         )
 
         remaining: str | None = buffer.flush()
@@ -668,6 +669,7 @@ class AgentSession:
             verdict: AgentRunResult[ClassificationResult] = await classifier_agent.run(
                 build_classification_prompt(self._task),
                 model=resolve_model(self._reviewer_model),
+                usage_limits=UsageLimits(request_limit=None),
             )
         except Exception as error:
             # Guessing either way is worse than stopping: guessing "no changes"
@@ -849,7 +851,9 @@ class AgentSession:
         """
         try:
             result: AgentRunResult[StructuredPlan] = await planner_agent.run(
-                prompt, model=resolve_model(self._coder_model)
+                prompt,
+                model=resolve_model(self._coder_model),
+                usage_limits=UsageLimits(request_limit=None),
             )
         except Exception as error:
             logger.warning('Structured planning failed, falling back to text: %s', error)
@@ -876,7 +880,10 @@ class AgentSession:
         :returns: The agent's output.
         """
         result: AgentRunResult[str] = await coder_agent.run(
-            prompt, deps=self._deps, model=resolve_model(self._coder_model)
+            prompt,
+            deps=self._deps,
+            model=resolve_model(self._coder_model),
+            usage_limits=UsageLimits(request_limit=None),
         )
         return result.output
 
@@ -1009,7 +1016,8 @@ class AgentSession:
             build_review_prompt(
                 self._task, changes, diffs, omitted=omitted, previous_feedback=previous
             ),
-            model=resolve_model(self._reviewer_model)
+            model=resolve_model(self._reviewer_model),
+            usage_limits=UsageLimits(request_limit=None),
         )
         self._last_review = review.output
         return SessionState.waiting_review_approval
