@@ -15,7 +15,7 @@ describe('chat presentation', () => {
     it('styles every message type that reaches the feed', () => {
         // Types the store consumes into state rather than rendering as a
         // bubble: `diff` feeds the diff viewer, `sandbox_unavailable` the banner.
-        const CONSUMED_WITHOUT_DISPLAY = ['diff', 'sandbox_unavailable'];
+        const CONSUMED_WITHOUT_DISPLAY = ['diff', 'sandbox_unavailable', 'context_usage'];
 
         // The union's own discriminator values, so a new message type added to
         // the protocol fails here rather than rendering unstyled.

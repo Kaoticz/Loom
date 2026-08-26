@@ -116,6 +116,19 @@ const warningMessageSchema = z.object({
     content: z.string()
 });
 
+/**
+ * How full the model's context is, as counts rather than a rendered string.
+ *
+ * Consumed as status rather than shown in the feed: one line per request would
+ * bury the conversation in a number that is only interesting at a glance.
+ */
+const contextUsageMessageSchema = z.object({
+    type: z.literal('context_usage'),
+    used_tokens: z.number().int().nonnegative(),
+    window_tokens: z.number().int().positive(),
+    resolved: z.boolean().default(true)
+});
+
 const sessionBusyMessageSchema = z.object({
     type: z.literal('session_busy'),
     content: z.string(),
@@ -183,6 +196,7 @@ export const agentMessageSchema = z.discriminatedUnion('type', [
     questionMessageSchema,
     errorMessageSchema,
     warningMessageSchema,
+    contextUsageMessageSchema,
     sessionBusyMessageSchema,
     systemMessageSchema,
     sandboxUnavailableMessageSchema

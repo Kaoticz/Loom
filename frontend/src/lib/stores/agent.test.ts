@@ -1411,3 +1411,47 @@ describe('warnings do not end the session', () => {
         expect(get(store).status).toBe('failed');
     });
 });
+
+describe('context usage', () => {
+    it('records both readings without adding to the feed', async () => {
+        const { store, socket } = await connected();
+
+        socket.deliver({
+            type: 'context_usage',
+            used_tokens: 79_400,
+            window_tokens: 128_048,
+            resolved: true
+        });
+
+        const state = get(store);
+        expect(state.contextUsage).toEqual({
+            usedTokens: 79_400,
+            windowTokens: 128_048,
+            resolved: true
+        });
+        // A line per request would bury the conversation.
+        expect(state.messages).toHaveLength(0);
+    });
+
+    it('replaces the previous reading rather than accumulating', async () => {
+        const { store, socket } = await connected();
+
+        socket.deliver({ type: 'context_usage', used_tokens: 1_000, window_tokens: 128_048 });
+        socket.deliver({ type: 'context_usage', used_tokens: 2_000, window_tokens: 128_048 });
+
+        expect(get(store).contextUsage?.usedTokens).toBe(2_000);
+    });
+
+    it('carries the unresolved flag so a guess can be shown as one', async () => {
+        const { store, socket } = await connected();
+
+        socket.deliver({
+            type: 'context_usage',
+            used_tokens: 500,
+            window_tokens: 200_000,
+            resolved: false
+        });
+
+        expect(get(store).contextUsage?.resolved).toBe(false);
+    });
+});

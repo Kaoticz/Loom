@@ -16,18 +16,19 @@ from pydantic_ai_harness.compaction import (
     ClampOversizedMessages,
     ClearToolResults,
     DeduplicateFileReads,
+    SlidingWindowCompaction,
     SummarizingCompaction,
     TieredCompaction,
 )
 
 from services.compaction import (
+    IRRECOVERABLE_TOOLS,
+    KEEP_RECENT_TOOL_PAIRS,
     DEFAULT_CONTEXT_WINDOW,
     MINIMUM_CONTEXT_WINDOW,
     TARGET_FRACTION,
     build_compaction,
     read_file_key,
-    MAX_REPLY_TOKENS,
-    response_allowance,
     resolve_context_window,
 )
 
@@ -153,11 +154,9 @@ def test_the_budget_leaves_headroom_below_the_window() -> None:
     """
     compaction: TieredCompaction[Any] = build_compaction(10_000)
 
-    assert compaction.target_tokens is not None
-    assert compaction.target_tokens <= int(10_000 * TARGET_FRACTION)
-    # The gap has to be big enough to answer in, or the model runs out of room
-    # to generate and returns nothing at all.
-    assert 10_000 - compaction.target_tokens >= response_allowance(10_000)
+    assert compaction.target_fraction == TARGET_FRACTION
+    assert TARGET_FRACTION < 1.0, 'the whole window leaves nothing to reply with'
+    assert compaction.context_window == 10_000
 
 
 def test_the_budget_is_absolute_rather_than_a_fraction() -> None:
@@ -170,8 +169,10 @@ def test_the_budget_is_absolute_rather_than_a_fraction() -> None:
     """
     compaction: TieredCompaction[Any] = build_compaction(16_384)
 
-    assert compaction.target_tokens is not None
-    assert compaction.target_fraction is None
+    # Stated rather than left to resolve: the fraction is otherwise taken of
+    # whatever a model registry reports, and a locally-hosted model is not in it.
+    assert compaction.context_window == 16_384
+    assert compaction.target_fraction == TARGET_FRACTION
 
 
 def test_the_tiers_run_cheapest_first() -> None:
@@ -188,20 +189,26 @@ def test_the_tiers_run_cheapest_first() -> None:
         DeduplicateFileReads.__name__,
         ClampOversizedMessages.__name__,
         ClearToolResults.__name__,
+        SummarizingCompaction.__name__,
+        SlidingWindowCompaction.__name__,
     ]
 
 
-def test_no_tier_calls_a_model() -> None:
+def test_the_expensive_tiers_sit_behind_the_free_ones() -> None:
     """
-    `SummarizingCompaction` is deliberately absent.
+    Summarizing costs a real model call, so everything free is tried first.
 
-    It costs a real model call, which is the expense compaction exists to
-    avoid, and it would run against the same local model that is already
-    struggling for room.
+    It is present rather than omitted: a long ReAct loop eventually exceeds what
+    blanking and deduplication can reclaim, and compressing old context beats
+    discarding it. The sliding window sits behind even that, as the floor which
+    guarantees the history comes under target however the earlier tiers fare.
     """
-    compaction: TieredCompaction[Any] = build_compaction(None)
+    tiers: list[str] = [type(tier).__name__ for tier in build_compaction(None).tiers]
 
-    assert not any(isinstance(tier, SummarizingCompaction) for tier in compaction.tiers)
+    assert tiers.index(SummarizingCompaction.__name__) > tiers.index(ClearToolResults.__name__)
+    assert tiers.index(SlidingWindowCompaction.__name__) > tiers.index(
+        SummarizingCompaction.__name__
+    )
 
 
 def test_a_single_message_may_not_fill_the_window() -> None:
@@ -212,7 +219,7 @@ def test_a_single_message_may_not_fill_the_window() -> None:
     clamp: Any = compaction.tiers[1]
 
     assert clamp.max_part_tokens is not None
-    assert clamp.max_part_tokens < compaction.target_tokens
+    assert clamp.max_part_tokens < int(64_000 * TARGET_FRACTION)
 
 
 def test_clamping_keeps_both_ends_of_a_message() -> None:
@@ -392,19 +399,25 @@ def history_with_an_answer(reads: int, body: str, answer: str) -> list[ModelMess
     return messages
 
 
-async def test_a_users_answer_is_never_cleared() -> None:
+async def test_a_users_answer_survives_the_blanking_tiers() -> None:
     """
     Everything else compaction drops can be fetched again; an answer cannot.
 
-    Blanking it leaves the agent having stopped the task to ask, been told, and
-    then forgotten — so it asks again, stopping the task twice, or guesses at
-    something it was explicitly told.
+    `exclude_tools` protects it from `ClearToolResults`, which is the tier that
+    would otherwise reach it in an ordinary long run. It cannot protect it from
+    `SlidingWindowCompaction`, which discards whole messages by age and is the
+    last resort — so this asserts what the blanking tiers do, not an absolute
+    guarantee across the whole ladder.
     """
     answer: str = 'The user replied: use exponential backoff with a 30s cap.'
     messages: list[ModelMessage] = history_with_an_answer(40, 'y' * 4_000, answer)
-    compaction: TieredCompaction[Any] = build_compaction(2_048)
+    blanking: ClearToolResults[Any] = ClearToolResults(
+        max_tokens=1_000,
+        keep_pairs=KEEP_RECENT_TOOL_PAIRS,
+        exclude_tools=IRRECOVERABLE_TOOLS,
+    )
 
-    result: list[ModelMessage] = await compaction.compact(messages, run_context(quiet_model()))
+    result: list[ModelMessage] = await blanking.compact(messages, run_context(quiet_model()))
 
     answers: list[str] = [
         str(part.content)
@@ -435,36 +448,6 @@ async def test_old_file_reads_are_still_cleared_around_an_answer() -> None:
     assert any('y' * 4_000 not in content for content in reads), 'nothing was reclaimed'
 
 
-@pytest.mark.parametrize('window', [2_048, 4_096, 8_192, 32_768, 128_048, 1_000_000])
-def test_a_reply_budget_never_grows_with_the_window(window: int) -> None:
-    """
-    How long one answer may be does not depend on how much history fits.
-
-    Derived from the window, a 128,048-token setting produced a 38,415-token
-    reply budget — meaningless as an answer, and larger than the room actually
-    left to generate into, so the model returned nothing at all and the run
-    failed reporting that very number.
-    """
-    assert response_allowance(window) <= MAX_REPLY_TOKENS
-
-
-@pytest.mark.parametrize('window', [2_048, 4_096, 8_192, 32_768, 128_048, 1_000_000])
-def test_every_window_leaves_room_to_answer_in(window: int) -> None:
-    """
-    A small window is where this bites: 30% of very little is not enough.
-
-    Filling the window to the brim does not fail loudly. The model returns an
-    empty response with a length finish reason, which surfaces as "token limit
-    exceeded before any response was generated".
-    """
-    compaction: TieredCompaction[Any] = build_compaction(window)
-    allowance: int = response_allowance(window)
-
-    assert compaction.target_tokens is not None
-    assert compaction.target_tokens > 0
-    assert compaction.target_tokens + allowance <= window
-
-
 def test_the_model_is_told_the_window_it_is_budgeted_against() -> None:
     """
     The setting has to reach the model, not just the compaction arithmetic.
@@ -479,4 +462,81 @@ def test_the_model_is_told_the_window_it_is_budgeted_against() -> None:
     settings: Any = model_settings(8_192)
 
     assert settings['extra_body']['options']['num_ctx'] == 8_192
-    assert settings['max_tokens'] == response_allowance(8_192)
+    # max_tokens is deliberately absent. Setting it only decided which number
+    # appeared in "token limit exceeded before any response was generated"; the
+    # prompt filling the window is what caused it, whatever the reply cap was.
+    assert 'max_tokens' not in settings
+
+
+def test_an_overflow_failure_is_recognised() -> None:
+    """
+    This failure is the only evidence Loom gets that a window is optimistic.
+
+    A locally-hosted model may be clamped to whatever it was trained for, whoever
+    configured what, and there is no way to ask it how much room it really has.
+    """
+    from pydantic_ai.exceptions import UnexpectedModelBehavior
+
+    from services.compaction import looks_like_no_room_to_answer
+
+    overflow = UnexpectedModelBehavior(
+        'Model token limit (8192) exceeded before any response was generated.'
+    )
+    unrelated = UnexpectedModelBehavior("Tool 'edit_file' exceeded max retries count of 5.")
+
+    assert looks_like_no_room_to_answer(overflow) is True
+    assert looks_like_no_room_to_answer(unrelated) is False
+
+
+def test_narrowing_closes_the_gap_and_then_stops() -> None:
+    """
+    Halving converges on a real window without anyone knowing the figure.
+
+    It has to stop somewhere, or a model that fails for an unrelated reason
+    would be retried down to a window too small to hold a prompt at all.
+    """
+    from services.compaction import narrowed_window
+
+    window: int = 128_048
+    seen: list[int] = []
+    for _ in range(20):
+        window = narrowed_window(window)
+        seen.append(window)
+
+    assert seen[0] == 64_024
+    assert seen[1] == 32_012
+    assert min(seen) == MINIMUM_CONTEXT_WINDOW
+    assert narrowed_window(MINIMUM_CONTEXT_WINDOW) == MINIMUM_CONTEXT_WINDOW
+
+
+def test_usage_is_measured_against_the_configured_window() -> None:
+    """
+    Usage is reported, not estimated by us and not left unknown.
+
+    `ReportContextUsage` reuses the same estimator and the same window the
+    compaction uses, so a reading cannot disagree with the budget it describes,
+    and each reading carries `resolved` so a percentage taken against a fallback
+    window can say that it is a guess.
+    """
+    from services.compaction import build_usage_monitor
+
+    async def noop(usage: object) -> None:
+        return None
+
+    monitor = build_usage_monitor(48_000, noop)
+
+    assert monitor.context_window == 48_000
+
+
+def test_every_requested_capability_is_present() -> None:
+    """
+    All five, on the ladder, in the order that spends the least first.
+    """
+    tiers = {type(tier).__name__ for tier in build_compaction(None).tiers}
+
+    assert {
+        'DeduplicateFileReads',
+        'ClearToolResults',
+        'SummarizingCompaction',
+        'SlidingWindowCompaction',
+    } <= tiers

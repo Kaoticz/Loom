@@ -11,6 +11,7 @@
         "done",
         "error",
         "warning",
+        "context_usage",
         "session_busy",
         "question",
         "system",

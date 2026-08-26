@@ -4,7 +4,7 @@ import os
 
 from pydantic_ai.models.openai import OpenAIChatModel, OpenAIChatModelSettings
 
-from services.compaction import resolve_context_window, response_allowance
+from services.compaction import resolve_context_window
 from pydantic_ai.providers.openai import OpenAIProvider
 
 
@@ -12,12 +12,15 @@ def model_settings(context_window: int | None) -> OpenAIChatModelSettings:
     """
     Build the per-run settings that keep a model inside its window.
 
-    Two things are set, and both matter for a locally-hosted model.
-
-    `max_tokens` bounds the reply. Without it the provider's own default applies,
-    and if the prompt has filled the window there is no room left to generate
-    into — which does not fail loudly but returns an empty response, surfacing as
-    "token limit exceeded before any response was generated".
+    `max_tokens` is deliberately not set. It was, twice, and each time the
+    resulting failure quoted whichever number had been chosen — which made it
+    look causal when it never was. "Exceeded before any response was generated"
+    means the prompt had already filled the model's real context window, leaving
+    nothing to generate into; that happens whatever the reply cap is. Setting it
+    only decided which number appeared in the message. The provider's own default
+    is left in place, and the prompt is kept small enough to answer in by
+    `AgentSession`, which narrows its working window whenever this failure shows
+    the configured one to be optimistic.
 
     `num_ctx` tells Ollama how large a window to actually allocate. Ollama
     defaults it low, often 4096, regardless of what the model could hold. Until
@@ -31,7 +34,6 @@ def model_settings(context_window: int | None) -> OpenAIChatModelSettings:
     :returns: The settings to pass to a run.
     """
     return OpenAIChatModelSettings(
-        max_tokens=response_allowance(context_window),
         extra_body={'options': {'num_ctx': resolve_context_window(context_window)}},
     )
 

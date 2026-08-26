@@ -13,6 +13,7 @@ from schemas.agent_messages import (
     DoneMessage,
     ErrorMessage,
     WarningMessage,
+    ContextUsageMessage,
     MessageType,
     ObservationMessage,
     PlanMessage,
@@ -29,6 +30,7 @@ from services.event_bus import (
     DoneEvent,
     ErrorEvent,
     WarningEvent,
+    ContextUsageEvent,
     PlanEvent,
     INDEXING_PROGRESS_KEY,
     ReviewEvent,
@@ -53,6 +55,8 @@ def test_every_message_type_is_defined() -> None:
         # Something failed but the session is still running, so it must not be
         # rendered like an error, which means the session is over.
         'warning',
+        # Counts for a gauge, consumed as status rather than shown in the feed.
+        'context_usage',
         # Not produced from an event: sent directly when a connection is refused.
         'session_busy',
         # Loom talking about the session, as opposed to the model reasoning.
@@ -77,6 +81,10 @@ def test_every_message_type_is_defined() -> None:
         (DoneEvent(summary='done'), DoneMessage),
         (ErrorEvent(content='boom'), ErrorMessage),
         (WarningEvent(content='could not commit'), WarningMessage),
+        (
+            ContextUsageEvent(used_tokens=79_400, window_tokens=128_048),
+            ContextUsageMessage,
+        ),
     ],
     ids=lambda value: type(value).__name__,
 )

@@ -1,12 +1,17 @@
 from __future__ import annotations
 
+from collections.abc import Awaitable, Callable
 from typing import Any
 
 from pydantic_ai.messages import ToolCallPart
 from pydantic_ai_harness.compaction import (
     ClampOversizedMessages,
     ClearToolResults,
+    ContextUsage,
     DeduplicateFileReads,
+    ReportContextUsage,
+    SlidingWindowCompaction,
+    SummarizingCompaction,
     TieredCompaction,
 )
 
@@ -64,6 +69,15 @@ and a search re-run, so dropping the result costs time at worst. A user's answer
 cannot. Blanking it leaves the agent having stopped the task to ask a question,
 received an answer, and then forgotten it — so it either asks again, stopping the
 task a second time, or guesses at something it was explicitly told.
+"""
+
+KEEP_RECENT_MESSAGES: int = 20
+"""
+How many recent messages the summarizing and sliding tiers keep verbatim.
+
+The tail is where the agent is working. Summarising or discarding it would take
+away the step it is part way through, which is the one part of the history it
+cannot do without.
 """
 
 KEEP_RECENT_TOOL_PAIRS: int = 5
@@ -157,6 +171,37 @@ def response_allowance(context_window: int | None) -> int:
     return min(MAX_REPLY_TOKENS, window - compaction_target(window))
 
 
+def looks_like_no_room_to_answer(error: Exception) -> bool:
+    """
+    Recognise a run that ended because the prompt filled the model's window.
+
+    The model produced nothing and stopped for length, which means the context
+    was already full before generation began. Loom cannot ask a model how large
+    its window really is — a locally-hosted one may be clamped to whatever it was
+    trained for, whatever the server permits — so this failure is the only
+    reliable evidence that the configured window is optimistic.
+
+    :param error: The exception that ended the run.
+    :returns: True if the prompt left no room for a reply.
+    """
+    message: str = str(error).lower()
+    return 'token limit' in message and 'before any response' in message
+
+
+def narrowed_window(context_window: int | None) -> int:
+    """
+    Halve the working window after a run found it too large.
+
+    Halving rather than stepping down: the gap between a configured window and a
+    real one is usually a factor, not a margin — 128k configured against a 32k
+    model — so a small decrement would take many failed runs to close.
+
+    :param context_window: The window that proved too large.
+    :returns: A smaller window, never below the minimum worth honouring.
+    """
+    return max(resolve_context_window(context_window) // 2, MINIMUM_CONTEXT_WINDOW)
+
+
 def resolve_context_window(configured: int | None) -> int:
     """
     Settle on the context window to budget against.
@@ -171,49 +216,88 @@ def resolve_context_window(configured: int | None) -> int:
 
 def build_compaction(context_window: int | None) -> TieredCompaction[Any]:
     """
-    Build the compaction pipeline for one agent run.
+    Build the compaction ladder for one agent run.
 
-    `target_tokens` is derived here rather than left to `target_fraction`,
-    because the fraction is resolved against whatever window the `genai-prices`
-    registry reports for the model. A locally-hosted Ollama model is not in that
-    registry, and its identifier may well name someone else's deployment, so the
-    resolved window would be a guess. The library's `context_window` override
-    does not help either: it is consulted only alongside `target_fraction`.
-    Passing an absolute `target_tokens` takes the registry out of the path
-    entirely.
+    Ordered cheapest to most expensive, stopping as soon as the history fits:
 
-    Tiers run cheap-to-expensive and stop as soon as the history fits.
-    `SummarizingCompaction` is deliberately absent: it costs a real model call,
-    which is the one thing compaction is supposed to save.
+    1. `DeduplicateFileReads` — a superseded read is redundant rather than old,
+       so dropping it costs nothing at all.
+    2. `ClampOversizedMessages` — one runaway result can cause the overrun by
+       itself, and trimming it alone may be enough.
+    3. `ClearToolResults` — tool output dominates an agent's history, and the
+       agent can re-run a tool if it needs the data again. This is the tier that
+       does the real work in a long ReAct loop.
+    4. `SummarizingCompaction` — compresses rather than discards, at the cost of
+       a real model call, so it sits behind the free tiers.
+    5. `SlidingWindowCompaction` — a hard floor. If summarizing still cannot
+       bring the history under target, the oldest turns go, with the first user
+       message kept so the task itself is never lost.
+
+    The budget is expressed as a fraction of the window rather than an absolute
+    token count, and the window is stated explicitly. Stating it matters: left
+    to resolve itself, the fraction is taken of whatever a model registry
+    reports, and a locally-hosted model is not in that registry.
 
     :param context_window: The configured window in tokens, or None for the default.
     :returns: The capability to pass to a single `Agent.run()`.
     """
     window: int = resolve_context_window(context_window)
-    target: int = compaction_target(window)
 
     return TieredCompaction(
         tiers=[
-            # Cheapest first: a superseded file read is redundant rather than
-            # merely old, so dropping it costs the agent nothing at all.
             DeduplicateFileReads(file_key=read_file_key),
-            # Then trim anything individually enormous, which may be enough on
-            # its own when one large result caused the overrun.
             ClampOversizedMessages(
                 max_part_tokens=max(MINIMUM_CONTEXT_WINDOW // 2, window // OVERSIZED_PART_DIVISOR),
                 keep_head_chars=CLAMP_KEEP_HEAD_CHARS,
                 keep_tail_chars=CLAMP_KEEP_TAIL_CHARS,
             ),
-            # Last, and most lossy: blank old tool results outright. The
-            # `max_tokens` trigger is never consulted, because `TieredCompaction`
-            # drives its tiers directly and decides when to stop; the constructor
-            # requires one regardless, so it is set to the same budget rather
-            # than to a number that would contradict it if it ever were read.
             ClearToolResults(
-                max_tokens=target,
+                max_fraction=TARGET_FRACTION,
+                context_window=window,
                 keep_pairs=KEEP_RECENT_TOOL_PAIRS,
                 exclude_tools=IRRECOVERABLE_TOOLS,
             ),
+            SummarizingCompaction(
+                max_fraction=TARGET_FRACTION,
+                context_window=window,
+                keep_messages=KEEP_RECENT_MESSAGES,
+                # Inherits the running agent's model, so a summary is written by
+                # whatever the user configured rather than by a second choice.
+                model=None,
+            ),
+            SlidingWindowCompaction(
+                max_fraction=TARGET_FRACTION,
+                context_window=window,
+                keep_messages=KEEP_RECENT_MESSAGES,
+                preserve_first_user_message=True,
+            ),
         ],
-        target_tokens=target,
+        target_fraction=TARGET_FRACTION,
+        context_window=window,
+    )
+
+
+def build_usage_monitor(
+    context_window: int | None,
+    on_usage: Callable[[ContextUsage], Awaitable[None]],
+) -> ReportContextUsage:
+    """
+    Build the capability that reports how full the context actually is.
+
+    Registered after the compaction ladder, so what it reports is the corrected
+    history for the request about to be sent rather than what triggered the
+    compaction.
+
+    This is measurement rather than estimation. It reuses the same estimator and
+    the same window the compaction uses, and its readings carry `resolved`,
+    which is False when the window is a fallback rather than the model's own —
+    so a reading that is a guess can say so instead of being mistaken for fact.
+
+    :param context_window: The configured window in tokens, or None for the default.
+    :param on_usage: Called with each reading.
+    :returns: The monitoring capability.
+    """
+    return ReportContextUsage(
+        on_usage=on_usage,
+        context_window=resolve_context_window(context_window),
     )

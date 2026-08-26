@@ -639,7 +639,9 @@ async def test_the_coder_run_carries_the_configured_budget(
     await session._handle_executing()
 
     assert windows == [40_000]
-    assert build_compaction(windows[0]).target_tokens == int(40_000 * TARGET_FRACTION)
+    # The ladder is budgeted as a fraction of a stated window, so the window is
+    # what has to arrive intact.
+    assert build_compaction(windows[0]).context_window == 40_000
 
 
 async def test_an_unset_budget_still_compacts(
@@ -661,9 +663,7 @@ async def test_an_unset_budget_still_compacts(
     await session._handle_executing()
 
     assert windows == [0]
-    assert build_compaction(windows[0]).target_tokens == int(
-        DEFAULT_CONTEXT_WINDOW * TARGET_FRACTION
-    )
+    assert build_compaction(windows[0]).context_window == DEFAULT_CONTEXT_WINDOW
 
 
 def quiet_model() -> FunctionModel:
@@ -1644,3 +1644,204 @@ async def test_an_established_command_reaches_the_whole_task_prompt(
     session._session.record_test_command('npm test')
 
     assert 'npm test' in session._build_step_prompt(None, 1, 1)
+
+
+async def test_a_window_too_large_is_narrowed_and_the_run_retried(
+    monkeypatch: pytest.MonkeyPatch, git_repo: GitManagerService
+) -> None:
+    """
+    The configured window is a claim Loom cannot check, so it reacts instead.
+
+    A model may be clamped to whatever it was trained for regardless of what the
+    server permits, and there is no way to ask it. Failing the session over a
+    number the user could only have guessed at loses the step for nothing.
+    """
+    from pydantic_ai.exceptions import UnexpectedModelBehavior
+
+    from services.event_bus import WarningEvent
+
+    session, events = prepare(monkeypatch, [], git_repo)
+    session._coder_context_window = 128_048
+    session._session.record_classification(True)
+
+    import agents.coder as coder_module
+
+    attempts: list[int] = []
+    original = coder_module.coder_agent.run
+
+    async def overflow_once(*args: Any, **kwargs: Any) -> Any:
+        attempts.append(session._coder_context_window)
+        if len(attempts) == 1:
+            raise UnexpectedModelBehavior(
+                'Model token limit (8192) exceeded before any response was generated.'
+            )
+        return await original(*args, **kwargs)
+
+    monkeypatch.setattr(agent_session_module, 'resolve_model', lambda name: quiet_model())
+    monkeypatch.setattr(coder_module.coder_agent, 'run', overflow_once)
+
+    await session._handle_executing()
+
+    assert attempts == [128_048, 64_024], 'the retry did not use a narrower window'
+    warnings = [event for event in events if isinstance(event, WarningEvent)]
+    assert warnings, 'the user was not told the window was too large'
+    assert 'smaller than' in warnings[0].content
+
+
+async def test_an_unrelated_model_failure_is_not_retried(
+    monkeypatch: pytest.MonkeyPatch, git_repo: GitManagerService
+) -> None:
+    """
+    Narrowing on any failure would retry a broken run down to a useless window.
+    """
+    from pydantic_ai.exceptions import UnexpectedModelBehavior
+
+    session, _ = prepare(monkeypatch, [], git_repo)
+    session._session.record_classification(True)
+
+    import agents.coder as coder_module
+
+    attempts: list[int] = []
+
+    async def always_fails(*args: Any, **kwargs: Any) -> Any:
+        attempts.append(1)
+        raise UnexpectedModelBehavior("Tool 'edit_file' exceeded max retries count of 5.")
+
+    monkeypatch.setattr(agent_session_module, 'resolve_model', lambda name: quiet_model())
+    monkeypatch.setattr(coder_module.coder_agent, 'run', always_fails)
+
+    with pytest.raises(UnexpectedModelBehavior):
+        await session._handle_executing()
+
+    assert len(attempts) == 1, 'an unrelated failure should not be retried'
+
+
+async def test_an_unworkable_window_is_explained_before_the_first_step(
+    monkeypatch: pytest.MonkeyPatch, git_repo: GitManagerService
+) -> None:
+    """
+    The check existed and was never called, so nobody was ever told.
+
+    The provider's own error names neither the window nor what filled it, so a
+    run that cannot possibly work reads as a bug in Loom rather than as a
+    setting to change.
+    """
+    from services.event_bus import WarningEvent
+
+    session, events = prepare(monkeypatch, [], git_repo)
+    session._plan = three_step_plan()
+    session._coder_context_window = 4_096
+    monkeypatch.setattr(agent_session_module, 'resolve_model', lambda name: quiet_model())
+
+    await session._handle_executing()
+
+    warnings = [event for event in events if isinstance(event, WarningEvent)]
+    assert warnings, 'an unworkable window was not reported at all'
+    assert 'instructions and tool definitions' in warnings[0].content
+    assert 'practical minimum' in warnings[0].content or 'minimum' in warnings[0].content
+
+
+async def test_a_workable_window_is_not_complained_about(
+    monkeypatch: pytest.MonkeyPatch, git_repo: GitManagerService
+) -> None:
+    """
+    A warning on every run would train the user to ignore it.
+    """
+    from services.event_bus import WarningEvent
+
+    session, events = prepare(monkeypatch, [], git_repo)
+    session._plan = three_step_plan()
+    session._coder_context_window = 64_000
+    monkeypatch.setattr(agent_session_module, 'resolve_model', lambda name: quiet_model())
+
+    await session._handle_executing()
+
+    complaints = [
+        event
+        for event in events
+        if isinstance(event, WarningEvent) and 'tool definitions' in event.content
+    ]
+    assert complaints == []
+
+
+async def test_narrowing_stops_once_it_cannot_help(
+    monkeypatch: pytest.MonkeyPatch, git_repo: GitManagerService
+) -> None:
+    """
+    Halving five times and failing identically each time is not progress.
+
+    Every request carries the instructions and tool schemas whatever the window
+    is. Below that floor the model has nowhere to put the work, so narrowing
+    again would fail the same way while looking like it were doing something.
+    """
+    from services.event_bus import WarningEvent
+
+    session, events = prepare(monkeypatch, [], git_repo)
+    session._coder_context_window = 8_003
+
+    narrowed: bool = await session._narrow_after_overflow(8_003)
+
+    assert narrowed is False, 'narrowing should have stopped'
+    warnings = [event for event in events if isinstance(event, WarningEvent)]
+    assert warnings
+    assert 'instructions and tool definitions' in warnings[-1].content
+
+
+async def test_narrowing_still_happens_while_it_can_help(
+    monkeypatch: pytest.MonkeyPatch, git_repo: GitManagerService
+) -> None:
+    """
+    The floor must not stop a narrowing that would have worked.
+    """
+    session, _ = prepare(monkeypatch, [], git_repo)
+    session._coder_context_window = 128_048
+
+    assert await session._narrow_after_overflow(128_048) is True
+    assert session._coder_context_window == 64_024
+
+
+async def test_context_usage_is_reported_with_both_readings(
+    monkeypatch: pytest.MonkeyPatch, git_repo: GitManagerService
+) -> None:
+    """
+    The count and the share answer different questions.
+
+    The count says how much room the work is taking; the share says how close it
+    is to running out. A reading is published per request so the number is
+    measured rather than inferred from a failure after the fact.
+    """
+    from pydantic_ai_harness.compaction import ContextUsage
+
+    from services.event_bus import ContextUsageEvent
+
+    session, events = prepare(monkeypatch, [], git_repo)
+
+    await session._report_context_usage(
+        ContextUsage(used_tokens=79_400, window_tokens=128_048, resolved=True)
+    )
+
+    readings = [event for event in events if isinstance(event, ContextUsageEvent)]
+    assert len(readings) == 1
+    assert readings[0].used_tokens == 79_400
+    assert readings[0].window_tokens == 128_048
+    assert readings[0].resolved is True
+
+
+async def test_an_unresolved_window_is_passed_through(
+    monkeypatch: pytest.MonkeyPatch, git_repo: GitManagerService
+) -> None:
+    """
+    A percentage taken against a fallback window is a guess, and must say so.
+    """
+    from pydantic_ai_harness.compaction import ContextUsage
+
+    from services.event_bus import ContextUsageEvent
+
+    session, events = prepare(monkeypatch, [], git_repo)
+
+    await session._report_context_usage(
+        ContextUsage(used_tokens=500, window_tokens=200_000, resolved=False)
+    )
+
+    readings = [event for event in events if isinstance(event, ContextUsageEvent)]
+    assert readings[0].resolved is False

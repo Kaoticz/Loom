@@ -141,13 +141,67 @@
                 >
             </button>
 
-            <div class="flex items-center gap-2">
-                <div
-                    class="h-2 w-2 rounded-full {$agentStore.status === 'idle'
-                        ? 'bg-gray-400'
-                        : 'animate-pulse bg-green-500'}"
-                ></div>
-                <span class="font-mono text-xs text-gray-500">{$agentStore.status}</span>
+            <div class="flex items-center gap-4">
+                {#if $agentStore.contextUsage}
+                    {@const usage = $agentStore.contextUsage}
+                    {@const share = usage.usedTokens / usage.windowTokens}
+                    <div
+                        class="flex items-center gap-2"
+                        title={usage.resolved
+                            ? `${usage.usedTokens.toLocaleString()} of ${usage.windowTokens.toLocaleString()} tokens`
+                            : `${usage.usedTokens.toLocaleString()} of ${usage.windowTokens.toLocaleString()} tokens. The window was not confirmed by the provider, so this is an estimate.`}
+                    >
+                        <span class="hidden font-mono text-xs text-gray-500 sm:inline">context</span
+                        >
+                        <!-- Both readings, since neither answers the other: the
+                             count says how much room the work is taking, the
+                             share says how close it is to running out. -->
+                        <span
+                            class="font-mono text-xs tabular-nums {share >= 0.9
+                                ? 'text-red-600'
+                                : share >= 0.7
+                                  ? 'text-amber-600'
+                                  : 'text-gray-500'}"
+                        >
+                            {usage.usedTokens.toLocaleString()}/{usage.windowTokens.toLocaleString()}
+                        </span>
+                        <div
+                            class="h-1.5 w-16 overflow-hidden rounded-full bg-gray-200 dark:bg-gray-700"
+                            role="progressbar"
+                            aria-label="Context window in use"
+                            aria-valuenow={Math.round(share * 100)}
+                            aria-valuemin={0}
+                            aria-valuemax={100}
+                        >
+                            <div
+                                class="h-full rounded-full {share >= 0.9
+                                    ? 'bg-red-500'
+                                    : share >= 0.7
+                                      ? 'bg-amber-500'
+                                      : 'bg-green-500'}"
+                                style="width: {Math.min(Math.round(share * 100), 100)}%"
+                            ></div>
+                        </div>
+                        <span
+                            class="font-mono text-xs tabular-nums {share >= 0.9
+                                ? 'text-red-600'
+                                : share >= 0.7
+                                  ? 'text-amber-600'
+                                  : 'text-gray-500'}"
+                        >
+                            {Math.round(share * 100)}%{usage.resolved ? '' : '*'}
+                        </span>
+                    </div>
+                {/if}
+
+                <div class="flex items-center gap-2">
+                    <div
+                        class="h-2 w-2 rounded-full {$agentStore.status === 'idle'
+                            ? 'bg-gray-400'
+                            : 'animate-pulse bg-green-500'}"
+                    ></div>
+                    <span class="font-mono text-xs text-gray-500">{$agentStore.status}</span>
+                </div>
             </div>
         </div>
     </header>

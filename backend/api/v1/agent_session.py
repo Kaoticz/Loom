@@ -12,6 +12,8 @@ from agents.coder import CODER_SYSTEM_PROMPT, AgentDeps, answering_agent, coder_
 from agents.reviewer import ReviewResult, reviewer_agent
 from fastapi import WebSocket
 from pydantic_ai import Agent, RunContext, UsageLimits
+from pydantic_ai.exceptions import UnexpectedModelBehavior
+from pydantic_ai_harness.compaction import ContextUsage
 from pydantic_ai.agent import AgentRunResult
 from pydantic_ai.messages import (
     AgentStreamEvent,
@@ -38,6 +40,7 @@ from services.event_bus import (
     SandboxStage,
     SandboxUnavailableEvent,
     SessionStatus,
+    ContextUsageEvent,
     SystemEvent,
     ThoughtEvent,
 )
@@ -45,7 +48,13 @@ from services.docker_sandbox import DockerSandboxManager, SandboxError
 from services.file_editor import FileEditorService
 from services.git_manager import CommitResult, FileChange, GitManagerService
 from services.code_search import CodeSearchService
-from services.compaction import build_compaction, resolve_context_window
+from services.compaction import (
+    build_compaction,
+    build_usage_monitor,
+    looks_like_no_room_to_answer,
+    narrowed_window,
+    resolve_context_window,
+)
 from services.context_budget import context_window_complaint, estimate_fixed_overhead
 from services.browser_tooling import BROWSER_GUIDANCE
 from services.frontend_detection import repository_has_frontend
@@ -196,6 +205,7 @@ class AgentSession:
     _recorder: TaskRecorder | None
     _connection_lost: Event
     _has_frontend: bool | None
+    _last_context_usage: ContextUsage | None
 
     def __init__(
         self,
@@ -261,6 +271,7 @@ class AgentSession:
         # Unresolved rather than False: the repository is not known until a task
         # arrives with its path, which is after this point.
         self._has_frontend = None
+        self._last_context_usage = None
         self._task_id = ''
         self._recorder = None
 
@@ -641,6 +652,73 @@ class AgentSession:
             logger.warning('Task history is unavailable for this session: %s', error)
             self._recorder = None
 
+    async def _report_context_usage(self, usage: ContextUsage) -> None:
+        """
+        Publish how full the context is, measured rather than guessed.
+
+        Sent as counts rather than a sentence, so the interface can show a gauge
+        and word it however it likes. It replaces the previous reading rather
+        than joining the feed: one line per request would bury the conversation
+        in a number that is only interesting at a glance.
+
+        `resolved` is passed through untouched, because a percentage taken
+        against a fallback window is a guess and the interface should be able to
+        mark it as one.
+
+        :param usage: The reading for the request about to be sent.
+        """
+        self._last_context_usage = usage
+        await self._events.emit(
+            ContextUsageEvent(
+                used_tokens=max(usage.used_tokens, 0),
+                window_tokens=max(usage.window_tokens, 1),
+                resolved=usage.resolved,
+            )
+        )
+
+    async def _narrow_after_overflow(self, budget: int) -> bool:
+        """
+        React to a run that had no room to answer in.
+
+        The configured window has been shown to be larger than the model's real
+        one, which Loom has no way to ask for. Narrowing what it budgets against
+        makes the next attempt smaller, and repeating that closes the gap without
+        anybody having to know the true figure.
+
+        :param budget: The window the failed run was budgeted against.
+        :returns: True if the window was narrowed and the run is worth retrying.
+        """
+        narrower: int = narrowed_window(budget)
+        if narrower >= resolve_context_window(budget):
+            return False
+
+        overhead: int = estimate_fixed_overhead(CODER_SYSTEM_PROMPT, coder_agent)
+        complaint: str = context_window_complaint(narrower, overhead)
+        if complaint:
+            # Narrowing further would be theatre. Every request carries the
+            # instructions and tool schemas whatever the window is, and below
+            # this the model has nowhere to put the work — so halving again
+            # would fail identically while looking like progress. The run stops
+            # with the one message that names what to change.
+            await self._events.emit(WarningEvent(content=complaint))
+            return False
+
+        self._coder_context_window = narrower
+        self._planner_context_window = min(
+            narrower, resolve_context_window(self._planner_context_window)
+        )
+        await self._events.emit(
+            WarningEvent(
+                content=(
+                    f'The model had no room to reply, so its context window is smaller than the '
+                    f'{resolve_context_window(budget):,} tokens configured. Retrying with '
+                    f'{narrower:,}. Set the context window to what the model actually supports '
+                    'to avoid this.'
+                )
+            )
+        )
+        return True
+
     async def _run_coder_streaming(self, prompt: str, agent: Agent[AgentDeps, str]) -> str:
         """
         Run a coder agent, streaming its reasoning to the client as it goes.
@@ -697,17 +775,41 @@ class AgentSession:
                     for thought in buffer.add(event.delta.content_delta, monotonic()):
                         await self._say(thought)
 
-        result: AgentRunResult[str] = await agent.run(
-            prompt,
-            deps=self._deps,
-            model=resolve_model(self._coder_model),
-            model_settings=model_settings(self._coder_context_window),
-            event_stream_handler=stream_thoughts,
-            usage_limits=UsageLimits(request_limit=None),
-            # Built per run rather than fixed on the agent: the budget is a user
-            # setting, and a capability attached at import time could not see it.
-            capabilities=[build_compaction(self._coder_context_window)],
-        )
+        while True:
+            try:
+                result: AgentRunResult[str] = await agent.run(
+                    prompt,
+                    deps=self._deps,
+                    model=resolve_model(self._coder_model),
+                    model_settings=model_settings(self._coder_context_window),
+                    event_stream_handler=stream_thoughts,
+                    usage_limits=UsageLimits(request_limit=None),
+                    # Built per run rather than fixed on the agent: the budget is
+                    # a user setting, and a capability attached at import time
+                    # could not see it.
+                    capabilities=[
+                        build_compaction(self._coder_context_window),
+                        # After the ladder, so the reading describes the history
+                        # actually being sent rather than what triggered it.
+                        build_usage_monitor(
+                            self._coder_context_window, self._report_context_usage
+                        ),
+                    ],
+                )
+                break
+            except UnexpectedModelBehavior as error:
+                # The prompt filled the model's real window, so nothing came back.
+                # Retried against a narrower window rather than failed: the run
+                # is recoverable, and the alternative is losing the step over a
+                # number the user could only have guessed at.
+                if not looks_like_no_room_to_answer(error):
+                    raise
+                if not await self._narrow_after_overflow(self._coder_context_window):
+                    raise
+                # Anything half-streamed belongs to the abandoned attempt, and
+                # emitting it alongside the retry's output would read as the
+                # model repeating itself.
+                _ = buffer.flush()
 
         remaining: str | None = buffer.flush()
         if remaining is not None:
@@ -923,7 +1025,12 @@ class AgentSession:
                 model=resolve_model(self._coder_model),
                 model_settings=model_settings(self._planner_context_window),
                 usage_limits=UsageLimits(request_limit=None),
-                capabilities=[build_compaction(self._planner_context_window)],
+                capabilities=[
+                    build_compaction(self._planner_context_window),
+                    build_usage_monitor(
+                        self._planner_context_window, self._report_context_usage
+                    ),
+                ],
             )
         except Exception as error:
             logger.warning('Structured planning failed, falling back to text: %s', error)
@@ -964,7 +1071,10 @@ class AgentSession:
             model=resolve_model(self._coder_model),
             model_settings=model_settings(self._planner_context_window),
             usage_limits=UsageLimits(request_limit=None),
-            capabilities=[build_compaction(self._planner_context_window)],
+            capabilities=[
+                build_compaction(self._planner_context_window),
+                build_usage_monitor(self._planner_context_window, self._report_context_usage),
+            ],
         )
         return result.output
 
@@ -1053,8 +1163,8 @@ class AgentSession:
 
         :returns: The next state.
         """
-        await self._announce('Executing plan...', SessionStatus.executing)
         await self._warn_if_context_is_too_small()
+        await self._announce('Executing plan...', SessionStatus.executing)
 
         steps: Sequence[PlanStep] = self._plan.steps
         if not steps:

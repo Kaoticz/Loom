@@ -14,6 +14,7 @@ from services.event_bus import (
     DoneEvent,
     ErrorEvent,
     WarningEvent,
+    ContextUsageEvent,
     PlanEvent,
     QuestionEvent,
     ReviewEvent,
@@ -83,6 +84,7 @@ class MessageType(str, Enum):
     done = 'done'
     error = 'error'
     warning = 'warning'
+    context_usage = 'context_usage'
     session_busy = 'session_busy'
     question = 'question'
     system = 'system'
@@ -217,6 +219,17 @@ class ErrorMessage(BaseAgentMessage):
     content: Annotated[str, Field()]
 
 
+class ContextUsageMessage(BaseAgentMessage):
+    """
+    How full the model's context is, as counts the interface can render.
+    """
+
+    type: Annotated[Literal[MessageType.context_usage], Field()] = MessageType.context_usage
+    used_tokens: Annotated[int, Field(ge=0, description='Tokens the next request will carry.')]
+    window_tokens: Annotated[int, Field(gt=0, description='The context window being measured against.')]
+    resolved: Annotated[bool, Field(description='False when the window is a fallback rather than the model\'s own, making the percentage a guess.')] = True
+
+
 class WarningMessage(BaseAgentMessage):
     """
     Something failed but the session is carrying on.
@@ -287,6 +300,7 @@ AgentMessage = Annotated[
     | DoneMessage
     | ErrorMessage
     | WarningMessage
+    | ContextUsageMessage
     | SessionBusyMessage
     | SystemMessage
     | SandboxUnavailableMessage,
@@ -360,6 +374,12 @@ def to_message(event: BaseAgentEvent) -> AgentMessage:
         return ErrorMessage(content=event.content)
     if isinstance(event, WarningEvent):
         return WarningMessage(content=event.content)
+    if isinstance(event, ContextUsageEvent):
+        return ContextUsageMessage(
+            used_tokens=event.used_tokens,
+            window_tokens=event.window_tokens,
+            resolved=event.resolved,
+        )
     if isinstance(event, SandboxUnavailableEvent):
         return SandboxUnavailableMessage(stage=event.stage, reason=event.reason)
     if isinstance(event, SystemEvent):

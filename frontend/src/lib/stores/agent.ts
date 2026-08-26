@@ -238,6 +238,15 @@ export interface AgentState {
      * session, and a line in the feed would scroll away from it.
      */
     sandboxUnavailable: { stage: SandboxStage; reason: string } | null;
+    /**
+     * How full the model's context is, or null before the first reading.
+     *
+     * State rather than a feed entry: it is replaced on every request, and a
+     * line per request would bury the conversation in a number that is only
+     * worth a glance. `resolved` is false when the window is a fallback rather
+     * than the model's own, so the reading can be shown as the guess it is.
+     */
+    contextUsage: { usedTokens: number; windowTokens: number; resolved: boolean } | null;
     /** Whether the reader has dismissed the sandbox notice for this session. */
     sandboxNoticeDismissed: boolean;
     /**
@@ -274,6 +283,7 @@ const initialState: AgentState = {
     connection: 'disconnected',
     blocked: null,
     sandboxUnavailable: null,
+    contextUsage: null,
     sandboxNoticeDismissed: false,
     pendingQuestion: null,
     // Secrets are deliberately never persisted, so merge the saved config over
@@ -705,6 +715,18 @@ function createAgentStore() {
                 return {
                     ...nextState,
                     sandboxUnavailable: { stage: data.stage, reason: data.reason }
+                };
+            }
+
+            // Shown as a gauge, so it never joins the feed.
+            if (data.type === 'context_usage') {
+                return {
+                    ...nextState,
+                    contextUsage: {
+                        usedTokens: data.used_tokens,
+                        windowTokens: data.window_tokens,
+                        resolved: data.resolved
+                    }
                 };
             }
 
