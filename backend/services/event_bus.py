@@ -27,6 +27,7 @@ class AgentEventType(str, Enum):
     review = 'review'
     done = 'done'
     error = 'error'
+    warning = 'warning'
     system = 'system'
     sandbox_unavailable = 'sandbox_unavailable'
     question = 'question'
@@ -231,6 +232,20 @@ class ErrorEvent(BaseAgentEvent):
     content: Annotated[str, Field()]
 
 
+class WarningEvent(BaseAgentEvent):
+    """
+    Emitted when something failed but the session is carrying on regardless.
+
+    Distinct from `ErrorEvent`, which means the session is over: a client that
+    renders both the same way tells the user their run has died when it has not.
+    Distinct from `SystemEvent`, which announces what phase the session is in and
+    would bury a failure among routine progress.
+    """
+
+    type: Annotated[Literal[AgentEventType.warning], Field()] = AgentEventType.warning
+    content: Annotated[str, Field()]
+
+
 class SystemEvent(BaseAgentEvent):
     """
     Loom talking about the session, as distinct from the model reasoning.
@@ -279,6 +294,7 @@ AgentEvent = Annotated[
     | ReviewEvent
     | DoneEvent
     | ErrorEvent
+    | WarningEvent
     | SystemEvent
     | SandboxUnavailableEvent,
     Field(discriminator='type'),

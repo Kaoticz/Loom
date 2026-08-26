@@ -8,7 +8,7 @@ from agents.classifier import (
     classifier_agent,
     build_classification_prompt,
 )
-from agents.coder import AgentDeps, answering_agent, coder_agent
+from agents.coder import CODER_SYSTEM_PROMPT, AgentDeps, answering_agent, coder_agent
 from agents.reviewer import ReviewResult, reviewer_agent
 from fastapi import WebSocket
 from pydantic_ai import Agent, RunContext, UsageLimits
@@ -26,6 +26,8 @@ from schemas.agent_commands import CommandAction, SessionCommand, parse_command
 from services.conversation_history import ConversationHistory, TurnRole
 from services.embedding import DEFAULT_EMBEDDING_MODEL, EmbeddingService
 from services.event_bus import (
+    CommitEvent,
+    WarningEvent,
     INDEXING_PROGRESS_KEY,
     DoneEvent,
     ErrorEvent,
@@ -41,8 +43,12 @@ from services.event_bus import (
 )
 from services.docker_sandbox import DockerSandboxManager, SandboxError
 from services.file_editor import FileEditorService
-from services.git_manager import FileChange, GitManagerService
+from services.git_manager import CommitResult, FileChange, GitManagerService
 from services.code_search import CodeSearchService
+from services.compaction import build_compaction, resolve_context_window
+from services.context_budget import context_window_complaint, estimate_fixed_overhead
+from services.browser_tooling import BROWSER_GUIDANCE
+from services.frontend_detection import repository_has_frontend
 from services.indexing import IndexingService, clamp_chunk_lines
 from agents.planner import StructuredPlan, planner_agent
 from services.plan_parser import (
@@ -54,7 +60,7 @@ from services.plan_parser import (
     render_plan,
 )
 from services.review_context import build_review_prompt, collect_review_diffs
-from services.model_resolution import resolve_model
+from services.model_resolution import model_settings, resolve_model
 from services.session_context import SessionContext
 from services.session_inbox import SessionInbox
 from services.user_questions import (
@@ -64,6 +70,7 @@ from services.user_questions import (
 )
 from services.session_fsm import SessionState, SessionStateMachine
 from services.session_limits import IterationLimits
+from services.session_registry import SessionRegistry
 from services.task_recorder import TaskRecorder
 from database.enums import TaskStatus
 from database.models.file import File
@@ -115,9 +122,39 @@ class SessionServices(Protocol):
     indexing: IndexingService
     embedding: EmbeddingService
     search: CodeSearchService
+    registry: SessionRegistry
 
 CONTEXT_TOKEN_BUDGET: int = 4096
 DEFAULT_MODEL: str = 'ollama:llama3'
+
+
+MAX_CONSECUTIVE_COMMIT_FAILURES: int = 3
+"""
+How many commits may fail in a row before the user is asked what to do.
+
+Three rather than one: a single failure is often an index lock held for a moment
+and clears by itself, and the retry inside the commit already covers that. Three
+in a row is a configuration problem, and every further step past it adds work
+that neither the review nor the merge can see.
+"""
+
+COMMIT_FAILURE_COMMITTED: str = 'I have committed the changes myself'
+COMMIT_FAILURE_CONTINUE: str = 'Carry on without committing'
+COMMIT_FAILURE_STOP: str = 'Stop the session'
+
+COMMIT_FAILURE_OPTIONS: tuple[str, ...] = (
+    COMMIT_FAILURE_COMMITTED,
+    COMMIT_FAILURE_CONTINUE,
+    COMMIT_FAILURE_STOP,
+)
+"""
+What the user may do about commits that keep failing.
+
+Committing by hand is offered first because it is usually the quickest fix and
+Loom has no business guessing at someone's git configuration. The claim is
+verified rather than trusted, so choosing it wrongly costs another question
+rather than a lost step.
+"""
 
 
 class AgentSession:
@@ -144,6 +181,8 @@ class AgentSession:
     _branch_created: bool
     _coder_model: str
     _reviewer_model: str
+    _coder_context_window: int
+    _planner_context_window: int
     _plan: ParsedPlan
     _plan_rejections: int
     _review_rejections: int
@@ -156,6 +195,7 @@ class AgentSession:
     _task_id: str
     _recorder: TaskRecorder | None
     _connection_lost: Event
+    _has_frontend: bool | None
 
     def __init__(
         self,
@@ -207,6 +247,9 @@ class AgentSession:
         self._branch_created = False
         self._coder_model = DEFAULT_MODEL
         self._reviewer_model = DEFAULT_MODEL
+        # Zero means "unset", which `build_compaction` reads as the default.
+        self._coder_context_window = 0
+        self._planner_context_window = 0
         self._plan = ParsedPlan(steps=[])
         self._plan_rejections = 0
         self._review_rejections = 0
@@ -215,6 +258,9 @@ class AgentSession:
         self._last_review = None
         self._dockerfile = ''
         self._secrets = {}
+        # Unresolved rather than False: the repository is not known until a task
+        # arrives with its path, which is after this point.
+        self._has_frontend = None
         self._task_id = ''
         self._recorder = None
 
@@ -291,34 +337,45 @@ class AgentSession:
         :returns: The terminal state the session ended in.
         """
         await self._receive_task()
+        # Only now is a task genuinely under way. The slot was taken when the
+        # socket connected, which is too early to stand for "an agent is
+        # working": anything reading that would block on an idle tab.
+        _ = await self._services.registry.begin_task(self._session_id)
         self._inbox.start()
 
-        while not self._machine.is_terminal:
-            if self._connection_lost.is_set():
-                return await self._abandon()
-            if self._inbox.stop_requested:
-                return await self._cancel()
+        try:
+            while not self._machine.is_terminal:
+                if self._connection_lost.is_set():
+                    return await self._abandon()
+                if self._inbox.stop_requested:
+                    return await self._cancel()
 
-            try:
-                next_state: SessionState = await self._advance(self._machine.current)
-            except ClientGone:
-                return await self._abandon()
-            except StopRequested:
-                return await self._cancel()
-            except Exception:
-                # The machine has to record the failure itself. Letting the
-                # exception escape while the state still reads `executing` leaves
-                # a lie behind, which matters as soon as anything resumes from it.
-                if not self._machine.is_terminal:
-                    self._machine.fail()
+                try:
+                    next_state: SessionState = await self._advance(self._machine.current)
+                except ClientGone:
+                    return await self._abandon()
+                except StopRequested:
+                    return await self._cancel()
+                except Exception:
+                    # The machine has to record the failure itself. Letting the
+                    # exception escape while the state still reads `executing` leaves
+                    # a lie behind, which matters as soon as anything resumes from it.
+                    if not self._machine.is_terminal:
+                        self._machine.fail()
+                    await self._record_status(TaskStatus.failed)
+                    raise
+                self._machine.transition_to(next_state)
+
+            if self._machine.current is SessionState.failed:
                 await self._record_status(TaskStatus.failed)
-                raise
-            self._machine.transition_to(next_state)
 
-        if self._machine.current is SessionState.failed:
-            await self._record_status(TaskStatus.failed)
-
-        return self._machine.current
+            return self._machine.current
+        finally:
+            # In a `finally` so that an escaping exception cannot leave the
+            # session looking as though it were still working. The connection may
+            # well outlive this — a finished review is still worth reading — and
+            # the index is safe to touch the moment nothing is working on it.
+            _ = await self._services.registry.end_task(self._session_id)
 
     async def _advance(self, state: SessionState) -> SessionState:
         """
@@ -362,6 +419,10 @@ class AgentSession:
 
         self._coder_model = str(message.get('coder_model', DEFAULT_MODEL))
         self._reviewer_model = str(message.get('reviewer_model', DEFAULT_MODEL))
+        self._coder_context_window = _read_context_window(message.get('coder_context_window'))
+        self._planner_context_window = _read_context_window(
+            message.get('planner_context_window')
+        )
         self._services.embedding.embedding_model = str(
             message.get('embedding_model', DEFAULT_EMBEDDING_MODEL)
         )
@@ -566,6 +627,8 @@ class AgentSession:
                     repo_path=self._services.git.repo_path,
                     coder_model=self._coder_model,
                     reviewer_model=self._reviewer_model,
+                    coder_context_window=self._coder_context_window,
+                    planner_context_window=self._planner_context_window,
                     branch_name=self._branch_name,
                     status=TaskStatus.initialized,
                 )
@@ -582,7 +645,7 @@ class AgentSession:
         """
         Run a coder agent, streaming its reasoning to the client as it goes.
 
-        Distinct from `_run_coder`, which planning uses: a plan is a single
+        Distinct from `_plan_as_text`, which planning uses: a plan is a single
         artefact the client is shown once it exists, while executing and
         answering are long runs whose reasoning is worth watching arrive.
 
@@ -638,8 +701,12 @@ class AgentSession:
             prompt,
             deps=self._deps,
             model=resolve_model(self._coder_model),
+            model_settings=model_settings(self._coder_context_window),
             event_stream_handler=stream_thoughts,
             usage_limits=UsageLimits(request_limit=None),
+            # Built per run rather than fixed on the agent: the budget is a user
+            # setting, and a capability attached at import time could not see it.
+            capabilities=[build_compaction(self._coder_context_window)],
         )
 
         remaining: str | None = buffer.flush()
@@ -820,11 +887,11 @@ class AgentSession:
         plan: ParsedPlan = await self._plan_structured(prompt)
 
         if plan.is_empty:
-            # One corrective attempt before giving up on this round. The coder is
-            # used here rather than the planner: if structure did not come back
-            # the first time, asking the same way again is unlikely to help, and
-            # the parser exists precisely for models that will not comply.
-            plan = parse_plan(await self._run_coder(f'{prompt}\n\n{NO_STEPS_CORRECTION}'))
+            # One corrective attempt before giving up on this round, asking for
+            # prose rather than for structure: if the shape did not come back the
+            # first time, requesting it the same way again is unlikely to help,
+            # and the parser exists precisely for models that will not comply.
+            plan = parse_plan(await self._plan_as_text(f'{prompt}\n\n{NO_STEPS_CORRECTION}'))
 
         if plan.is_empty:
             await self._events.emit(
@@ -852,12 +919,15 @@ class AgentSession:
         try:
             result: AgentRunResult[StructuredPlan] = await planner_agent.run(
                 prompt,
+                deps=self._deps,
                 model=resolve_model(self._coder_model),
+                model_settings=model_settings(self._planner_context_window),
                 usage_limits=UsageLimits(request_limit=None),
+                capabilities=[build_compaction(self._planner_context_window)],
             )
         except Exception as error:
             logger.warning('Structured planning failed, falling back to text: %s', error)
-            return parse_plan(await self._run_coder(prompt))
+            return parse_plan(await self._plan_as_text(prompt))
 
         steps: list[PlanStep] = [
             PlanStep(title=step.title.strip(), description=step.description.strip())
@@ -868,22 +938,33 @@ class AgentSession:
         if not steps:
             # Structure arrived but said nothing, which the text path may still
             # recover something from.
-            return parse_plan(await self._run_coder(prompt))
+            return parse_plan(await self._plan_as_text(prompt))
 
         return ParsedPlan(steps=steps, used_fallback=False, format=PlanFormat.structured)
 
-    async def _run_coder(self, prompt: str) -> str:
+    async def _plan_as_text(self, prompt: str) -> str:
         """
-        Run the coder agent to completion and return its text output.
+        Ask the planner for a plan as prose, for `parse_plan` to read.
+
+        The planner rather than the coder, despite the coder being the agent
+        that returns text by default. The coder carries `edit_file`,
+        `create_file` and `commit_changes`, so asking it to plan let it start
+        writing and committing code before the user had approved anything. The
+        planner carries the read-only tools but none of those, and `output_type`
+        is overridden per run rather than on the agent, so the structured path it
+        exists for is untouched.
 
         :param prompt: The prompt to send.
-        :returns: The agent's output.
+        :returns: The planner's output, as text.
         """
-        result: AgentRunResult[str] = await coder_agent.run(
+        result: AgentRunResult[str] = await planner_agent.run(
             prompt,
+            output_type=str,
             deps=self._deps,
             model=resolve_model(self._coder_model),
+            model_settings=model_settings(self._planner_context_window),
             usage_limits=UsageLimits(request_limit=None),
+            capabilities=[build_compaction(self._planner_context_window)],
         )
         return result.output
 
@@ -940,9 +1021,65 @@ class AgentSession:
 
         return SessionState.planning
 
+    def _repository_has_frontend(self) -> bool:
+        """
+        Whether this session's repository plausibly contains a web frontend.
+
+        Cached for the life of the session. The answer is settled by files on
+        disk, and execution is re-entered on every replanning loop, so asking
+        git to list the repository again each time would pay the same cost for
+        the same answer.
+
+        :returns: True if the repository looks like it has a frontend.
+        """
+        if self._has_frontend is None:
+            self._has_frontend = repository_has_frontend(self._services.git.repo_path)
+        return self._has_frontend
+
     async def _handle_executing(self) -> SessionState:
         """
-        Run the coder agent against the approved plan.
+        Work through the approved plan one step at a time.
+
+        One run per step rather than one run for the whole plan. Handed
+        everything at once, a small model reads the plan as a description of the
+        finished state and stops after whichever part it found most legible,
+        because nothing obliges it to account for the rest. A step at a time
+        makes finishing each one an explicit act with its own gate.
+
+        A step is given the earlier steps' summaries rather than their history.
+        Carrying the raw tool calls forward would recreate the context pressure
+        compaction exists to relieve, and by the tenth step the first step's file
+        reads are the least useful thing in the window.
+
+        :returns: The next state.
+        """
+        await self._announce('Executing plan...', SessionStatus.executing)
+        await self._warn_if_context_is_too_small()
+
+        steps: Sequence[PlanStep] = self._plan.steps
+        if not steps:
+            # Nothing to iterate over, but the task still has to be executed:
+            # an unparsed plan is not an empty one.
+            await self._execute_step(None, 1, 1)
+            return await self._finish_execution()
+
+        for position, step in enumerate(steps, start=1):
+            if self._inbox.stop_requested:
+                raise StopRequested()
+
+            await self._announce(
+                f'Step {position} of {len(steps)}: {step.title}', SessionStatus.executing
+            )
+            await self._execute_step(step, position, len(steps))
+            await self._resolve_commit_failures()
+
+        return await self._finish_execution()
+
+    async def _execute_step(
+        self, step: PlanStep | None, position: int, total: int
+    ) -> None:
+        """
+        Run the coder against one step of the plan.
 
         The graph is run with `run()` and an event stream handler rather than
         `run_stream()`. `run_stream()` stops the graph once it has an output
@@ -951,16 +1088,245 @@ class AgentSession:
         ReAct sequence such as read, edit, test, complete would be cut off after
         its first step, so the agent could never finish the work.
 
-        :returns: The next state.
+        :param step: The step to work on, or None to execute the plan as a whole.
+        :param position: Which step this is, counting from one.
+        :param total: How many steps the plan has.
         """
-        await self._announce('Executing plan...', SessionStatus.executing)
+        before: int = len(self._session.step_summaries)
+        if step is not None:
+            self._session.begin_step(step.title)
 
+        await self._run_coder_streaming(self._build_step_prompt(step, position, total), coder_agent)
+
+        if step is not None and len(self._session.step_summaries) == before:
+            # Not a failure. The agent may well have done the work and simply
+            # not said so, and abandoning the remaining steps over a missing
+            # tool call would throw away more than it protects.
+            await self._announce(
+                f'Step {position} finished without being marked complete. '
+                'Continuing to the next step.'
+            )
+            self._session.record_step_completion(
+                f'{step.title} — the agent did not report what it did for this step.'
+            )
+
+    async def _warn_if_context_is_too_small(self) -> None:
+        """
+        Say so, once, if the window cannot hold what every request must carry.
+
+        The provider's own error for this names neither the window nor what
+        filled it, so it reads as a bug in Loom rather than as a setting to
+        change. Checked before the first step rather than after a failure,
+        because by then the run is over.
+        """
+        complaint: str = context_window_complaint(
+            resolve_context_window(self._coder_context_window),
+            estimate_fixed_overhead(CODER_SYSTEM_PROMPT, coder_agent),
+        )
+        if complaint:
+            await self._events.emit(WarningEvent(content=complaint))
+
+    async def _sweep_uncommitted(self) -> None:
+        """
+        Commit anything left in the working tree once every step has run.
+
+        Steps commit their own work, but a step that ended without reporting
+        completion does not, and neither does one whose commit failed. Left
+        alone, that work would reach neither the reviewer nor the merge, both of
+        which read only commits — the exact loss this phase exists to prevent.
+
+        Announced as a warning rather than done quietly: a commit nobody asked
+        for, covering work nobody described, is worth knowing about.
+        """
+        if not self._branch_created:
+            return
+        if not await self._services.git.has_uncommitted_changes():
+            return
+
+        result: CommitResult = await self._services.git.commit_changes_with_retry(
+            'Remaining changes not committed by any step'
+        )
+
+        if result.failed:
+            await self._events.emit(
+                WarningEvent(
+                    content=(
+                        f'Changes are left uncommitted and could not be swept up: {result.error}. '
+                        'They will not appear in the review or the merge.'
+                    )
+                )
+            )
+            self._session.record_commit_failure(self._session.current_step or 'Remaining changes')
+            return
+
+        if result.commit is None:
+            return
+
+        await self._events.emit(
+            CommitEvent(
+                commit_hash=result.commit.commit_hash,
+                message=result.commit.message,
+                files_changed=result.commit.files_changed,
+            )
+        )
+        await self._events.emit(
+            WarningEvent(
+                content=(
+                    'Some changes were not committed by the step that made them, so they have '
+                    'been committed together to keep them visible to the review.'
+                )
+            )
+        )
+
+    async def _resolve_commit_failures(self) -> None:
+        """
+        Stop and ask once commits have failed repeatedly.
+
+        A run of failures usually means something that will not clear on its own
+        — an unconfigured identity, a full disk, a read-only repository. Carrying
+        on would accumulate work that neither the reviewer nor the merge can see,
+        since both read only commits, so the user is asked while the work is
+        still recoverable rather than told about it at the end.
+
+        The user is offered the chance to commit by hand, because that is often
+        the fastest fix and Loom has no business guessing at someone's git
+        configuration. Their claim is checked rather than believed: if the tree
+        is still dirty afterwards, they are asked again.
+
+        :raises StopRequested: If the user chooses to stop.
+        """
+        while self._session.consecutive_commit_failures >= MAX_CONSECUTIVE_COMMIT_FAILURES:
+            failures: int = self._session.consecutive_commit_failures
+            stranded: str = ', '.join(self._session.uncommitted_steps) or 'the current step'
+            questioner: UserQuestioner | None = self._deps.questioner
+
+            if questioner is None:
+                # No one to ask. Warning and continuing is the lesser evil: the
+                # changes are on disk, and stopping a session nobody is watching
+                # would discard them for no one's benefit.
+                await self._events.emit(
+                    WarningEvent(
+                        content=(
+                            f'{failures} commits in a row have failed and there is no one to ask '
+                            f'how to proceed. Work for {stranded} is uncommitted and will not be '
+                            'reviewed or merged.'
+                        )
+                    )
+                )
+                return
+
+            reply, _ = await questioner.ask(
+                f'{failures} commits in a row have failed. Work for {stranded} is sitting '
+                'uncommitted, and neither the review nor the merge can see it. How should '
+                'Loom proceed?',
+                list(COMMIT_FAILURE_OPTIONS),
+            )
+            answer: str = reply.strip().lower()
+
+            # Matched exactly against the offered options first. Every option
+            # mentions committing, so a substring test reads "carry on without
+            # committing" as a claim that a commit was made and clears the very
+            # warning the user asked to keep.
+            if answer == COMMIT_FAILURE_STOP.lower() or answer == 'stop':
+                raise StopRequested()
+
+            claimed_commit: bool = answer == COMMIT_FAILURE_COMMITTED.lower() or (
+                # A reply typed by hand rather than chosen. "Committed" means a
+                # claim; "without committing" is the opposite of one.
+                'commit' in answer and 'without' not in answer and 'not ' not in answer
+            )
+
+            if claimed_commit:
+                if await self._services.git.has_uncommitted_changes():
+                    await self._events.emit(
+                        WarningEvent(
+                            content=(
+                                'The working tree still has uncommitted changes, so nothing was '
+                                'committed. Asking again.'
+                            )
+                        )
+                    )
+                    continue
+                self._session.record_commit_success()
+                self._session.clear_pending_changes()
+                await self._announce('The changes were committed. Continuing with the plan.')
+                return
+
+            # Carrying on knowingly. The run of failures is cleared so the
+            # question is not repeated at every remaining step, but the stranded
+            # steps stay recorded so the final summary still says so.
+            self._session.forgive_commit_failures()
+            await self._events.emit(
+                WarningEvent(
+                    content=(
+                        'Continuing without committing, at your request. Uncommitted work will '
+                        'not appear in the review or the merge.'
+                    )
+                )
+            )
+            return
+
+    def _build_step_prompt(self, step: PlanStep | None, position: int, total: int) -> str:
+        """
+        Build the prompt for one step's run.
+
+        :param step: The step being worked on, or None for the whole plan.
+        :param position: Which step this is, counting from one.
+        :param total: How many steps the plan has.
+        :returns: The prompt to send.
+        """
         prompt: str = (
             f'Task: {self._task}\n\n'
             f'Approved plan:\n{render_plan(self._plan)}\n\n'
-            'Execute this plan now. Verify every change with run_test_command, and call '
-            'complete_task once the work is finished.'
         )
+
+        established: str = self._session.test_command
+        waiver: str = self._session.verification_waiver
+        if waiver:
+            # Applies to both branches. A decision the user already made must not
+            # be put to them again, and a prompt that still demands verification
+            # after it was waived contradicts the tool that waived it.
+            prompt += (
+                f'Verification is not required for this plan: {waiver}\n'
+                'Do not run tests and do not ask about them again.\n\n'
+            )
+        elif established:
+            prompt += (
+                'Verify your work with this command, established earlier in this plan:\n'
+                f'    {established}\n'
+                'If it turns out to be the wrong command for the work in hand, rather than a '
+                'real test failure, call forget_test_command and work out the right one.\n\n'
+            )
+
+        if step is None:
+            prompt += (
+                'Execute this plan now. '
+                + ('' if waiver else 'Verify every change with run_test_command. ')
+                + 'Call complete_task once the work is finished.'
+            )
+        else:
+            done: Sequence[str] = self._session.step_summaries
+            if done:
+                # The summaries, not the history: what a step needs from the ones
+                # before it is what they achieved, not how they went about it.
+                completed: str = '\n'.join(
+                    f'- {summary}' for summary in done
+                )
+                prompt += f'Steps already done:\n{completed}\n\n'
+
+            prompt += (
+                f'You are working on step {position} of {total}, and only on this step:\n'
+                f'{step.title}\n{step.description}\n\n'
+                'Do the work this step calls for and nothing belonging to a later step. '
+                + ('' if waiver else 'Verify every change with run_test_command. ')
+                + 'Call complete_step when the step '
+                'is done, or accept_step_without_changes if the step was investigative and '
+                'required no change. Do not call complete_task: the plan is not finished until '
+                'every step is.'
+            )
+
+        if self._repository_has_frontend():
+            prompt += f'\n\n{BROWSER_GUIDANCE}'
 
         if self._secrets:
             prompt += (
@@ -969,15 +1335,37 @@ class AgentSession:
                 'values are not available to you and must never be written into a file.'
             )
 
-        await self._run_coder_streaming(prompt, coder_agent)
+        return prompt
 
-        if not self._session.completion_requested:
-            # Stopping without signalling completion usually means the agent lost
-            # track of the loop rather than finished, so the reviewer decides.
-            await self._announce(
-                'The agent stopped without calling complete_task. '
-                'Reviewing whatever has changed so far.'
+    async def _finish_execution(self) -> SessionState:
+        """
+        Settle the task's completion summary once every step has run.
+
+        Assembled from the steps' own summaries rather than by asking a model to
+        write one. A rollup call would cost a request and could disagree with the
+        steps it was summarising, and the reviewer reads the diff regardless.
+
+        :returns: The next state.
+        """
+        await self._sweep_uncommitted()
+
+        summaries: Sequence[str] = self._session.step_summaries
+        if summaries:
+            # Recorded even if completion was already requested. A model that
+            # ignored its instructions and called `complete_task` part way
+            # through a plan would otherwise have that one step's summary stand
+            # for the whole task, with every later step's work unmentioned.
+            self._session.record_rollup_completion(
+                '\n'.join(f'{index}. {text}' for index, text in enumerate(summaries, start=1))
             )
+        elif not self._session.completion_requested:
+                # Stopping without signalling completion usually means the agent
+                # lost track of the loop rather than finished, so the reviewer
+                # decides.
+                await self._announce(
+                    'The agent stopped without reporting any completed step. '
+                    'Reviewing whatever has changed so far.'
+                )
 
         return SessionState.reviewing
 
@@ -1213,3 +1601,20 @@ def _read_chunk_lines(value: Any) -> int | None:
     if isinstance(value, bool) or not isinstance(value, int):
         return None
     return value if value > 0 else None
+
+
+def _read_context_window(value: Any) -> int:
+    """
+    Interpret a context-window setting the client sent.
+
+    Anything unusable becomes zero, which means "unset" and leaves the default
+    to apply. A client sending nonsense should get the behaviour that always
+    works rather than a session that refuses to start, matching how
+    `_read_chunk_lines` treats the same problem.
+
+    :param value: The value from the opening message.
+    :returns: The requested window in tokens, or zero for the default.
+    """
+    if isinstance(value, bool) or not isinstance(value, int):
+        return 0
+    return value if value > 0 else 0

@@ -4,6 +4,7 @@ import { tick } from 'svelte';
 import Settings from './+page.svelte';
 import { agentStore } from '$lib/stores/agent';
 import { DEFAULT_CHUNK_LINES, MAX_CHUNK_LINES, MIN_CHUNK_LINES } from '$lib/chunkSize';
+import { DEFAULT_CONTEXT_WINDOW, MAX_CONTEXT_WINDOW, MIN_CONTEXT_WINDOW } from '$lib/contextWindow';
 
 vi.mock('$app/environment', () => ({ browser: true }));
 vi.mock('$app/navigation', () => ({ goto: vi.fn() }));
@@ -46,14 +47,14 @@ describe('chunk size control', () => {
     it('starts on Auto', async () => {
         await renderSettings();
 
-        expect(screen.getByRole('checkbox', { name: /auto/i })).toBeChecked();
+        expect(screen.getByRole('checkbox', { name: 'Automatic chunk size' })).toBeChecked();
         expect(screen.getByLabelText('Chunk Size')).toBeDisabled();
     });
 
     it('offers a real number once Auto is turned off', async () => {
         await renderSettings();
 
-        await fireEvent.click(screen.getByRole('checkbox', { name: /auto/i }));
+        await fireEvent.click(screen.getByRole('checkbox', { name: 'Automatic chunk size' }));
 
         // Leaving it null here would make the box look editable while still
         // meaning automatic.
@@ -64,7 +65,7 @@ describe('chunk size control', () => {
 
     it('returns to Auto when the box is ticked again', async () => {
         await renderSettings();
-        const auto = screen.getByRole('checkbox', { name: /auto/i });
+        const auto = screen.getByRole('checkbox', { name: 'Automatic chunk size' });
 
         await fireEvent.click(auto);
         await fireEvent.click(auto);
@@ -326,5 +327,69 @@ describe('removing indexed data', () => {
 
         expect(await screen.findByRole('alert')).toHaveTextContent(/was not removed/i);
         expect(screen.queryByRole('status')).not.toBeInTheDocument();
+    });
+});
+
+describe('context window controls', () => {
+    it('start on Auto for both agents', async () => {
+        await renderSettings();
+
+        expect(
+            screen.getByRole('checkbox', { name: 'Automatic coder context window' })
+        ).toBeChecked();
+        expect(
+            screen.getByRole('checkbox', { name: 'Automatic planner context window' })
+        ).toBeChecked();
+        expect(screen.getByLabelText('Coder Context Window')).toBeDisabled();
+        expect(screen.getByLabelText('Planner Context Window')).toBeDisabled();
+    });
+
+    it('offers a real number once Auto is turned off', async () => {
+        await renderSettings();
+
+        await fireEvent.click(
+            screen.getByRole('checkbox', { name: 'Automatic coder context window' })
+        );
+
+        // Leaving it null here would make the box look editable while still
+        // meaning automatic.
+        const box = screen.getByLabelText('Coder Context Window') as HTMLInputElement;
+        expect(box).toBeEnabled();
+        expect(box.value).toBe(String(DEFAULT_CONTEXT_WINDOW));
+    });
+
+    it('budgets the two agents independently', async () => {
+        await renderSettings();
+
+        await fireEvent.click(
+            screen.getByRole('checkbox', { name: 'Automatic coder context window' })
+        );
+
+        // The planner is deliberately separate: turning one off must not drag
+        // the other along with it.
+        expect(
+            screen.getByRole('checkbox', { name: 'Automatic planner context window' })
+        ).toBeChecked();
+        expect(screen.getByLabelText('Planner Context Window')).toBeDisabled();
+    });
+
+    it('states the bounds the backend will enforce', async () => {
+        await renderSettings();
+
+        for (const label of ['Coder Context Window', 'Planner Context Window']) {
+            const box = screen.getByLabelText(label);
+            expect(box).toHaveAttribute('min', String(MIN_CONTEXT_WINDOW));
+            expect(box).toHaveAttribute('max', String(MAX_CONTEXT_WINDOW));
+        }
+    });
+
+    it('returns to Auto when the box is ticked again', async () => {
+        await renderSettings();
+        const auto = screen.getByRole('checkbox', { name: 'Automatic coder context window' });
+
+        await fireEvent.click(auto);
+        await fireEvent.click(auto);
+
+        expect(screen.getByLabelText('Coder Context Window')).toBeDisabled();
     });
 });

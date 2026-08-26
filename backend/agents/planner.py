@@ -4,6 +4,7 @@ from typing import Annotated
 
 from pydantic import BaseModel, Field
 from pydantic_ai import Agent
+from agents.coder import PLANNING_TOOLS, AgentDeps
 
 PLANNER_SYSTEM_PROMPT: str = """You plan software changes. You do not make them.
 
@@ -23,6 +24,39 @@ Write steps that can be acted on. "Improve error handling" is not a step;
 
 Cover the whole task, and stop there. Do not invent work that was not asked for,
 and do not include steps for reviewing or committing: that happens anyway.
+
+# Looking at the repository first
+
+You have tools for reading the codebase: `list_files` to see how it is laid out,
+`search_code` and `search_code_lexical` to find where something lives,
+`get_symbol` to look up a definition, `read_file` to read one, and `web_search`
+for anything outside the repository.
+
+Use them before writing the plan. A plan written without looking names files
+that do not exist and steps that are already done. You cannot change anything —
+none of these tools writes — so there is no cost to looking beyond the time it
+takes.
+
+Stop looking once you know enough to write concrete steps. You are not reviewing
+the codebase; you are finding out enough to describe the work.
+
+# Asking the user
+
+When an ambiguity would change what steps you produce — which of several things
+they meant, which of two reasonable approaches they want, a decision the
+repository does not settle — call `ask_user`. It puts the question to the user
+and waits, and returns what they said.
+
+Suggest up to six answers when you can see what the likely ones are. The
+interface always offers the user a further option of typing their own reply, so
+you neither need to add one nor can remove it, and a question with no suggested
+answers at all is perfectly usable.
+
+Ask only when the answer changes the plan. Do not ask permission for work you
+were already asked to do, do not ask what you could find out by reading the
+repository, and do not ask what you could settle by making a reasonable
+assumption and saying so in the step that depends on it. Every question stops
+the task until someone comes back to it.
 """
 
 
@@ -61,8 +95,8 @@ class StructuredPlan(BaseModel):
     ]
 
 
-planner_agent: Agent[None, StructuredPlan] = Agent(
-    deps_type=type(None),
+planner_agent: Agent[AgentDeps, StructuredPlan] = Agent(
+    deps_type=AgentDeps,
     output_type=StructuredPlan,
     system_prompt=PLANNER_SYSTEM_PROMPT,
     retries=5,
@@ -71,10 +105,19 @@ planner_agent: Agent[None, StructuredPlan] = Agent(
 The planner.
 
 Separate from the coder for two reasons. Its prompt is about planning rather
-than about executing, and it carries none of the coder's tools — which is why
-the planning prompt no longer has to tell the agent not to call any. That
-instruction only existed because planning was borrowing an agent built to act.
+than about executing, and it carries none of the coder's *writing* tools.
+
+It does carry the read-only ones. A plan written without looking at the
+repository is a guess about a codebase the planner has never seen, and naming
+files that do not exist is the usual result. Being unable to write is structural
+rather than instructed: `create_file`, `edit_file`, `run_test_command` and
+`commit_changes` were never registered, so there is no switch to leave in the
+wrong position — the same reasoning `answering_agent` is built on.
 
 Follows the shape already used by `reviewer_agent` and `classifier_agent`: a
 narrow agent, its own prompt, a structured output type.
 """
+
+
+for _planning_tool in PLANNING_TOOLS:
+    planner_agent.tool(_planning_tool)

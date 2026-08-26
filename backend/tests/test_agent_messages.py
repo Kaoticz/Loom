@@ -12,6 +12,7 @@ from schemas.agent_messages import (
     DiffMessage,
     DoneMessage,
     ErrorMessage,
+    WarningMessage,
     MessageType,
     ObservationMessage,
     PlanMessage,
@@ -27,6 +28,7 @@ from services.event_bus import (
     DiffEvent,
     DoneEvent,
     ErrorEvent,
+    WarningEvent,
     PlanEvent,
     INDEXING_PROGRESS_KEY,
     ReviewEvent,
@@ -48,6 +50,9 @@ def test_every_message_type_is_defined() -> None:
     assert {member.value for member in MessageType} == {
         'thought', 'plan', 'action', 'observation',
         'commit', 'diff', 'review', 'done', 'error',
+        # Something failed but the session is still running, so it must not be
+        # rendered like an error, which means the session is over.
+        'warning',
         # Not produced from an event: sent directly when a connection is refused.
         'session_busy',
         # Loom talking about the session, as opposed to the model reasoning.
@@ -71,6 +76,7 @@ def test_every_message_type_is_defined() -> None:
         (ReviewEvent(approved=True, comments='fine'), ReviewMessage),
         (DoneEvent(summary='done'), DoneMessage),
         (ErrorEvent(content='boom'), ErrorMessage),
+        (WarningEvent(content='could not commit'), WarningMessage),
     ],
     ids=lambda value: type(value).__name__,
 )

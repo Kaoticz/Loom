@@ -320,7 +320,7 @@ def test_index_status_and_deletion_go_through_the_app() -> None:
 
 
 @pytest.mark.usefixtures('app_database')
-def test_deletion_is_refused_while_a_session_is_running() -> None:
+def test_deletion_is_refused_while_a_task_is_running() -> None:
     """
     Refused rather than allowed, at the user's direction.
 
@@ -338,6 +338,7 @@ def test_deletion_is_refused_while_a_session_is_running() -> None:
             main.app.state.dishka_container.get, SessionRegistry
         )
         client.portal.call(registry.acquire, 'session-1')
+        client.portal.call(registry.begin_task, 'session-1')
 
         try:
             status = client.get('/api/v1/index/status', params={'path': '/repos/mine'})
@@ -347,5 +348,100 @@ def test_deletion_is_refused_while_a_session_is_running() -> None:
             refused = client.request('DELETE', '/api/v1/index', params={'path': '/repos/mine'})
             assert refused.status_code == 409
             assert 'session is running' in refused.json()['detail']
+        finally:
+            client.portal.call(registry.release, 'session-1')
+
+
+@pytest.mark.usefixtures('app_database')
+def test_deletion_is_allowed_while_a_session_is_merely_connected() -> None:
+    """
+    A connected session that has been given nothing to do does not block.
+
+    The slot is claimed the moment a browser tab opens a socket, long before any
+    prompt is sent. Reading that as "an agent is working" left the control
+    disabled for anyone who simply had Loom open, which is the bug this covers.
+    """
+    import main
+    from database.models.file import File
+    from services.projects import normalise_project_path
+    from services.session_registry import SessionRegistry
+
+    project: str = '/repos/idle'
+
+    with TestClient(main.app) as client:
+        assert client.portal is not None
+
+        async def seed() -> None:
+            await File.create(
+                project=normalise_project_path(project),
+                file_path='src/main.py',
+                raw_content='x\n',
+                hash='h',
+            )
+
+        client.portal.call(seed)
+
+        registry: SessionRegistry = client.portal.call(
+            main.app.state.dishka_container.get, SessionRegistry
+        )
+        client.portal.call(registry.acquire, 'session-1')
+
+        try:
+            status = client.get('/api/v1/index/status', params={'path': project})
+            assert status.json()['can_delete'] is True
+            assert status.json()['blocked_reason'] == ''
+
+            removed = client.request('DELETE', '/api/v1/index', params={'path': project})
+            assert removed.status_code == 200
+            assert removed.json()['files_deleted'] == 1
+        finally:
+            client.portal.call(registry.release, 'session-1')
+
+
+@pytest.mark.usefixtures('app_database')
+def test_deletion_is_allowed_once_the_task_has_finished() -> None:
+    """
+    A finished task stops blocking even while its socket is still open.
+
+    The connection deliberately outlives the work — a completed review is still
+    worth reading — so waiting for it to close would leave the control disabled
+    for as long as the user kept the tab open.
+    """
+    import main
+    from database.models.file import File
+    from services.projects import normalise_project_path
+    from services.session_registry import SessionRegistry
+
+    project: str = '/repos/finished'
+
+    with TestClient(main.app) as client:
+        assert client.portal is not None
+
+        async def seed() -> None:
+            await File.create(
+                project=normalise_project_path(project),
+                file_path='src/main.py',
+                raw_content='x\n',
+                hash='h',
+            )
+
+        client.portal.call(seed)
+
+        registry: SessionRegistry = client.portal.call(
+            main.app.state.dishka_container.get, SessionRegistry
+        )
+        client.portal.call(registry.acquire, 'session-1')
+        client.portal.call(registry.begin_task, 'session-1')
+
+        try:
+            blocked = client.get('/api/v1/index/status', params={'path': project})
+            assert blocked.json()['can_delete'] is False
+
+            # The task terminates; the socket stays open.
+            client.portal.call(registry.end_task, 'session-1')
+
+            status = client.get('/api/v1/index/status', params={'path': project})
+            assert status.json()['can_delete'] is True
+            assert registry.is_busy is True, 'the slot should still be held'
         finally:
             client.portal.call(registry.release, 'session-1')

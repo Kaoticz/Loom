@@ -28,6 +28,7 @@ dependencies = [
     "python-dotenv",
     "pydantic",
     "pydantic-ai>=2.18.0,<3",
+    "pydantic-ai-harness",
     "pyjwt",
     "tortoise-embeddings",
     "dishka",
@@ -70,7 +71,9 @@ reportUnknownLambdaType = false
 dev = [
     "setuptools",   # Often needed for tools in editable mode
     "mypy",
-    "basedpyright"
+    "basedpyright",
+    "pytest",
+    "pytest-asyncio"
 ]
 
 [tool.pytest.ini_options]

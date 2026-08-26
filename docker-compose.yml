@@ -3,7 +3,7 @@ services:
     container_name: loom-postgres
     image: pgvector/pgvector:pg18-trixie
     environment:
-      POSTGRES_DB: loom
+      POSTGRES_DB: loom_db
       POSTGRES_USER: loom
       POSTGRES_PASSWORD: loom_password
     ports:
@@ -11,7 +11,7 @@ services:
     volumes:
       - postgres_data:/var/lib/postgresql
     healthcheck:
-      test: ['CMD-SHELL', 'pg_isready -U loom -d loom']
+      test: ['CMD-SHELL', 'pg_isready -U loom -d loom_db']
       interval: 5s
       timeout: 5s
       retries: 5
@@ -85,7 +85,7 @@ services:
       - path: ./backend/.env
         required: false
     environment:
-      - DATABASE_URL=postgres://loom:loom_password@postgres:5432/loom
+      - DATABASE_URL=postgres://loom:loom_password@postgres:5432/loom_db
       - OLLAMA_BASE_URL=http://ollama:11434
       - SEARXNG_URL=http://searxng:8080
     ports:

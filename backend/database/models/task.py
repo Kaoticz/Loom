@@ -2,7 +2,15 @@ from datetime import datetime
 from uuid import UUID
 
 from database.enums import TaskStatus
-from tortoise.fields import CharEnumField, CharField, DatetimeField, Field, TextField, UUIDField
+from tortoise.fields import (
+    CharEnumField,
+    CharField,
+    DatetimeField,
+    Field,
+    IntField,
+    TextField,
+    UUIDField,
+)
 from tortoise.models import Model
 
 class Task(Model):
@@ -35,6 +43,24 @@ class Task(Model):
     reviewer_model: Field[str] = CharField(max_length=255, default='')
     """
     The model used to review the work.
+    """
+
+    coder_context_window: Field[int] = IntField(default=0)
+    """
+    Context window, in tokens, budgeted for the coder agent.
+
+    Zero means the user configured nothing and the default was used. Recorded as
+    the raw setting rather than the resolved number so that a later change to
+    the default is visible in old tasks as "unset", not as the old default.
+    """
+
+    planner_context_window: Field[int] = IntField(default=0)
+    """
+    Context window, in tokens, budgeted for the planner agent.
+
+    Separate from the coder's at the user's direction. The two agents share one
+    model setting today, so a deployment where they differ is one where the user
+    wants the planner held to a tighter budget than the coder.
     """
 
     branch_name: Field[str] = CharField(max_length=255, default='')

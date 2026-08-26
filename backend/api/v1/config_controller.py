@@ -119,7 +119,10 @@ async def index_status(
     project: str = normalise_project_path(path)
     indexed: int = await count_project_index(project)
 
-    if registry.is_busy:
+    # Deliberately not `is_busy`: that is true from the moment a tab connects,
+    # which would block deletion on an idle session that has been given nothing
+    # to do.
+    if registry.has_active_task:
         return IndexStatusResponse(
             project=project,
             indexed_files=indexed,
@@ -147,15 +150,16 @@ async def delete_index(
     """
     Remove everything indexed for a project.
 
-    Refused while a session is running: deleting the index underneath a working
+    Refused while a task is running: deleting the index underneath a working
     agent does not raise anything it can report, it simply makes every search
     come back empty, which reads as an unindexed repository rather than as a
-    deliberate act.
+    deliberate act. A session that is merely connected is not working, so it
+    does not refuse.
 
     Re-indexing is not started here. It happens when a session next begins, and
     the interface says so.
     """
-    if registry.is_busy:
+    if registry.has_active_task:
         raise HTTPException(status_code=409, detail=SESSION_ACTIVE_REASON)
 
     project: str = normalise_project_path(path)

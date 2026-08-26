@@ -10,6 +10,7 @@
         "review",
         "done",
         "error",
+        "warning",
         "session_busy",
         "question",
         "system",

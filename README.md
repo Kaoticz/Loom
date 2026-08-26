@@ -149,7 +149,7 @@ services are reachable by name rather than on `localhost`.
 
 | Variable | Default | Purpose |
 |---|---|---|
-| `DATABASE_URL` | `postgres://loom:loom_password@localhost:5432/loom` | Postgres, with the `vector` extension available |
+| `DATABASE_URL` | `postgres://loom:loom_password@localhost:5432/loom_db` | Postgres, with the `vector` extension available |
 | `OLLAMA_BASE_URL` | `http://localhost:11434` | Where Ollama is listening |
 | `SEARXNG_URL` | `http://localhost:8080` | Where SearXNG is listening |
 | `REPO_PATH` | `/tmp/repo` | The repository, as this process sees it |
@@ -210,7 +210,7 @@ The backend suite runs with no external services, skipping the parts that need t
 everything:
 
 ```bash
-export TEST_DATABASE_URL='postgres://loom:loom_password@localhost:5432/loom'
+export TEST_DATABASE_URL='postgres://loom:loom_password@localhost:5432/loom_db'
 export AST_GREP_BIN=/path/to/ast-grep     # only if not on PATH
 pytest
 ```

@@ -24,7 +24,8 @@ export const MARKDOWN_TYPES: MessageType[] = [
     'plan',
     'review',
     'done',
-    'error'
+    'error',
+    'warning'
 ];
 
 /** The dot beside the connection label. */
@@ -45,6 +46,9 @@ export const typeStyles: Record<MessageType, string> = {
     commit: 'bg-slate-50 border-slate-200 text-slate-600 font-mono text-xs',
     done: 'bg-green-100 border-green-300 text-green-900 font-bold',
     error: 'bg-red-50 border-red-200 text-red-800',
+    // Amber rather than red: something failed but the run is still going, and
+    // red would tell the user their session had died when it has not.
+    warning: 'bg-amber-50 border-amber-300 text-amber-900',
     // A refusal, not a fault: distinct from `error` so a busy slot does not look
     // like the run failed.
     session_busy: 'bg-amber-50 border-amber-200 text-amber-900',

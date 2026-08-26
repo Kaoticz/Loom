@@ -11,6 +11,12 @@
         readChunkLines
     } from '$lib/chunkSize';
     import {
+        DEFAULT_CONTEXT_WINDOW,
+        MAX_CONTEXT_WINDOW,
+        MIN_CONTEXT_WINDOW,
+        readContextWindow
+    } from '$lib/contextWindow';
+    import {
         indexDeletionSchema,
         indexStatusSchema,
         modelDescriptionSchema,
@@ -331,6 +337,92 @@
                     </div>
                     <div>
                         <label
+                            for="coderContextWindow"
+                            class="mb-1 block text-sm font-medium text-gray-700 dark:text-gray-300"
+                            >Coder Context Window</label
+                        >
+                        <p class="mb-1 text-xs text-gray-500 dark:text-gray-400">
+                            How many tokens of history the coder may hold before older tool results
+                            are trimmed. Set this to your model's actual window. Too high and the
+                            run overflows mid-task; too low only trims sooner than needed.
+                        </p>
+                        <div class="flex items-center gap-3">
+                            <label class="flex items-center gap-2 text-sm dark:text-gray-300">
+                                <input
+                                    type="checkbox"
+                                    aria-label="Automatic coder context window"
+                                    checked={config.coderContextWindow === null}
+                                    onchange={(event) => {
+                                        config.coderContextWindow = event.currentTarget.checked
+                                            ? null
+                                            : DEFAULT_CONTEXT_WINDOW;
+                                    }}
+                                />
+                                Auto
+                            </label>
+                            <input
+                                id="coderContextWindow"
+                                type="number"
+                                min={MIN_CONTEXT_WINDOW}
+                                max={MAX_CONTEXT_WINDOW}
+                                step="1024"
+                                disabled={config.coderContextWindow === null}
+                                value={config.coderContextWindow ?? DEFAULT_CONTEXT_WINDOW}
+                                oninput={(event) => {
+                                    config.coderContextWindow = readContextWindow(
+                                        event.currentTarget.value
+                                    );
+                                }}
+                                class="w-32 rounded border border-gray-300 bg-white p-2 text-gray-900 disabled:cursor-not-allowed disabled:opacity-50 dark:border-gray-600 dark:bg-gray-700 dark:text-white"
+                            />
+                            <span class="text-xs text-gray-500 dark:text-gray-400">tokens</span>
+                        </div>
+                    </div>
+                    <div>
+                        <label
+                            for="plannerContextWindow"
+                            class="mb-1 block text-sm font-medium text-gray-700 dark:text-gray-300"
+                            >Planner Context Window</label
+                        >
+                        <p class="mb-1 text-xs text-gray-500 dark:text-gray-400">
+                            The same budget for the planning agent, which runs on the coder's model
+                            but does far less: one structured call, no tools. Held separately so a
+                            tighter planning budget does not constrain the coder.
+                        </p>
+                        <div class="flex items-center gap-3">
+                            <label class="flex items-center gap-2 text-sm dark:text-gray-300">
+                                <input
+                                    type="checkbox"
+                                    aria-label="Automatic planner context window"
+                                    checked={config.plannerContextWindow === null}
+                                    onchange={(event) => {
+                                        config.plannerContextWindow = event.currentTarget.checked
+                                            ? null
+                                            : DEFAULT_CONTEXT_WINDOW;
+                                    }}
+                                />
+                                Auto
+                            </label>
+                            <input
+                                id="plannerContextWindow"
+                                type="number"
+                                min={MIN_CONTEXT_WINDOW}
+                                max={MAX_CONTEXT_WINDOW}
+                                step="1024"
+                                disabled={config.plannerContextWindow === null}
+                                value={config.plannerContextWindow ?? DEFAULT_CONTEXT_WINDOW}
+                                oninput={(event) => {
+                                    config.plannerContextWindow = readContextWindow(
+                                        event.currentTarget.value
+                                    );
+                                }}
+                                class="w-32 rounded border border-gray-300 bg-white p-2 text-gray-900 disabled:cursor-not-allowed disabled:opacity-50 dark:border-gray-600 dark:bg-gray-700 dark:text-white"
+                            />
+                            <span class="text-xs text-gray-500 dark:text-gray-400">tokens</span>
+                        </div>
+                    </div>
+                    <div>
+                        <label
                             for="embeddingModel"
                             class="mb-1 block text-sm font-medium text-gray-700 dark:text-gray-300"
                             >Embedding Model</label
@@ -386,6 +478,7 @@
                             <label class="flex items-center gap-2 text-sm dark:text-gray-300">
                                 <input
                                     type="checkbox"
+                                    aria-label="Automatic chunk size"
                                     checked={config.chunkLines === null}
                                     onchange={(event) => {
                                         config.chunkLines = event.currentTarget.checked

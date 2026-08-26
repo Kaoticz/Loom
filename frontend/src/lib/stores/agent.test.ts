@@ -1389,3 +1389,25 @@ describe('chunk size', () => {
         expect(socket.lastSent.chunk_lines).toBe(80);
     });
 });
+
+describe('warnings do not end the session', () => {
+    it('shows a warning without marking the session failed', async () => {
+        // Sent when a commit failed but the plan carries on. Treating it like an
+        // error would tell the user their run had died when it had not.
+        const { store, socket } = await connected();
+
+        socket.deliver({ type: 'warning', content: 'Could not commit the changes.' });
+
+        expect(latest(store).type).toBe('warning');
+        expect(latest(store).content).toContain('Could not commit');
+        expect(get(store).status).not.toBe('failed');
+    });
+
+    it('still fails the session on a real error', async () => {
+        const { store, socket } = await connected();
+
+        socket.deliver({ type: 'error', content: 'Unrecoverable.' });
+
+        expect(get(store).status).toBe('failed');
+    });
+});

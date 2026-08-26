@@ -56,6 +56,8 @@ class TaskController:
             repo_path=body.repo_path,
             coder_model=body.coder_model,
             reviewer_model=body.reviewer_model,
+            coder_context_window=body.coder_context_window,
+            planner_context_window=body.planner_context_window,
             status=TaskStatus.initialized,
         )
         return to_response(task)
@@ -104,6 +106,8 @@ class TaskController:
             task=to_response(task),
             coder_model=task.coder_model,
             reviewer_model=task.reviewer_model,
+            coder_context_window=task.coder_context_window,
+            planner_context_window=task.planner_context_window,
             log=[
                 TaskLogEntryResponse(
                     entry_type=entry.entry_type,

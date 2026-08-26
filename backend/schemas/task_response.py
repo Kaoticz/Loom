@@ -34,6 +34,8 @@ class TaskDetailResponse(BaseModel):
     task: Annotated[TaskResponse, Field(description='The task itself.')]
     coder_model: Annotated[str, Field(description='Model used to plan and execute the work.')]
     reviewer_model: Annotated[str, Field(description='Model used to review the work.')]
+    coder_context_window: Annotated[int, Field(ge=0, description='Context window in tokens budgeted for the coder agent. Zero means the default was used.')]
+    planner_context_window: Annotated[int, Field(ge=0, description='Context window in tokens budgeted for the planner agent. Zero means the default was used.')]
     log: Annotated[list[TaskLogEntryResponse], Field(default_factory=list, description='The recorded action log, oldest first.')]
 
 

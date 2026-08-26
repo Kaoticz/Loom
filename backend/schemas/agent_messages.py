@@ -13,6 +13,7 @@ from services.event_bus import (
     DiffEvent,
     DoneEvent,
     ErrorEvent,
+    WarningEvent,
     PlanEvent,
     QuestionEvent,
     ReviewEvent,
@@ -81,6 +82,7 @@ class MessageType(str, Enum):
     review = 'review'
     done = 'done'
     error = 'error'
+    warning = 'warning'
     session_busy = 'session_busy'
     question = 'question'
     system = 'system'
@@ -215,6 +217,18 @@ class ErrorMessage(BaseAgentMessage):
     content: Annotated[str, Field()]
 
 
+class WarningMessage(BaseAgentMessage):
+    """
+    Something failed but the session is carrying on.
+
+    Separate from `ErrorMessage`, which ends the session. A client that renders
+    both alike tells the user their run has died when it has not.
+    """
+
+    type: Annotated[Literal[MessageType.warning], Field()] = MessageType.warning
+    content: Annotated[str, Field()]
+
+
 class SessionBusyMessage(BaseAgentMessage):
     """
     A session is already running, so this connection cannot start one.
@@ -272,6 +286,7 @@ AgentMessage = Annotated[
     | ReviewMessage
     | DoneMessage
     | ErrorMessage
+    | WarningMessage
     | SessionBusyMessage
     | SystemMessage
     | SandboxUnavailableMessage,
@@ -343,6 +358,8 @@ def to_message(event: BaseAgentEvent) -> AgentMessage:
         )
     if isinstance(event, ErrorEvent):
         return ErrorMessage(content=event.content)
+    if isinstance(event, WarningEvent):
+        return WarningMessage(content=event.content)
     if isinstance(event, SandboxUnavailableEvent):
         return SandboxUnavailableMessage(stage=event.stage, reason=event.reason)
     if isinstance(event, SystemEvent):

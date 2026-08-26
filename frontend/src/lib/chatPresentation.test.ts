@@ -248,3 +248,12 @@ describe('promptPlaceholder', () => {
         expect(promptPlaceholder('reviewing', 'approve_review')).toMatch(/reason/i);
     });
 });
+
+describe('warnings versus errors', () => {
+    it('styles a warning differently from an error', () => {
+        // A warning means the run is still going. Rendering it like an error
+        // tells the user their session has died when it has not.
+        expect(typeStyles.warning).not.toBe(typeStyles.error);
+        expect(typeStyles.warning).not.toContain('red');
+    });
+});

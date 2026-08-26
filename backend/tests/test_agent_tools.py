@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import os
+
 from collections.abc import Sequence
 
 from pathlib import Path
@@ -32,10 +34,16 @@ from tests.conftest import TEST_PROJECT, TEST_REPO_PATH, git_log, stub_embedding
 
 EXPECTED_TOOLS: set[str] = {
     'ask_user',
+    'complete_step',
+    'record_test_command',
+    'forget_test_command',
+    'skip_verification',
+    'accept_step_without_changes',
     'search_code',
     'search_code_lexical',
     'get_symbol',
     'read_file',
+    'list_files',
     'create_file',
     'edit_file',
     'run_test_command',
@@ -85,9 +93,12 @@ def test_all_tools_are_registered() -> None:
     assert set(coder_agent._function_toolset.tools) == EXPECTED_TOOLS
 
 
-async def test_create_file_writes_commits_and_emits(deps: AgentDeps, events: EventBus) -> None:
+async def test_create_file_writes_and_emits(deps: AgentDeps, events: EventBus) -> None:
     """
-    Creating a file writes it, commits it, and reports both events.
+    Creating a file writes it and reports it, without committing.
+
+    The commit happens when the step finishes, not per write: a commit per edit
+    turned one step into a string of commits nobody chose the boundaries of.
     """
     seen: list[Any] = []
 
@@ -102,7 +113,9 @@ async def test_create_file_writes_commits_and_emits(deps: AgentDeps, events: Eve
     assert 'Created pkg/mod.py' in result
     assert Path(root, 'pkg/mod.py').read_text().startswith('def added():')
     assert 'pkg/mod.py' in deps.session.modified_files
-    assert 'Create pkg/mod.py' in git_log(root)
+    assert 'Create pkg/mod.py' not in git_log(root), 'the write should not have committed'
+    # Kept for the step's eventual commit message.
+    assert 'Create pkg/mod.py' in deps.session.pending_change_summaries
     assert any(isinstance(event, ToolActionEvent) for event in seen)
     assert any(isinstance(event, ToolObservationEvent) for event in seen)
 
@@ -155,6 +168,60 @@ async def test_run_test_command_reports_the_verdict(deps: AgentDeps) -> None:
     failing: str = await invoke('run_test_command', deps, command='pytest')
     assert 'FAILED with exit code 1' in failing
     assert deps.session.last_verification_passed is False
+
+
+async def test_playwright_is_refused_before_reaching_the_sandbox(deps: AgentDeps) -> None:
+    """
+    The command never runs, and the refusal points at `agent-browser`.
+
+    Refused before execution rather than after: installing a browser stack is
+    slow and leaves the sandbox changed, so running it and complaining
+    afterwards would achieve neither.
+    """
+    from services.docker_sandbox import CommandResult
+
+    ran: list[str] = []
+
+    async def record(command: str) -> CommandResult:
+        ran.append(command)
+        return CommandResult(exit_code=0, output='')
+
+    deps.docker.run_test_command = record  # type: ignore[method-assign]
+
+    result: str = await invoke('run_test_command', deps, command='npx playwright install')
+
+    assert ran == [], 'the command should not have reached the sandbox'
+    assert 'agent-browser' in result
+    assert 'was not run' in result
+
+
+async def test_a_refused_command_is_not_recorded_as_a_verification(deps: AgentDeps) -> None:
+    """
+    Nothing ran, so nothing was verified.
+
+    Recording it either way would corrupt the completion gate: a pass would let
+    the agent finish on the strength of a command that never executed.
+    """
+    before: bool | None = deps.session.last_verification_passed
+
+    await invoke('run_test_command', deps, command='pip install selenium')
+
+    assert deps.session.last_verification_passed is before
+
+
+async def test_agent_browser_itself_reaches_the_sandbox(deps: AgentDeps) -> None:
+    """
+    The tool the agent is being pointed at must not be caught by the guard.
+    """
+    from tests.test_sandbox import attach_fake_container
+
+    attach_fake_container(deps.docker, 0, b'installed')
+
+    result: str = await invoke(
+        'run_test_command', deps, command='npx --yes agent-browser install'
+    )
+
+    assert 'Command passed' in result
 
 
 @pytest.mark.usefixtures('db')
@@ -608,9 +675,14 @@ async def test_a_half_failed_search_says_so_in_the_feed(
     assert all('SECRET_BODY' not in str(event.arguments) for event in actions)
 
 
-async def test_create_file_emits_commit_and_diff(deps: AgentDeps, events: EventBus) -> None:
+async def test_create_file_emits_a_diff_but_no_commit(
+    deps: AgentDeps, events: EventBus
+) -> None:
     """
-    Creating a file announces the commit and both sides of the diff.
+    Creating a file announces the diff and nothing about a commit.
+
+    The diff is per edit because the live viewer shows each edit as it lands,
+    which has nothing to do with commit cadence.
     """
     seen: list[AgentEvent] = collect(events)
     await deps.git.create_branch('ai-task-diff')
@@ -620,9 +692,7 @@ async def test_create_file_emits_commit_and_diff(deps: AgentDeps, events: EventB
     commits = [event for event in seen if isinstance(event, CommitEvent)]
     diffs = [event for event in seen if isinstance(event, DiffEvent)]
 
-    assert len(commits) == 1
-    assert commits[0].commit_hash
-    assert commits[0].message == 'Create new.py'
+    assert commits == []
 
     assert len(diffs) == 1
     assert diffs[0].file_path == 'new.py'
@@ -739,7 +809,7 @@ async def test_a_broken_base_branch_does_not_block_edits(
     assert 'Edited tracked.py' in result
     assert Path(root, 'tracked.py').read_text() == 'value = 2\n'
     assert [event for event in seen if isinstance(event, DiffEvent)] == []
-    assert len([event for event in seen if isinstance(event, CommitEvent)]) == 1
+    assert [event for event in seen if isinstance(event, CommitEvent)] == []
 
 
 async def test_new_file_still_gets_a_diff_with_an_empty_original(
@@ -1148,3 +1218,370 @@ async def test_ask_user_reports_itself_like_every_other_tool(
 
     actions = [event for event in seen if isinstance(event, ToolActionEvent)]
     assert [event.tool_name for event in actions] == ['ask_user']
+
+
+async def test_list_files_names_its_argument_like_every_other_file_tool(
+    deps: AgentDeps,
+) -> None:
+    """
+    The tools share a vocabulary, or the model spends its retries learning it.
+
+    `list_files` once took `subdirectory` while `read_file`, `create_file` and
+    `edit_file` all took `path`. A model calling it the way the rest of the
+    toolset taught it produced a schema validation error, and pydantic-ai counts
+    those as retries — five wrong guesses ended the session outright.
+    """
+    from agents.coder import coder_agent
+
+    schema: dict[str, Any] = (
+        coder_agent._function_toolset.tools['list_files'].tool_def.parameters_json_schema
+    )
+
+    assert 'path' in schema['properties']
+    assert 'subdirectory' not in schema['properties']
+
+
+async def test_list_files_lists_the_repository(deps: AgentDeps) -> None:
+    """
+    The plain case: everything not ignored.
+    """
+    root: str = deps.git.repo_path
+    Path(root, 'alpha.py').write_text('a = 1\n', encoding='utf-8')
+    Path(root, 'pkg').mkdir(exist_ok=True)
+    Path(root, 'pkg', 'beta.py').write_text('b = 2\n', encoding='utf-8')
+
+    result: str = await invoke('list_files', deps)
+
+    assert 'alpha.py' in result
+    assert f'pkg{os.sep}beta.py' in result
+
+
+async def test_list_files_narrows_to_a_directory(deps: AgentDeps) -> None:
+    """
+    Passing a directory lists only what is under it.
+    """
+    root: str = deps.git.repo_path
+    Path(root, 'alpha.py').write_text('a = 1\n', encoding='utf-8')
+    Path(root, 'pkg').mkdir(exist_ok=True)
+    Path(root, 'pkg', 'beta.py').write_text('b = 2\n', encoding='utf-8')
+
+    result: str = await invoke('list_files', deps, path='pkg')
+
+    assert 'beta.py' in result
+    assert 'alpha.py' not in result
+
+
+async def test_a_directory_that_does_not_exist_is_not_a_failure(deps: AgentDeps) -> None:
+    """
+    A miss is a legitimate answer to "what is in here", not an error.
+
+    Reported as a failure it tells the model nothing, so it guesses again — and
+    repeated guessing is what exhausts the retry budget and ends the session.
+    The reply names the directories that do exist so one turn is enough.
+    """
+    root: str = deps.git.repo_path
+    Path(root, 'pkg').mkdir(exist_ok=True)
+    Path(root, 'pkg', 'beta.py').write_text('b = 2\n', encoding='utf-8')
+
+    result: str = await invoke('list_files', deps, path='source')
+
+    assert 'Nothing in the repository matches' in result
+    assert 'pkg' in result, 'the reply should name a directory that does exist'
+
+
+async def test_a_miss_is_answered_at_the_depth_that_was_asked_for(
+    deps: AgentDeps,
+) -> None:
+    """
+    A wrong guess three levels down is answered three levels down.
+
+    Replying with the repository root would make the model start over rather
+    than correct the part it got wrong.
+    """
+    root: str = deps.git.repo_path
+    Path(root, 'pkg', 'inner').mkdir(parents=True, exist_ok=True)
+    Path(root, 'pkg', 'inner', 'beta.py').write_text('b = 2\n', encoding='utf-8')
+
+    result: str = await invoke('list_files', deps, path='pkg/missing')
+
+    assert f'pkg{os.sep}inner' in result
+
+
+async def test_a_miss_below_a_wrong_parent_falls_back_to_the_top(
+    deps: AgentDeps,
+) -> None:
+    """
+    Answering at a depth whose parent is also wrong would repeat the mistake.
+    """
+    root: str = deps.git.repo_path
+    Path(root, 'pkg').mkdir(exist_ok=True)
+    Path(root, 'pkg', 'beta.py').write_text('b = 2\n', encoding='utf-8')
+
+    result: str = await invoke('list_files', deps, path='nowhere/deeper')
+
+    assert 'pkg' in result
+
+
+async def test_edit_file_survives_an_absolute_path_and_a_stray_argument(
+    deps: AgentDeps,
+) -> None:
+    """
+    The exact call shape that killed a real session.
+
+    The model sent an absolute path and an argument nobody defined. The schema
+    forbade unknown properties, so pydantic-ai rejected the call before it ran,
+    counted it as a retry, and five such attempts ended the session — over an
+    edit that was otherwise perfectly well formed.
+    """
+    root: str = deps.git.repo_path
+    Path(root, 'a.py').write_text('value = 1\n', encoding='utf-8')
+
+    result: str = await invoke(
+        'edit_file',
+        deps,
+        path=os.path.join(root, 'a.py'),
+        search='value = 1',
+        replace='value = 2',
+        summary='bump',
+        suffix_added=True,
+    )
+
+    assert 'Could not edit' not in result
+    assert Path(root, 'a.py').read_text() == 'value = 2\n'
+    # Named rather than dropped in silence, so the model stops sending it.
+    assert 'suffix_added' in result
+    # Recorded relative, or the commit message and git lookups go wrong.
+    assert 'a.py' in deps.session.modified_files
+    assert root not in ' '.join(deps.session.modified_files)
+
+
+async def test_every_tool_parameter_is_described_to_the_model() -> None:
+    """
+    A parameter with only a name leaves the model guessing what it means.
+
+    `edit_file` took `search` and `replace` with nothing said about either, so a
+    model had to infer from the names alone that they are exact text copied from
+    the file. Guessing wrong costs a retry, and five wrong guesses end the run.
+    """
+    from agents.coder import answering_agent, coder_agent
+    from agents.planner import planner_agent
+
+    undocumented: list[str] = []
+    for agent in (coder_agent, answering_agent, planner_agent):
+        for name, tool in agent._function_toolset.tools.items():
+            schema: dict[str, Any] = tool.tool_def.parameters_json_schema
+            for parameter, spec in schema.get('properties', {}).items():
+                if not spec.get('description'):
+                    undocumented.append(f'{name}.{parameter}')
+
+    assert undocumented == [], f'parameters with no description: {sorted(set(undocumented))}'
+
+
+async def test_the_file_tools_agree_on_what_a_path_is() -> None:
+    """
+    A shared vocabulary, or the model spends its retries discovering it.
+
+    `list_files` once took `subdirectory` while everything else took `path`,
+    which ended a session on its own.
+    """
+    from agents.coder import coder_agent
+
+    for name in ('read_file', 'create_file', 'edit_file', 'list_files'):
+        schema: dict[str, Any] = (
+            coder_agent._function_toolset.tools[name].tool_def.parameters_json_schema
+        )
+        assert 'path' in schema['properties'], f'{name} does not take a path'
+
+
+async def test_a_missing_file_says_how_to_find_the_right_one(deps: AgentDeps) -> None:
+    """
+    Refusing without saying what to do next invites another guess.
+    """
+    result: str = await invoke('read_file', deps, path='nowhere.py')
+
+    assert 'does not exist' in result
+    assert 'list_files' in result
+
+
+@pytest.mark.parametrize('spelling', ['.', './', '', 'REPO_ROOT', 'REPO_ROOT/'])
+async def test_list_files_understands_every_way_of_naming_the_root(
+    deps: AgentDeps, spelling: str
+) -> None:
+    """
+    A model asking for "." means the repository, and was told nothing matched.
+
+    Refusing a spelling that obviously means the root does more than waste a
+    turn: the agent never sees the layout, so it never finds the README that
+    says how the project is tested.
+    """
+    root: str = deps.git.repo_path
+    Path(root, 'README.md').write_text('# Run tests with: pytest\n', encoding='utf-8')
+
+    result: str = await invoke('list_files', deps, path=spelling.replace('REPO_ROOT', root))
+
+    assert 'README.md' in result
+    assert 'Nothing in the repository matches' not in result
+
+
+async def test_list_files_ignores_a_trailing_slash_or_dot_prefix(deps: AgentDeps) -> None:
+    """
+    "./pkg", "pkg/" and "pkg" all name the same directory.
+    """
+    root: str = deps.git.repo_path
+    Path(root, 'pkg').mkdir(exist_ok=True)
+    Path(root, 'pkg', 'beta.py').write_text('b = 2\n', encoding='utf-8')
+
+    for spelling in ('pkg', './pkg', 'pkg/'):
+        result: str = await invoke('list_files', deps, path=spelling)
+        assert 'beta.py' in result, f'{spelling!r} did not list the directory'
+
+
+async def test_a_missing_tool_does_not_count_as_a_failed_verification(
+    deps: AgentDeps,
+) -> None:
+    """
+    Nothing was verified, so nothing should be charged to the allowance.
+
+    The allowance exists for a repository whose tests were already failing, and
+    once it is spent the completion gate releases. Charging a missing tool to it
+    turns "pytest is not installed" into permission to stop verifying, which is
+    exactly the wandering this guards against.
+    """
+    from services.docker_sandbox import CommandResult
+
+    async def missing(command: str) -> CommandResult:
+        return CommandResult(exit_code=127, output='bash: pytest: command not found')
+
+    deps.docker.run_test_command = missing  # type: ignore[method-assign]
+    before: int = deps.session.failed_verifications
+
+    result: str = await invoke('run_test_command', deps, command='pytest -q')
+
+    assert deps.session.failed_verifications == before, 'the allowance was charged'
+    assert 'not installed' in result
+    assert 'Install it inside the sandbox' in result
+
+
+async def test_a_missing_python_module_is_recognised_too(deps: AgentDeps) -> None:
+    """
+    `python -m pytest` without pytest exits 1, not 127.
+
+    The exit code is indistinguishable from a real failure, and this is the most
+    likely way the problem shows up in a Python repository.
+    """
+    from services.docker_sandbox import CommandResult
+
+    async def missing(command: str) -> CommandResult:
+        return CommandResult(exit_code=1, output='/usr/bin/python: No module named pytest')
+
+    deps.docker.run_test_command = missing  # type: ignore[method-assign]
+    before: int = deps.session.failed_verifications
+
+    result: str = await invoke('run_test_command', deps, command='python -m pytest')
+
+    assert deps.session.failed_verifications == before
+    assert 'not installed' in result
+
+
+async def test_a_real_test_failure_still_counts(deps: AgentDeps) -> None:
+    """
+    Narrowness matters: a genuine defect must not be read as a missing tool.
+
+    Telling the agent to install something when the code is broken would send it
+    after the wrong problem entirely.
+    """
+    from services.docker_sandbox import CommandResult
+
+    async def failing(command: str) -> CommandResult:
+        return CommandResult(exit_code=1, output='FAILED tests/test_a.py::test_b - assert 1 == 2')
+
+    deps.docker.run_test_command = failing  # type: ignore[method-assign]
+    before: int = deps.session.failed_verifications
+
+    result: str = await invoke('run_test_command', deps, command='pytest -q')
+
+    assert deps.session.failed_verifications == before + 1
+    assert 'not installed' not in result
+
+
+async def test_a_command_that_was_never_run_cannot_be_recorded(deps: AgentDeps) -> None:
+    """
+    The exact trace from a real session, and why it mattered.
+
+    The agent ran `node -v && npm -v`, then recorded `npm install && vite build
+    && npm run typecheck && npm run test` — four things it had never tried
+    together, one of which reinstalls the world on every use. Every later step
+    would have inherited it.
+    """
+    from services.docker_sandbox import CommandResult
+
+    async def probe(command: str) -> CommandResult:
+        return CommandResult(exit_code=0, output='v25.9.0\n11.12.1')
+
+    deps.docker.run_test_command = probe  # type: ignore[method-assign]
+    await invoke('run_test_command', deps, command='node -v && npm -v')
+
+    result: str = await invoke(
+        'record_test_command',
+        deps,
+        command='npm install && vite build && npm run typecheck && npm run test',
+    )
+
+    assert 'rejected' in result
+    assert 'has not been run and passed' in result
+    assert deps.session.test_command == ''
+
+
+async def test_a_command_that_passed_can_be_recorded(deps: AgentDeps) -> None:
+    """
+    The intended path: run it, watch it pass, then record it.
+    """
+    from services.docker_sandbox import CommandResult
+
+    async def passing(command: str) -> CommandResult:
+        return CommandResult(exit_code=0, output='4 passed')
+
+    deps.docker.run_test_command = passing  # type: ignore[method-assign]
+    await invoke('run_test_command', deps, command='npm run test')
+
+    result: str = await invoke('record_test_command', deps, command='npm run test')
+
+    assert 'rejected' not in result
+    assert deps.session.test_command == 'npm run test'
+
+
+async def test_a_command_that_failed_cannot_be_recorded(deps: AgentDeps) -> None:
+    """
+    A command that ran and failed has not been shown to verify anything.
+    """
+    from services.docker_sandbox import CommandResult
+
+    async def failing(command: str) -> CommandResult:
+        return CommandResult(exit_code=1, output='1 failed')
+
+    deps.docker.run_test_command = failing  # type: ignore[method-assign]
+    await invoke('run_test_command', deps, command='npm run test')
+
+    result: str = await invoke('record_test_command', deps, command='npm run test')
+
+    assert 'rejected' in result
+    assert deps.session.test_command == ''
+
+
+async def test_recording_must_match_what_was_run(deps: AgentDeps) -> None:
+    """
+    Near enough is not enough: the extra part is the part that was never tried.
+    """
+    from services.docker_sandbox import CommandResult
+
+    async def passing(command: str) -> CommandResult:
+        return CommandResult(exit_code=0, output='ok')
+
+    deps.docker.run_test_command = passing  # type: ignore[method-assign]
+    await invoke('run_test_command', deps, command='npm run test')
+
+    result: str = await invoke(
+        'record_test_command', deps, command='npm install && npm run test'
+    )
+
+    assert 'rejected' in result

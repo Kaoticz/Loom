@@ -8,7 +8,7 @@ from environment import load_environment
 load_environment()
 from database import vector_client as vector_client  # noqa: F401  installs the pgvector client
 
-DEFAULT_DATABASE_URL: str = 'postgres://loom:loom_password@localhost:5432/loom'
+DEFAULT_DATABASE_URL: str = 'postgres://loom:loom_password@localhost:5432/loom_db'
 
 
 def database_url() -> str:

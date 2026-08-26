@@ -3,6 +3,9 @@ from git.exc import GitCommandError
 from pydantic import BaseModel, Field
 from typing import Annotated
 import asyncio
+from logging import Logger, getLogger
+
+logger: Logger = getLogger(__name__)
 
 
 class FileChange(BaseModel):
@@ -32,6 +35,28 @@ class CommitInfo(BaseModel):
     commit_hash: Annotated[str, Field(description='The full SHA of the new commit.')]
     message: Annotated[str, Field(description='The commit message.')]
     files_changed: Annotated[list[str], Field(default_factory=list, description='Repository-relative paths touched by the commit.')]
+
+class CommitResult(BaseModel):
+    """
+    What came of trying to commit.
+
+    All three outcomes are distinct and the caller acts differently on each: a
+    commit was made, there was nothing to commit, or it failed and the changes
+    are still sitting in the working tree where review will not see them.
+    """
+
+    commit: Annotated[CommitInfo | None, Field(description='The commit, if one was made.')] = None
+    error: Annotated[str | None, Field(description='Why the commit failed, if it did.')] = None
+
+    @property
+    def failed(self) -> bool:
+        """
+        Whether the commit was attempted and did not succeed.
+
+        :returns: True if an error was recorded.
+        """
+        return self.error is not None
+
 
 class GitManagerService:
     """
@@ -163,6 +188,50 @@ class GitManagerService:
                 files_changed=sorted(path for path in changed if path)
             )
         return await asyncio.to_thread(_commit)
+
+    async def commit_changes_with_retry(self, message: str) -> CommitResult:
+        """
+        Commit, retrying once, and report the outcome rather than raising.
+
+        A commit can fail for reasons that pass on their own — an index lock
+        held by something else for a moment — and for reasons that never will,
+        such as an unconfigured identity. One retry separates the two cheaply.
+
+        The failure is returned rather than raised because the caller is part
+        way through a plan: the changes are on disk either way, and killing the
+        session loses the work along with the diagnosis.
+
+        :param message: The commit message.
+        :returns: The commit, the reason it failed, or neither if there was nothing to commit.
+        """
+        attempts: int = 2
+        last: Exception | None = None
+
+        for attempt in range(1, attempts + 1):
+            try:
+                commit: CommitInfo | None = await self.commit_changes(message)
+            except Exception as error:
+                last = error
+                logger.warning('Commit attempt %d of %d failed: %s', attempt, attempts, error)
+                continue
+            return CommitResult(commit=commit, error=None)
+
+        return CommitResult(commit=None, error=str(last) if last is not None else 'unknown error')
+
+    async def has_uncommitted_changes(self) -> bool:
+        """
+        Whether the working tree holds anything not yet committed.
+
+        Used to tell "the commit failed" apart from "there was nothing to
+        commit", and to notice work that would otherwise reach neither the
+        reviewer nor the merge, both of which read only commits.
+
+        :returns: True if anything is modified, staged or untracked.
+        """
+        def _dirty() -> bool:
+            return bool(self.repo.is_dirty(untracked_files=True))
+
+        return await asyncio.to_thread(_dirty)
 
     async def get_file_at_branch(self, branch: str, file_path: str) -> str | None:
         """

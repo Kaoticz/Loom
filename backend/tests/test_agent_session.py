@@ -30,10 +30,11 @@ from services.event_bus import (
 )
 from services.indexing_progress import ProgressReporter
 from services.file_editor import FileEditorService
-from services.git_manager import FileChange, GitManagerService
+from services.git_manager import CommitResult, FileChange, GitManagerService
 from services.session_context import SessionContext
 from services.session_fsm import SessionState, SessionStateMachine
 from services.session_limits import IterationLimits
+from services.session_registry import SessionRegistry
 from tests.conftest import TEST_REPO_PATH, stub_embedding_service
 
 
@@ -77,6 +78,10 @@ class FakeWebSocket:
 class FakeGit:
     """
     A git manager stand-in recording the calls a session makes.
+
+    `dirty` answers `has_uncommitted_changes`, which the session consults when a
+    user claims to have committed by hand. False by default: a fake repository
+    with no writes to it has nothing outstanding.
     """
 
     repo_path: str
@@ -84,6 +89,7 @@ class FakeGit:
     merged: list[str]
     changes: list[FileChange]
     merge_error: Exception | None
+    dirty: bool
 
     def __init__(self, changes: list[FileChange] | None = None) -> None:
         """
@@ -98,6 +104,7 @@ class FakeGit:
             FileChange(path='a.py', insertions=3, deletions=1)
         ]
         self.merge_error = None
+        self.dirty = False
 
     async def create_branch(self, branch_name: str) -> None:
         """
@@ -106,6 +113,23 @@ class FakeGit:
         :param branch_name: The branch requested.
         """
         self.created_branches.append(branch_name)
+
+    async def has_uncommitted_changes(self) -> bool:
+        """
+        Whether the fake working tree has anything outstanding.
+
+        :returns: Whatever `dirty` has been set to.
+        """
+        return self.dirty
+
+    async def commit_changes_with_retry(self, message: str) -> CommitResult:
+        """
+        Report a clean commit without touching a real repository.
+
+        :param message: The commit message, ignored.
+        :returns: A result with nothing to commit and no error.
+        """
+        return CommitResult(commit=None, error=None)
 
     async def get_changed_files(self, base_branch: str | None = None) -> list[FileChange]:
         """
@@ -210,6 +234,7 @@ class FakeServices:
     editor: Any
     embedding: Any
     search: Any
+    registry: SessionRegistry
 
     def __init__(self, git: FakeGit) -> None:
         """
@@ -223,6 +248,9 @@ class FakeServices:
         self.editor = MagicMock()
         self.embedding = MagicMock()
         self.search = MagicMock()
+        # A real one rather than a mock: the session reports the start and end
+        # of its task through it, and the tests below assert on what it says.
+        self.registry = SessionRegistry()
 
         async def spawn(
             session_id: str,
@@ -309,6 +337,14 @@ def stub_agents(
     """
     Replace the coder, reviewer and classifying agents with scripted stand-ins.
 
+    Also replaces `_handle_executing` wholesale with `_fake_execute`, so a test
+    using this never runs the real executing state. That is what makes the
+    surrounding session tests cheap, but it means the execution prompt, the
+    tools the coder is offered, and anything else that state builds are not
+    observable from here: `seen['coder']` records the planning prompts only.
+    Assert on any of that from `test_execution_loop.py`, which drives
+    `_handle_executing()` directly against a real repository.
+
     :param monkeypatch: Fixture used to swap the agents out.
     :param plan_outputs: The successive outputs the coder should return.
     :param review_results: The successive verdicts the reviewer should return.
@@ -320,6 +356,7 @@ def stub_agents(
     import agents.classifier as classifier_module
     import agents.coder as coder_module
     import agents.reviewer as reviewer_module
+    import agents.planner as planner_module
     import api.v1.agent_session as module
     from agents.classifier import ClassificationResult
     from agents.reviewer import ReviewResult
@@ -344,6 +381,20 @@ def stub_agents(
         result.output = plans.pop(0) if plans else '1. Fallback step'
         return result
 
+    async def fake_plan_text(prompt: str, **kwargs: Any) -> Any:
+        # Structured output is refused, standing in for the small models this
+        # fallback exists for; the text request is answered. Before the fallback
+        # moved onto the planner, the structured call failed by reaching for a
+        # model that was not there, which is what drove these tests down the
+        # text path. Refusing explicitly keeps that behaviour without the
+        # network attempt.
+        if kwargs.get('output_type') is not str:
+            raise RuntimeError('this model does not do structured output')
+        seen['coder'].append(prompt)
+        result: Any = MagicMock()
+        result.output = plans.pop(0) if plans else '1. Fallback step'
+        return result
+
     async def fake_review(prompt: str, **kwargs: Any) -> Any:
         seen['reviewer'].append(prompt)
         approved, comments = reviews.pop(0) if reviews else (True, 'Looks fine.')
@@ -353,6 +404,7 @@ def stub_agents(
 
     monkeypatch.setattr(classifier_module.classifier_agent, 'run', fake_classify)
     monkeypatch.setattr(coder_module.coder_agent, 'run', fake_run)
+    monkeypatch.setattr(planner_module.planner_agent, 'run', fake_plan_text)
     monkeypatch.setattr(reviewer_module.reviewer_agent, 'run', fake_review)
     monkeypatch.setattr(
         module.AgentSession, '_handle_executing', _fake_execute, raising=True
@@ -770,6 +822,83 @@ async def test_failure_leaves_the_machine_in_the_failed_state(
 
     assert session._machine.current is SessionState.failed
     assert session._machine.is_terminal is True
+
+
+async def test_a_finished_session_reports_that_its_task_ended(
+    monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """
+    The registry learns the task is over as soon as the machine terminates.
+
+    The socket may well stay open afterwards, so anything waiting for the
+    connection to close would keep the repository blocked for as long as the
+    user left the tab open.
+    """
+    stub_agents(monkeypatch, ['1. Do the thing'], [(True, 'Looks correct.')])
+    session, _, _, services = build_session([
+        opening(),
+        json.dumps({'approved': True}),
+        json.dumps({'approved': True}),
+    ])
+    await services.registry.acquire('testsess')
+
+    assert await session.run() is SessionState.merged
+    assert services.registry.has_active_task is False
+    # The slot is released by the socket controller, not by the session.
+    assert services.registry.is_busy is True
+
+
+async def test_a_crashed_session_does_not_leave_a_task_running(
+    monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """
+    An exception escaping the loop still clears the working flag.
+
+    Otherwise a single crash would block index deletion for the lifetime of the
+    process, with nothing left running to explain why.
+    """
+    stub_agents(monkeypatch, ['1. Attempt'], [(True, 'Fine.')])
+    session, _, _, services = build_session([opening(), json.dumps({'approved': True})])
+    await services.registry.acquire('testsess')
+
+    async def explode(base_branch: str | None = None) -> list[FileChange]:
+        raise RuntimeError('the database went away')
+
+    services.git.get_changed_files = explode  # type: ignore[method-assign]
+
+    with pytest.raises(RuntimeError):
+        await session.run()
+
+    assert services.registry.has_active_task is False
+
+
+async def test_a_prompt_marks_the_task_as_under_way(
+    monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """
+    The working flag is set once a prompt arrives, not when the socket connects.
+
+    Checked part way through rather than at the end, since by then the task has
+    finished and the flag has legitimately been cleared again.
+    """
+    stub_agents(monkeypatch, ['1. Do the thing'], [(True, 'Looks correct.')])
+    session, _, _, services = build_session([opening(), json.dumps({'approved': True})])
+    await services.registry.acquire('testsess')
+
+    assert services.registry.has_active_task is False, 'connecting is not working'
+
+    seen: list[bool] = []
+
+    async def watch(base_branch: str | None = None) -> list[FileChange]:
+        seen.append(services.registry.has_active_task)
+        raise RuntimeError('stop here')
+
+    services.git.get_changed_files = watch  # type: ignore[method-assign]
+
+    with pytest.raises(RuntimeError):
+        await session.run()
+
+    assert seen == [True]
 
 
 async def test_empty_repository_stops_for_confirmation(
@@ -1762,10 +1891,10 @@ async def test_planning_falls_back_to_text_when_structure_fails(
 
     session, _, _, _ = build_session([json.dumps({'prompt': 'do something'})])
 
-    async def coder_text(_self: object, _prompt: str) -> str:
+    async def planner_text(_self: object, _prompt: str) -> str:
         return '1. Read the file.\n2. Edit it.\nPLAN_COMPLETE'
 
-    monkeypatch.setattr(type(session), '_run_coder', coder_text)
+    monkeypatch.setattr(type(session), '_plan_as_text', planner_text)
 
     plan = await session._plan_structured('irrelevant')
 
@@ -1797,12 +1926,147 @@ async def test_structure_that_says_nothing_falls_back_too(
 
     session, _, _, _ = build_session([json.dumps({'prompt': 'do something'})])
 
-    async def coder_text(_self: object, _prompt: str) -> str:
+    async def planner_text(_self: object, _prompt: str) -> str:
         return '1. Recovered step.'
 
-    monkeypatch.setattr(type(session), '_run_coder', coder_text)
+    monkeypatch.setattr(type(session), '_plan_as_text', planner_text)
 
     plan = await session._plan_structured('irrelevant')
 
     assert plan.titles == ['Recovered step.']
     assert plan.format is PlanFormat.text
+
+
+async def test_the_context_windows_reach_the_session(monkeypatch: pytest.MonkeyPatch) -> None:
+    """
+    Windows chosen in the interface have to arrive where budgets are built.
+
+    The two are read independently, so a client setting only one does not drag
+    the other along with it.
+    """
+    stub_agents(monkeypatch, ['1. Do the thing'], [(True, 'Looks correct.')])
+    session, _, _, _ = build_session([
+        json.dumps({
+            'prompt': 'do it',
+            'coder_context_window': 40_000,
+            'planner_context_window': 8_192,
+        }),
+        json.dumps({'approved': True}),
+        json.dumps({'approved': True}),
+    ])
+
+    await session.run()
+
+    assert session._coder_context_window == 40_000
+    assert session._planner_context_window == 8_192
+
+
+@pytest.mark.parametrize(
+    'sent',
+    [None, 0, -1, 'lots', True, 1.5],
+)
+async def test_an_unusable_context_window_means_the_default(
+    monkeypatch: pytest.MonkeyPatch, sent: object
+) -> None:
+    """
+    A client sending nonsense gets the default rather than a refused session.
+
+    Zero is the stored form of "unset", which `build_compaction` reads as the
+    default, so nothing is left unbounded by a bad value.
+    """
+    stub_agents(monkeypatch, ['1. Do the thing'], [(True, 'Looks correct.')])
+    session, _, _, _ = build_session([
+        json.dumps({'prompt': 'do it', 'coder_context_window': sent}),
+        json.dumps({'approved': True}),
+        json.dumps({'approved': True}),
+    ])
+
+    await session.run()
+
+    assert session._coder_context_window == 0
+
+
+async def test_the_text_fallback_cannot_write_code(monkeypatch: pytest.MonkeyPatch) -> None:
+    """
+    The fallback runs the planner, which carries no writing tools.
+
+    It used to run the coder, whose tools include `edit_file`, `create_file`
+    and `commit_changes`. That let a plan-shaped request start writing and
+    committing before the user had approved anything. The planner does get
+    deps, because its read-only tools need something to act through — being
+    unable to write comes from those tools never having been registered.
+    """
+    from agents.planner import planner_agent
+    import agents.planner as planner_module
+
+    async def refuse(*_: object, **__: object) -> object:
+        raise RuntimeError('this model does not do structured output')
+
+    seen: list[object] = []
+
+    async def record(*args: object, **kwargs: object) -> object:
+        if kwargs.get('output_type') is not str:
+            raise RuntimeError('structured output requested')
+        seen.append(kwargs.get('deps'))
+
+        class Result:
+            output: str = '1. Recovered step.'
+
+        return Result()
+
+    calls: list[str] = []
+
+    async def dispatch(*args: object, **kwargs: object) -> object:
+        calls.append('call')
+        if len(calls) == 1:
+            return await refuse(*args, **kwargs)
+        return await record(*args, **kwargs)
+
+    monkeypatch.setattr(planner_module.planner_agent, 'run', dispatch)
+
+    session, _, _, _ = build_session([json.dumps({'prompt': 'do something'})])
+    plan = await session._plan_structured('irrelevant')
+
+    assert plan.titles == ['Recovered step.']
+    # Deps are passed, so the read-only tools can reach the repository.
+    assert seen and seen[0] is not None
+    registered: set[str] = {tool.name for tool in planner_agent._function_toolset.tools.values()}
+    assert registered.isdisjoint({'create_file', 'edit_file', 'run_test_command'})
+
+
+async def test_the_text_fallback_uses_the_planner_budget(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """
+    The budget follows the agent whose history is compacted, which is now the planner.
+    """
+    import agents.planner as planner_module
+    import api.v1.agent_session as session_module
+    from services.compaction import build_compaction
+
+    windows: list[int | None] = []
+    # Captured before patching: reaching for it through the module afterwards
+    # would find this very function and recurse.
+    original = build_compaction
+
+    def record(context_window: int | None) -> object:
+        windows.append(context_window)
+        return original(context_window)
+
+    monkeypatch.setattr(session_module, 'build_compaction', record)
+
+    session, _, _, _ = build_session([json.dumps({'prompt': 'do something'})])
+    session._planner_context_window = 8_192
+
+    async def answer(*_: object, **__: object) -> object:
+        class Result:
+            output: str = '1. A step.'
+
+        return Result()
+
+    monkeypatch.setattr(planner_module.planner_agent, 'run', answer)
+
+    await session._plan_as_text('irrelevant')
+
+    assert windows == [8_192]
+    assert original(8_192).target_tokens == build_compaction(8_192).target_tokens

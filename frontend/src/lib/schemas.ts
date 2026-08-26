@@ -105,6 +105,17 @@ const errorMessageSchema = z.object({
     content: z.string()
 });
 
+/**
+ * Something failed but the session is carrying on.
+ *
+ * Separate from `error`, which means the session is over. Rendering both the
+ * same way tells the user their run has died when it has not.
+ */
+const warningMessageSchema = z.object({
+    type: z.literal('warning'),
+    content: z.string()
+});
+
 const sessionBusyMessageSchema = z.object({
     type: z.literal('session_busy'),
     content: z.string(),
@@ -171,6 +182,7 @@ export const agentMessageSchema = z.discriminatedUnion('type', [
     doneMessageSchema,
     questionMessageSchema,
     errorMessageSchema,
+    warningMessageSchema,
     sessionBusyMessageSchema,
     systemMessageSchema,
     sandboxUnavailableMessageSchema
@@ -234,6 +246,8 @@ export const taskDetailSchema = z.object({
     task: taskSchema,
     coder_model: z.string(),
     reviewer_model: z.string(),
+    coder_context_window: z.number().int().nonnegative().default(0),
+    planner_context_window: z.number().int().nonnegative().default(0),
     log: z.array(taskLogEntrySchema).default([])
 });
 

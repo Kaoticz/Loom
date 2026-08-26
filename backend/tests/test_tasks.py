@@ -384,3 +384,57 @@ async def test_nothing_to_sweep_is_harmless() -> None:
     from services.task_recorder import fail_interrupted_tasks
 
     assert await fail_interrupted_tasks() == 0
+
+
+@pytest.mark.usefixtures('task_db')
+async def test_create_task_persists_the_context_windows(controller: TaskController) -> None:
+    """
+    The two budgets are stored independently of one another.
+    """
+    response = await controller.create_task(
+        TaskRequest(
+            prompt='Add a timeout',
+            repo_path='/repo',
+            coder_model='ollama:llama3',
+            coder_context_window=40_000,
+            planner_context_window=8_192,
+        )
+    )
+
+    stored = await Task.get_or_none(id=response.id)
+    assert stored is not None
+    assert stored.coder_context_window == 40_000
+    assert stored.planner_context_window == 8_192
+
+
+@pytest.mark.usefixtures('task_db')
+async def test_an_unset_context_window_is_stored_as_zero(controller: TaskController) -> None:
+    """
+    Zero records "the user configured nothing", not "the user chose zero".
+
+    The raw setting is stored rather than the resolved number so that changing
+    the default later reads as unset on old tasks, instead of silently claiming
+    they used a value they never saw.
+    """
+    response = await controller.create_task(TaskRequest(prompt='Add a timeout'))
+
+    stored = await Task.get_or_none(id=response.id)
+    assert stored is not None
+    assert stored.coder_context_window == 0
+    assert stored.planner_context_window == 0
+
+
+@pytest.mark.usefixtures('task_db')
+async def test_get_task_reports_the_context_windows(controller: TaskController) -> None:
+    """
+    A recorded budget has to be readable back, or the record is of no use.
+    """
+    task = await make_task()
+    task.coder_context_window = 40_000
+    task.planner_context_window = 8_192
+    await task.save()
+
+    detail = await controller.get_task(str(task.id))
+
+    assert detail.coder_context_window == 40_000
+    assert detail.planner_context_window == 8_192

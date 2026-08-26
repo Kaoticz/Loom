@@ -23,6 +23,7 @@ export type MessageType =
     | 'commit'
     | 'done'
     | 'error'
+    | 'warning'
     | 'session_busy'
     | 'question'
     | 'reply'
@@ -205,6 +206,17 @@ export interface AgentConfig {
      * quietly using a different size and leaving the setting looking effective.
      */
     chunkLines: number | null;
+    /**
+     * Context window in tokens budgeted for the coder agent, or null for the default.
+     *
+     * Separate from the planner's. The two agents share one model setting, but
+     * they do not share a shape of work: the coder runs a long tool-heavy loop
+     * whose history grows with every read and test, while the planner makes one
+     * structured call. Budgeting them together would hold one of them wrong.
+     */
+    coderContextWindow: number | null;
+    /** Context window in tokens budgeted for the planner agent, or null for the default. */
+    plannerContextWindow: number | null;
     repoPath: string;
     dockerfile: string;
     secrets: { key: string; value: string }[];
@@ -244,6 +256,8 @@ const defaultConfig: AgentConfig = {
     reviewerModel: 'ollama:llama3',
     embeddingModel: 'nomic-embed-text',
     chunkLines: null,
+    coderContextWindow: null,
+    plannerContextWindow: null,
     repoPath: '/tmp/repo',
     dockerfile: 'FROM python:3.14-slim\n\nWORKDIR /workspace\n',
     secrets: [],
@@ -787,6 +801,11 @@ function createAgentStore() {
                     nextState.requiresAction = false;
                     nextState.actionType = null;
                     break;
+                case 'warning':
+                    // Deliberately leaves `status` alone. The session is still
+                    // running, and marking it failed would say otherwise.
+                    newMessage.content = data.content;
+                    break;
                 case 'question':
                     newMessage.content = data.question;
                     break;
@@ -891,6 +910,8 @@ function createAgentStore() {
                     reviewer_model: state.config.reviewerModel,
                     embedding_model: state.config.embeddingModel,
                     chunk_lines: state.config.chunkLines,
+                    coder_context_window: state.config.coderContextWindow ?? 0,
+                    planner_context_window: state.config.plannerContextWindow ?? 0,
                     repo_path: state.config.repoPath,
                     dockerfile: state.config.dockerfile,
                     secrets: state.config.secrets

@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import os
+from collections.abc import Sequence
 from logging import Logger, getLogger
 from typing import Any, ClassVar
 
@@ -21,11 +22,14 @@ from services.code_search import (
     normalise_keywords,
     split_at_keyword_limit,
 )
+from services.browser_tooling import browser_automation_refusal
+from services.repository_files import list_indexable_files
 from services.docker_sandbox import CommandResult, DockerSandboxManager
 from services.embedding import EmbeddingService
-from services.event_bus import CommitEvent, DiffEvent, EventBus
-from services.git_manager import CommitInfo, GitManagerService
+from services.event_bus import CommitEvent, DiffEvent, EventBus, WarningEvent
+from services.git_manager import CommitResult, GitManagerService
 from services.tool_reporting import (
+    ToolReport,
     ToolReport,
     describe_file_read,
     describe_symbol_lookup,
@@ -91,6 +95,52 @@ If you do not know which test to run, run the narrowest command that would catch
 mistake in the file you just touched (for example the module's test file, a syntax check,
 or a linter on that path).
 
+## Getting a working environment first
+
+Before concluding that a command does not work, check whether the project has a
+development environment and set one up if it does not. Look at what the repository says
+about itself — a lockfile, a manifest, a contributor guide, a CI configuration — and use
+whatever that tooling calls for. Installing dependencies, creating a virtual environment
+or fetching modules inside the sandbox is ordinary work, not a detour, and a command that
+fails only because nothing is installed is not a failing test.
+
+Once you have a command that runs, call `record_test_command` with it. Later steps of this
+plan are told what it was, so nobody works it out twice or is asked twice.
+
+Record only a command you have actually run and watched pass, spelled exactly as you ran it.
+Do not record a command you assume will work, and do not assemble a longer one out of parts
+you have not tried together — every later step inherits whatever you record, so a command
+that does not exist, or that reinstalls everything each time, costs the rest of the plan.
+Checking versions is not verifying: `node -v` tells you the tool is there, not that the
+project's tests run.
+
+## When there is nothing to test
+
+Some repositories have no tests at all. That is a normal state, not a problem to solve and
+not a reason to ask the user anything. Do not invent a test suite, and do not fabricate a
+command so that something has run. Call `skip_verification`, saying that the repository has
+no tests, and carry on with the work.
+
+## When verification is genuinely stuck
+
+If a command keeps failing and you believe the cause is the command or the environment
+rather than the code — it cannot find the tests, it fails identically before and after your
+change, it complains about missing tooling you could not install — stop guessing and call
+`ask_user`. Ask how the project's tests are meant to be run, or whether to skip verification
+for this step, and say which of the two you think is happening.
+
+Do not simply keep re-running a failing command until the failure allowance runs out. That
+allowance exists for a repository whose tests were already failing, not as a way past a
+command that was never right.
+
+Tell the two cases apart honestly. A test that runs and reports a real problem in your
+change is a failing test: fix the code. A command that errors before any test runs, or that
+fails in exactly the same way on code you have not touched, is a wrong command. If you are
+not sure which you are looking at, assume it is a real failure and fix the code.
+
+If a command you were given earlier starts failing this way, call `forget_test_command`
+before asking again, so a later step does not inherit it.
+
 # 4. Recover from errors, do not skip them
 
 If a tool call fails or a test does not pass:
@@ -119,6 +169,27 @@ question you could answer by making a reasonable assumption and saying so in you
 question stops the task until someone comes back to it.
 
 # 5. Finishing
+
+## When you were given one step of a plan
+
+You will be told plainly when this is the case: the prompt names which step of how many you are
+working on. Then the step is your whole job, and `complete_task` is not yours to call — the plan
+is not finished until every step is, and the steps after yours have not run yet.
+
+- Finish with `complete_step`, passing a summary of what you did. The next step is told your
+  summary and is not shown your work, so anything you leave out is lost to it.
+- If the step was investigative from the start — finding where something lives, confirming what
+  the code already does — and required no change to any file, finish with
+  `accept_step_without_changes` and report what you found. Do not invent a change to satisfy the
+  verification rule.
+- Do not use `accept_step_without_changes` to get past a step you could not manage. If the step
+  called for a change, make the change.
+- Do the work of your step and nothing belonging to a later one. A step that runs ahead leaves
+  the next one repeating it or contradicting it.
+
+Everything below about verification applies to your step exactly as it does to a whole task.
+
+## When you were given a whole task
 
 When, and only when, the task is genuinely done, call the `complete_task` tool.
 
@@ -195,6 +266,7 @@ async def search_code(ctx: RunContext[AgentDeps], query: str) -> str:
     Runs a semantic search over the indexed embeddings and a literal text search
     in parallel, then merges the two, so that both conceptual matches and exact
     keyword matches are covered.
+    :param query: What you are looking for, in plain words, for example "where retries are configured".
     """
     async with report_tool(ctx.deps.events, 'search_code', {'query': query}) as report:
         outcome: CodeSearchOutcome = await _search_code(ctx, query)
@@ -296,6 +368,9 @@ async def search_code_lexical(
 
     `limit` caps the total number of lines returned across all keywords, and at
     most 10 keywords are searched for in one call.
+    :param keywords: The exact identifiers or literals to look for, as a list of separate strings.
+    :param limit: How many results to return at most.
+    :param mode: Whether a result must contain all of the keywords or any of them.
     """
     searched: list[str]
     ignored: list[str]
@@ -340,6 +415,7 @@ async def search_code_lexical(
 async def get_symbol(ctx: RunContext[AgentDeps], symbol: str) -> str:
     """
     Get the definition of a symbol (class, function).
+    :param symbol: The exact name of the function, class or method, without brackets or a module prefix.
     """
     async with report_tool(ctx.deps.events, 'get_symbol', {'symbol': symbol}) as report:
         found: list[SymbolDefinition] = await ctx.deps.search.get_symbol_definition(symbol)
@@ -360,9 +436,11 @@ async def get_symbol(ctx: RunContext[AgentDeps], symbol: str) -> str:
 @coder_agent.tool
 async def read_file(
     ctx: RunContext[AgentDeps],
+    /,
     path: str,
     start_line: int | None = None,
-    end_line: int | None = None
+    end_line: int | None = None,
+    **extra: object
 ) -> str:
     """
     Read a file from the repository.
@@ -370,6 +448,9 @@ async def read_file(
     Pass start_line and end_line to read only part of a large file. When you do,
     each line is prefixed with its line number for reference: those prefixes are
     not part of the file, so never include them in an edit_file search block.
+    :param path: Path to the file, relative to the repository root, for example "src/app.py". An absolute path inside the repository is accepted and converted.
+    :param start_line: First line to read, counting from one. Omit to read from the beginning.
+    :param end_line: Last line to read, inclusive. Omit to read to the end.
     """
     arguments: dict[str, Any] = {'path': path}
     if start_line is not None:
@@ -378,6 +459,7 @@ async def read_file(
         arguments['end_line'] = end_line
 
     async with report_tool(ctx.deps.events, 'read_file', arguments) as report:
+        path = _repository_path(ctx, path)
         try:
             contents: str = await ctx.deps.editor.read_file(path, start_line, end_line)
             # The agent gets the file; the reader gets a line saying it was read.
@@ -386,7 +468,10 @@ async def read_file(
                 observation=describe_file_read(path, contents, start_line, end_line),
             )
         except FileNotFoundError:
-            return report.fail(f'File {path} does not exist.')
+            return report.fail(
+                f'File {path} does not exist. Use list_files to see what is there, or '
+                'search_code to find where something lives.'
+            )
         except ValueError as error:
             return report.fail(f'Could not read {path}: {error}')
 
@@ -394,17 +479,23 @@ async def read_file(
 @coder_agent.tool
 async def create_file(
     ctx: RunContext[AgentDeps],
+    /,
     path: str,
     content: str,
-    summary: str = ''
+    summary: str = '',
+    **extra: object
 ) -> str:
     """
-    Create a new file in the repository and commit it.
+    Create a new file in the repository.
 
     Give a short summary of why the file is being added, in a few words, so the
     commit history reads meaningfully.
+    :param path: Path for the new file, relative to the repository root. An absolute path inside the repository is accepted and converted.
+    :param content: The complete contents of the new file.
+    :param summary: A few words on what this file is for, used in the commit message.
     """
     async with report_tool(ctx.deps.events, 'create_file', {'path': path}) as report:
+        path = _repository_path(ctx, path)
         original: str | None = await _read_base_version(ctx, path)
         try:
             await ctx.deps.editor.create_file(path, content)
@@ -412,25 +503,33 @@ async def create_file(
             return report.fail(f'Could not create {path}: {error}')
 
         ctx.deps.session.record_modification(path)
-        await _commit_and_report(ctx, path, _commit_message('Create', path, summary), original)
-        return report.succeed(f'Created {path}.')
+        await _report_diff(ctx, path, original)
+        ctx.deps.session.note_pending_change(_commit_message('Create', path, summary))
+        return report.succeed(f'Created {path}.' + _note_ignored(extra))
 
 
 @coder_agent.tool
 async def edit_file(
     ctx: RunContext[AgentDeps],
+    /,
     path: str,
     search: str,
     replace: str,
-    summary: str = ''
+    summary: str = '',
+    **extra: object
 ) -> str:
     """
-    Edit a file surgically and commit changes.
+    Edit a file surgically.
 
     Give a short summary of what the edit accomplishes, in a few words, so the
-    commit history reads meaningfully.
+    commit made when this step finishes reads meaningfully.
+    :param path: Path to the file to change, relative to the repository root. An absolute path inside the repository is accepted and converted.
+    :param search: The exact text to find, copied character for character from the file, including its indentation. Not a description, not a regular expression, not a line number. Include enough surrounding lines to make it appear only once.
+    :param replace: The exact text to put in its place. Pass an empty string to delete the text found.
+    :param summary: A few words on what the edit accomplishes, used in the commit message.
     """
     async with report_tool(ctx.deps.events, 'edit_file', {'path': path}) as report:
+        path = _repository_path(ctx, path)
         original: str | None = await _read_base_version(ctx, path)
         try:
             result: EditResult = await ctx.deps.editor.edit_file(path, search, replace)
@@ -441,8 +540,67 @@ async def edit_file(
             return report.fail(result.message)
 
         ctx.deps.session.record_modification(path)
-        await _commit_and_report(ctx, path, _commit_message('Edit', path, summary), original)
-        return report.succeed(result.message)
+        await _report_diff(ctx, path, original)
+        ctx.deps.session.note_pending_change(_commit_message('Edit', path, summary))
+        return report.succeed(result.message + _note_ignored(extra))
+
+
+def _repository_path(ctx: RunContext[AgentDeps], path: str) -> str:
+    """
+    Reduce a path the model supplied to one relative to the repository root.
+
+    Models routinely pass an absolute path. The editor already tolerates one
+    inside the root, so the edit lands, but everything downstream — the modified
+    file list, the commit message, the git lookup for the original contents —
+    assumes a relative path and quietly misbehaves with an absolute one. Reducing
+    it once here keeps that from happening in four places.
+
+    A path outside the repository is returned untouched, so the editor still
+    refuses it and says so, rather than this function inventing a path inside.
+
+    :param ctx: The agent run context.
+    :param path: The path as the model wrote it.
+    :returns: The path relative to the repository root where possible.
+    """
+    cleaned: str = path.strip().replace('\\', os.sep)
+    if not cleaned:
+        return ''
+
+    if not os.path.isabs(cleaned):
+        # `.`, `./`, `./src` and `src/` all name the same things as `` and `src`.
+        # A model that writes any of them means the obvious thing, and refusing
+        # it teaches nothing except that the tool is fussy.
+        collapsed: str = os.path.normpath(cleaned)
+        return '' if collapsed in ('.', os.sep) else collapsed.strip(os.sep)
+
+    root: str = os.path.abspath(ctx.deps.git.repo_path)
+    resolved: str = os.path.abspath(cleaned)
+    if resolved == root:
+        return ''
+    if resolved.startswith(root + os.sep):
+        return os.path.relpath(resolved, root)
+    return cleaned
+
+
+def _note_ignored(extra: dict[str, object]) -> str:
+    """
+    Describe any arguments the tool did not recognise.
+
+    Reported rather than silently dropped: the call is honoured because failing
+    an otherwise valid edit over a stray argument costs a retry and teaches the
+    model nothing, but saying which arguments went nowhere lets it stop sending
+    them instead of assuming they took effect.
+
+    :param extra: The unrecognised keyword arguments.
+    :returns: A note to append to the tool's reply, empty when there were none.
+    """
+    if not extra:
+        return ''
+    named: str = ', '.join(sorted(extra))
+    return (
+        f' (ignored unknown argument(s): {named}. They do nothing here; '
+        'leave them out next time.)'
+    )
 
 
 def _commit_message(verb: str, path: str, summary: str) -> str:
@@ -487,30 +645,24 @@ async def _read_base_version(ctx: RunContext[AgentDeps], path: str) -> str | Non
     return content if content is not None else ''
 
 
-async def _commit_and_report(
+async def _report_diff(
     ctx: RunContext[AgentDeps],
     path: str,
-    message: str,
     original: str | None,
 ) -> None:
     """
-    Commit a modified file and announce the commit and the resulting diff.
+    Announce the diff a single edit produced.
+
+    No longer commits. A commit per write turned one step into a string of
+    commits nobody chose the boundaries of, and a plan into a history that could
+    not be read back a step at a time. The commit now happens once, when the
+    step finishes. The diff still goes out per edit, because the live diff viewer
+    shows the edit as it lands and has nothing to do with commit cadence.
 
     :param ctx: The agent run context.
     :param path: Repository-relative path of the modified file.
-    :param message: The commit message to use.
     :param original: The contents before the change, or None if they could not be determined.
     """
-    commit: CommitInfo | None = await ctx.deps.git.commit_changes(message)
-    if commit is not None:
-        await ctx.deps.events.emit(
-            CommitEvent(
-                commit_hash=commit.commit_hash,
-                message=commit.message,
-                files_changed=commit.files_changed,
-            )
-        )
-
     if original is None:
         logger.warning('Skipping diff for %s: the base version is unknown.', path)
         return
@@ -533,8 +685,16 @@ async def _commit_and_report(
 async def run_test_command(ctx: RunContext[AgentDeps], command: str) -> str:
     """
     Run a test, build, or lint command inside the sandbox and return its output.
+    :param command: The shell command to run inside the sandbox, for example "pytest -q tests/".
     """
     async with report_tool(ctx.deps.events, 'run_test_command', {'command': command}) as report:
+        refusal: str | None = browser_automation_refusal(command)
+        if refusal is not None:
+            # Refused before reaching the sandbox rather than after: installing
+            # a browser stack is slow and leaves the sandbox changed, so letting
+            # it run and complaining afterwards would achieve neither.
+            return report.fail(refusal)
+
         try:
             result: CommandResult = await ctx.deps.docker.run_test_command(command)
         except Exception as error:
@@ -547,10 +707,73 @@ async def run_test_command(ctx: RunContext[AgentDeps], command: str) -> str:
                 f'summary that they could not be verified. (Reason: {error})'
             )
 
+        if not result.success and _looks_uninstalled(result):
+            # Deliberately not recorded as a failed verification. Nothing was
+            # verified: the command never ran. Counting it would spend the
+            # allowance that exists for a repository whose tests were already
+            # failing, and once that is spent the completion gate releases — so
+            # a missing tool would quietly become permission to stop verifying.
+            return report.fail(
+                f'The command did not run: the tooling it needs is not installed.\n\n'
+                f'{result.output}\n\n'
+                'Install it inside the sandbox and run the command again. Installing '
+                'dependencies is ordinary work, not a detour. Look at what the repository '
+                'says about itself — a lockfile, a manifest, a contributor guide — and use '
+                'whatever it calls for. Do not move on to a different command instead, and '
+                'do not treat this as a failing test.'
+            )
+
         ctx.deps.session.record_verification(result.success)
+        if result.success:
+            # Remembered so `record_test_command` can insist on a command that
+            # demonstrably runs, rather than one that merely looks right.
+            ctx.deps.session.note_command_passed(command)
         status: str = 'passed' if result.success else f'FAILED with exit code {result.exit_code}'
         output: str = f'Command {status}.\n\n{result.output}'
         return report.succeed(output) if result.success else report.fail(output)
+
+
+MISSING_TOOL_EXIT_CODES: frozenset[int] = frozenset({126, 127})
+"""
+Shell exit codes meaning the command could not be run at all.
+
+127 is "command not found" and 126 is "found but not executable". Neither says
+anything about the code under test.
+"""
+
+MISSING_TOOL_MESSAGES: tuple[str, ...] = (
+    'command not found',
+    'no such file or directory',
+    'no module named',
+    'is not recognized as an internal',
+    'executable file not found',
+)
+"""
+What a missing tool says when the exit code alone does not give it away.
+
+`python -m pytest` with pytest absent exits 1, not 127, and says "No module
+named pytest" — indistinguishable from a real failure by exit code, and the
+single most likely way this arises in a Python repository.
+"""
+
+
+def _looks_uninstalled(result: CommandResult) -> bool:
+    """
+    Decide whether a command failed because its tooling is missing.
+
+    Kept narrow on purpose. Treating a real test failure as a missing tool would
+    tell the agent to install something instead of fixing a genuine defect, so
+    the signal has to be an exit code that means "did not run" or a message the
+    shell and interpreter only produce when something is absent.
+
+    :param result: The outcome of the command.
+    :returns: True if the command never really ran.
+    """
+    if result.exit_code in MISSING_TOOL_EXIT_CODES:
+        return True
+
+    output: str = result.output.lower()
+    return any(message in output for message in MISSING_TOOL_MESSAGES)
 
 
 @coder_agent.tool
@@ -559,6 +782,7 @@ async def web_search(ctx: RunContext[AgentDeps], query: str) -> str:
     Search the web for information using SearXNG.
 
     Returns the top results as title, URL and a short snippet each.
+    :param query: What to search the web for, in plain words.
     """
     async with report_tool(ctx.deps.events, 'web_search', {'query': query}) as report:
         return report.succeed(await _web_search(query))
@@ -620,6 +844,8 @@ async def ask_user(
 
     Do not use it to ask permission for work you have already been asked to do,
     and do not use it in place of reading the repository to find something out.
+    :param question: The question to put to the user, in one or two sentences.
+    :param options: Up to six suggested answers. The user can always type their own instead, so this may be left empty.
     """
     async with report_tool(ctx.deps.events, 'ask_user', {'question': question}) as report:
         questioner: UserQuestioner | None = ctx.deps.questioner
@@ -654,6 +880,7 @@ async def complete_task(ctx: RunContext[AgentDeps], summary: str) -> str:
     before you have modified at least one and verified the change with
     run_test_command. If the task only ever called for an answer — a summary, an
     explanation, an assessment — call it with that answer as the summary.
+    :param summary: What you did across the whole task, in a sentence or two.
     """
     session: SessionContext = ctx.deps.session
 
@@ -679,9 +906,298 @@ async def complete_task(ctx: RunContext[AgentDeps], summary: str) -> str:
             return report.fail(f'complete_task was rejected: {error}')
 
         modified: str = ', '.join(session.modified_files)
+        # Still commits. This is the whole-task path — an unparsed plan, or an
+        # answering task with nothing to commit — and review reads only commits,
+        # so skipping it here would leave the work invisible.
+        note: str = await _commit_step(ctx, recorded)
         return report.succeed(
-            f'Task marked complete. Summary recorded: {recorded} (files modified: {modified})'
+            f'Task marked complete. Summary recorded: {recorded} '
+            f'(files modified: {modified}){note}'
         )
+
+
+@coder_agent.tool
+async def complete_step(ctx: RunContext[AgentDeps], summary: str) -> str:
+    """
+    Signal that the current plan step is finished.
+
+    Call this once the step you were given is done and its changes are verified.
+    Say what you actually did, in a sentence or two — the next step is told your
+    summary rather than shown your work, so anything you leave out is lost to it.
+
+    This finishes the step, not the task. Do not use it to report the whole plan
+    as done, and do not call it for work belonging to a later step.
+    :param summary: What you did for this step, in a sentence or two. The next step is told this and is not shown your work.
+    """
+    async with report_tool(ctx.deps.events, 'complete_step', {'summary': summary}) as report:
+        session: SessionContext = ctx.deps.session
+        try:
+            recorded: str = session.request_step_completion(summary)
+        except ValueError as error:
+            return report.fail(f'complete_step was rejected: {error}')
+
+        note: str = await _commit_step(ctx, recorded)
+        return report.succeed(f'Step marked complete. Summary recorded: {recorded}{note}')
+
+
+@coder_agent.tool
+async def accept_step_without_changes(ctx: RunContext[AgentDeps], summary: str) -> str:
+    """
+    Finish a step that required no change to any file.
+
+    Only for a step that was investigative from the start — finding where
+    something lives, or confirming what the code already does. Report what you
+    found, so the steps after this one can use it.
+
+    Do not use it to get past a step you could not manage. If the step called
+    for a change, make the change.
+    :param summary: What you found out, in a sentence or two, for the steps that follow this one.
+    """
+    arguments: dict[str, Any] = {'summary': summary}
+
+    async with report_tool(ctx.deps.events, 'accept_step_without_changes', arguments) as report:
+        session: SessionContext = ctx.deps.session
+        try:
+            recorded: str = session.accept_step_completion_without_changes(summary)
+        except ValueError as error:
+            return report.fail(f'accept_step_without_changes was rejected: {error}')
+
+        return report.succeed(f'Step marked complete with no file changes. Recorded: {recorded}')
+
+
+async def _commit_step(ctx: RunContext[AgentDeps], summary: str) -> str:
+    """
+    Commit everything the finished step changed, as one commit.
+
+    A failure is reported back to the agent and announced as a warning, not
+    raised. The changes are on disk either way, so killing the session would
+    lose the work along with the explanation — and the next step's commit stages
+    everything outstanding, so a failure here may well be made good later.
+
+    :param ctx: The agent run context.
+    :param summary: The step's recorded summary, used as the commit subject.
+    :returns: A note to append to the tool's reply, empty if the commit was clean.
+    """
+    session: SessionContext = ctx.deps.session
+    # Falls back to the summary's first line rather than a fixed word, because
+    # this also runs for a whole task, which has no step title. A commit subject
+    # reading "Plan step" would tell a reader nothing at all.
+    step: str = session.current_step or summary.strip().splitlines()[0][:72]
+    body: Sequence[str] = session.pending_change_summaries
+    message: str = f'{step}\n\n{summary}'
+    if body:
+        message += '\n\n' + '\n'.join(f'- {line}' for line in body)
+
+    result: CommitResult = await ctx.deps.git.commit_changes_with_retry(message)
+
+    if result.failed:
+        failures: int = session.record_commit_failure(step)
+        await ctx.deps.events.emit(
+            WarningEvent(
+                content=(
+                    f'Could not commit the changes for "{step}" after two attempts: '
+                    f'{result.error}. The changes are still in the working tree. '
+                    'Carrying on; they will be included in the next commit that succeeds.'
+                )
+            )
+        )
+        return (
+            f' (warning: the commit failed - {result.error}. Your changes are safe on disk '
+            f'and will be picked up by a later commit. This is failure {failures} in a row; '
+            'do not try to fix git yourself, carry on with the plan.)'
+        )
+
+    session.record_commit_success()
+    session.clear_pending_changes()
+
+    if result.commit is None:
+        return ''
+
+    await ctx.deps.events.emit(
+        CommitEvent(
+            commit_hash=result.commit.commit_hash,
+            message=result.commit.message,
+            files_changed=result.commit.files_changed,
+        )
+    )
+    return f' (committed as {result.commit.commit_hash[:8]})'
+
+
+@coder_agent.tool
+async def record_test_command(ctx: RunContext[AgentDeps], command: str) -> str:
+    """
+    Remember the command that verifies work in this repository.
+
+    Call this once you have found a command that actually runs — after setting
+    up an environment, or after the user told you what to use. Later steps are
+    given it, so nobody has to work it out or be asked again.
+
+    If a remembered command later fails in a way that says the command itself is
+    wrong rather than the code, call `forget_test_command` instead of persisting
+    with it.
+    :param command: The verification command, exactly as you already ran it with run_test_command and saw it pass. A command you have not run cannot be recorded.
+    """
+    async with report_tool(ctx.deps.events, 'record_test_command', {'command': command}) as report:
+        try:
+            recorded: str = ctx.deps.session.record_test_command(command)
+        except ValueError as error:
+            return report.fail(f'record_test_command was rejected: {error}')
+        return report.succeed(f'Verification command for this plan: {recorded}')
+
+
+@coder_agent.tool
+async def forget_test_command(ctx: RunContext[AgentDeps], reason: str) -> str:
+    """
+    Discard the remembered verification command because it is wrong.
+
+    For a command that does not fit the work in hand — a different area of a
+    monorepo, a suite that does not cover what you changed — not for a test that
+    ran correctly and reported a real failure. Say which of the two you believe
+    happened; if you are not sure, you are probably looking at a real failure.
+    :param reason: Why the remembered command does not fit the work in hand.
+    """
+    async with report_tool(ctx.deps.events, 'forget_test_command', {'reason': reason}) as report:
+        ctx.deps.session.clear_test_command()
+        return report.succeed(
+            f'Forgotten. Work out how to verify this step, or ask the user. Reason: {reason}'
+        )
+
+
+@coder_agent.tool
+async def skip_verification(ctx: RunContext[AgentDeps], reason: str) -> str:
+    """
+    Stop requiring verification for the rest of this plan.
+
+    Only for two situations: the repository genuinely has no tests to run, or
+    the user has told you to skip them. Not for a suite you could not get
+    working and not for tests that fail — those are for `ask_user`.
+
+    Every summary from here on says the work was unverified, and gives your
+    reason, so make it accurate.
+    :param reason: Why verification does not apply, for example that the repository has no tests. This is repeated in every summary from now on.
+    """
+    async with report_tool(ctx.deps.events, 'skip_verification', {'reason': reason}) as report:
+        try:
+            recorded: str = ctx.deps.session.waive_verification(reason)
+        except ValueError as error:
+            return report.fail(f'skip_verification was rejected: {error}')
+        return report.succeed(f'Verification is no longer required for this plan: {recorded}')
+
+
+MAX_LISTED_FILES: int = 500
+"""
+How many paths `list_files` will return.
+
+A large repository would otherwise spend most of a small model's window on a
+file listing, leaving no room to reason about what the listing said.
+"""
+
+
+@coder_agent.tool
+async def list_files(
+    ctx: RunContext[AgentDeps], /, path: str = '', **extra: object
+) -> str:
+    """
+    List the files in the repository, optionally under one directory.
+
+    Use this to see how the project is laid out before deciding what to read.
+    Pass a directory to narrow the listing, or nothing to list the whole
+    repository. Files the repository ignores are never listed.
+
+    A directory that does not exist is not an error: you will be shown the
+    directories that do exist at that level, so you can correct the path.
+    :param path: Directory to list, relative to the repository root. Omit it to list the whole repository.
+    """
+    arguments: dict[str, Any] = {'path': path} if path else {}
+
+    async with report_tool(ctx.deps.events, 'list_files', arguments) as report:
+        root: str = ctx.deps.git.repo_path
+        try:
+            found: list[str] = list_indexable_files(root)
+        except OSError as error:
+            return report.fail(f'Could not list {root}: {error}')
+
+        relative: list[str] = sorted(os.path.relpath(item, root) for item in found)
+        if not relative:
+            return report.succeed(
+                'The repository contains no files that are not ignored.',
+                observation='Listed 0 files.',
+            )
+
+        wanted: str = _repository_path(ctx, path)
+        if not wanted:
+            return _render_listing(report, relative, 'the repository')
+
+        matching: list[str] = [
+            item for item in relative if item == wanted or item.startswith(wanted + os.sep)
+        ]
+        if matching:
+            return _render_listing(report, matching, wanted)
+
+        # A miss is a legitimate answer to "what is in here", not a failure. The
+        # useful reply is what does exist nearby, which lets the model correct
+        # itself in one turn instead of guessing again — and guessing again is
+        # what exhausts the tool's retry budget and ends the session.
+        return report.succeed(
+            f'Nothing in the repository matches "{path}".\n\n'
+            f'These directories do exist:\n{_directories_near(relative, wanted)}',
+            observation=f'No match for {path}.',
+        )
+
+
+def _render_listing(report: ToolReport, paths: list[str], where: str) -> str:
+    """
+    Report a listing, truncated if it would flood the context.
+
+    :param report: The tool report to record into.
+    :param paths: The repository-relative paths to list.
+    :param where: What was listed, for the observation line.
+    :returns: The recorded result.
+    """
+    shown: list[str] = paths[:MAX_LISTED_FILES]
+    listing: str = '\n'.join(shown)
+    if len(paths) > len(shown):
+        listing += (
+            f'\n... and {len(paths) - len(shown)} more not shown. '
+            'Pass a directory to narrow the listing.'
+        )
+    return report.succeed(
+        listing, observation=f'Listed {len(shown)} of {len(paths)} files in {where}.'
+    )
+
+
+def _directories_near(paths: list[str], wanted: str) -> str:
+    """
+    List the directories that exist alongside a path that does not.
+
+    Shown at the depth that was asked for, so a wrong guess at the third level
+    is answered with the third level rather than with the repository root.
+
+    :param paths: Every repository-relative path.
+    :param wanted: The path that matched nothing.
+    :returns: A newline-separated list of directories.
+    """
+    depth: int = len(wanted.split(os.sep)) if wanted else 1
+    parent: str = os.sep.join(wanted.split(os.sep)[:-1])
+
+    candidates: set[str] = set()
+    for item in paths:
+        parts: list[str] = item.split(os.sep)
+        if len(parts) <= depth - 1:
+            continue
+        candidate: str = os.sep.join(parts[:depth])
+        if parent and not candidate.startswith(parent + os.sep):
+            continue
+        candidates.add(candidate)
+
+    if not candidates and parent:
+        # The parent is wrong too, so answering at that depth would repeat the
+        # mistake. Fall back to the top level, which certainly exists.
+        candidates = {item.split(os.sep)[0] for item in paths}
+
+    return '\n'.join(sorted(candidates)[:MAX_LISTED_FILES]) or '(none)'
+
+
 
 
 READ_ONLY_TOOLS: tuple[Any, ...] = (
@@ -690,6 +1206,7 @@ READ_ONLY_TOOLS: tuple[Any, ...] = (
     search_code_lexical,
     get_symbol,
     read_file,
+    list_files,
     web_search,
     complete_task,
 )
@@ -727,3 +1244,30 @@ repository has already changed, which is exactly what this prevents.
 
 for _read_only_tool in READ_ONLY_TOOLS:
     answering_agent.tool(_read_only_tool)
+
+
+PLANNING_TOOLS: tuple[Any, ...] = (
+    ask_user,
+    search_code,
+    search_code_lexical,
+    get_symbol,
+    read_file,
+    list_files,
+    web_search,
+)
+"""
+The tools the planner is allowed to use.
+
+A plan written without looking at the repository is a guess about a codebase the
+planner has never seen, so the tools that let it look are exactly the ones it
+needs. Every one of them only reads.
+
+`ask_user` is included: an ambiguity that would change what steps to produce is
+better settled before the plan is written than discovered halfway through
+executing it.
+
+`complete_task` is absent, unlike in `READ_ONLY_TOOLS`: the planner's job ends
+when it returns a plan, and it has no task to mark complete.
+Nothing here can alter the working tree, which is the point — planning happens
+before the user has approved anything.
+"""

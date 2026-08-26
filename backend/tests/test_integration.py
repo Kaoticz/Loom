@@ -324,10 +324,22 @@ def test_a_whole_session_runs_against_real_infrastructure(project: str) -> None:
 
     # The file really was written and committed on the real repository.
     assert (Path(project) / 'subtract.py').read_text().startswith('def subtract')
+    # The whole log, not --oneline: a step commits once, so what the agent said
+    # about an individual edit is in the commit body rather than the subject.
     log: str = subprocess.run(
-        ['git', '-C', project, 'log', '--oneline'], capture_output=True, text=True
+        ['git', '-C', project, 'log'], capture_output=True, text=True
     ).stdout
     assert 'add subtract helper' in log
+    # One commit for the step, not one per file written. The repository's own
+    # initial commit is not the agent's.
+    subjects: list[str] = [
+        line
+        for line in subprocess.run(
+            ['git', '-C', project, 'log', '--format=%s'], capture_output=True, text=True
+        ).stdout.splitlines()
+        if line.strip() and line.strip() != 'init'
+    ]
+    assert subjects == ['Add a subtract function']
 
     branches: str = subprocess.run(
         ['git', '-C', project, 'branch'], capture_output=True, text=True
