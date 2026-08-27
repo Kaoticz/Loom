@@ -1,9 +1,18 @@
 from __future__ import annotations
 
 import json
-from typing import Any
+from collections.abc import Awaitable, Callable
+from enum import Enum
+from typing import TYPE_CHECKING, Any, override
+
+from pydantic_ai.capabilities import AbstractCapability
+from pydantic_ai.messages import ModelResponse
 
 from services.conversation_history import estimate_tokens
+
+if TYPE_CHECKING:
+    from pydantic_ai.models import ModelRequestContext
+    from pydantic_ai.tools import RunContext
 
 WORKING_HEADROOM_TOKENS: int = 4_096
 """
@@ -13,6 +22,112 @@ Enough for the task, one step's prompt, a couple of file reads and a reply. A
 window that leaves less than this is not tight, it is unusable: the model has
 nowhere to put the work, and fails before generating anything.
 """
+
+PROVIDER_UNDER_ESTIMATE_RATIO: float = 0.5
+"""
+The largest provider-to-Loom input ratio that signals likely server truncation.
+
+Small rounding differences are normal for a character-based estimator. A provider
+seeing at most half of Loom's estimate instead points to it discarding part of the
+prompt, commonly because its actual ``num_ctx`` is smaller than requested.
+"""
+
+PROVIDER_OVER_ESTIMATE_RATIO: float = 1.5
+"""
+The smallest provider-to-Loom input ratio that signals unseen prompt growth.
+
+At this distance the provider is accounting for material content Loom's heuristic
+did not see, so later compaction budgets need an additional reserve.
+"""
+
+
+class ProviderUsageDivergence(str, Enum):
+    """
+    How the provider's prompt-token count compares with Loom's estimate.
+    """
+
+    unavailable = 'unavailable'
+    agreement = 'agreement'
+    input_truncated = 'input_truncated'
+    estimate_too_low = 'estimate_too_low'
+
+
+def provider_usage_divergence(
+    estimated_input_tokens: int, provider_input_tokens: int
+) -> ProviderUsageDivergence:
+    """
+    Classify a provider's prompt-token accounting against Loom's estimate.
+
+    :param estimated_input_tokens: Loom's estimated tokens in the sent prompt.
+    :param provider_input_tokens: Tokens the provider reports processing.
+    :returns: The meaningful direction of divergence, if there is one.
+    """
+    if estimated_input_tokens <= 0 or provider_input_tokens <= 0:
+        return ProviderUsageDivergence.unavailable
+    if provider_input_tokens <= estimated_input_tokens * PROVIDER_UNDER_ESTIMATE_RATIO:
+        return ProviderUsageDivergence.input_truncated
+    if provider_input_tokens >= estimated_input_tokens * PROVIDER_OVER_ESTIMATE_RATIO:
+        return ProviderUsageDivergence.estimate_too_low
+    return ProviderUsageDivergence.agreement
+
+
+def provider_usage_correction(estimated_input_tokens: int, provider_input_tokens: int) -> int:
+    """
+    Calculate the extra context reserve justified by provider usage.
+
+    :param estimated_input_tokens: Loom's estimated tokens in the sent prompt.
+    :param provider_input_tokens: Tokens the provider reports processing.
+    :returns: Extra tokens later compaction budgets should reserve.
+    """
+    if (
+        provider_usage_divergence(estimated_input_tokens, provider_input_tokens)
+        is not ProviderUsageDivergence.estimate_too_low
+    ):
+        return 0
+    return provider_input_tokens - estimated_input_tokens
+
+
+class ReportProviderUsage(AbstractCapability[Any]):
+    """
+    Report provider input-token usage after each successful model response.
+
+    The existing harness monitor reports the matching estimate before each request.
+    Keeping this capability deliberately narrow lets the session reconcile those
+    two measurements without changing the request, response, or usage-gauge
+    contracts.
+
+    :param on_usage: Receives positive provider-reported input token counts.
+    """
+
+    def __init__(self, on_usage: Callable[[int], Awaitable[None]]) -> None:
+        """
+        Create the response-usage reporter.
+
+        :param on_usage: Receives positive provider-reported input token counts.
+        """
+        super().__init__()
+        self._on_usage: Callable[[int], Awaitable[None]] = on_usage
+
+    @override
+    async def after_model_request(
+        self,
+        ctx: RunContext[Any],
+        *,
+        request_context: ModelRequestContext,
+        response: ModelResponse,
+    ) -> ModelResponse:
+        """
+        Pass a successful response's prompt usage to the host application.
+
+        :param ctx: The active agent run context, unused by this observer.
+        :param request_context: The request that received the response, unused.
+        :param response: The successful provider response.
+        :returns: The original response, unchanged.
+        """
+        input_tokens: int = response.usage.input_tokens
+        if input_tokens > 0:
+            await self._on_usage(input_tokens)
+        return response
 
 
 def estimate_fixed_overhead(system_prompt: str, agent: Any) -> int:

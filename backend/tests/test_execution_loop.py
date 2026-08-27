@@ -1880,3 +1880,105 @@ async def test_an_unresolved_window_is_passed_through(
 
     readings = [event for event in events if isinstance(event, ContextUsageEvent)]
     assert readings[0].resolved is False
+
+
+async def test_provider_input_truncation_warns_once_with_concrete_counts(
+    monkeypatch: pytest.MonkeyPatch, git_repo: GitManagerService
+) -> None:
+    """
+    A server processing half the estimated prompt is surfaced without feed spam.
+    """
+    from pydantic_ai_harness.compaction import ContextUsage
+
+    from services.event_bus import WarningEvent
+
+    session, events = prepare(monkeypatch, [], git_repo)
+    await session._report_context_usage(
+        ContextUsage(used_tokens=900, window_tokens=32_768, resolved=True), fixed_overhead=100
+    )
+
+    await session._reconcile_provider_usage(400)
+    await session._reconcile_provider_usage(400)
+
+    warnings: list[WarningEvent] = [event for event in events if isinstance(event, WarningEvent)]
+    assert len(warnings) == 1
+    assert '400 prompt tokens' in warnings[0].content
+    assert '1,000' in warnings[0].content
+    assert 'num_ctx' in warnings[0].content
+
+
+async def test_provider_underestimate_reserves_budget_and_warns_once(
+    monkeypatch: pytest.MonkeyPatch, git_repo: GitManagerService
+) -> None:
+    """
+    Provider usage above the heuristic reduces later compaction budgets.
+    """
+    from pydantic_ai_harness.compaction import ContextUsage
+
+    from services.event_bus import WarningEvent
+
+    session, events = prepare(monkeypatch, [], git_repo)
+    await session._report_context_usage(
+        ContextUsage(used_tokens=900, window_tokens=32_768, resolved=True), fixed_overhead=100
+    )
+
+    await session._reconcile_provider_usage(1_600)
+
+    assert session._compaction_for(10_000).context_window == 9_400
+    await session._reconcile_provider_usage(2_000)
+    assert session._compaction_for(10_000).context_window == 9_000
+
+    warnings: list[WarningEvent] = [event for event in events if isinstance(event, WarningEvent)]
+    assert len(warnings) == 1
+    assert '1,600 prompt tokens' in warnings[0].content
+    assert '600 additional context tokens' in warnings[0].content
+
+
+async def test_agreeing_or_absent_provider_usage_emits_no_warning(
+    monkeypatch: pytest.MonkeyPatch, git_repo: GitManagerService
+) -> None:
+    """
+    Normal estimator variation and unavailable usage leave the feed unchanged.
+    """
+    from pydantic_ai_harness.compaction import ContextUsage
+
+    from services.event_bus import WarningEvent
+
+    session, events = prepare(monkeypatch, [], git_repo)
+    await session._report_context_usage(
+        ContextUsage(used_tokens=900, window_tokens=32_768, resolved=True), fixed_overhead=100
+    )
+
+    await session._reconcile_provider_usage(1_200)
+    await session._reconcile_provider_usage(0)
+
+    assert not [event for event in events if isinstance(event, WarningEvent)]
+
+
+async def test_provider_usage_capability_reconciles_each_successful_response(
+    monkeypatch: pytest.MonkeyPatch, git_repo: GitManagerService
+) -> None:
+    """
+    The session's response hook drives reconciliation from provider usage.
+    """
+    from pydantic_ai.messages import ModelResponse, TextPart
+    from pydantic_ai.usage import RequestUsage
+    from pydantic_ai_harness.compaction import ContextUsage
+
+    from services.event_bus import WarningEvent
+
+    session, events = prepare(monkeypatch, [], git_repo)
+    await session._report_context_usage(
+        ContextUsage(used_tokens=900, window_tokens=32_768, resolved=True), fixed_overhead=100
+    )
+    response: ModelResponse = ModelResponse(
+        parts=[TextPart(content='Done.')], usage=RequestUsage(input_tokens=400)
+    )
+
+    returned: ModelResponse = await session._provider_usage_monitor().after_model_request(
+        MagicMock(), request_context=MagicMock(), response=response
+    )
+
+    assert returned is response
+    warnings: list[WarningEvent] = [event for event in events if isinstance(event, WarningEvent)]
+    assert len(warnings) == 1

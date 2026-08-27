@@ -8,6 +8,7 @@ from pathlib import Path
 
 import pytest
 import pytest_asyncio
+from dotenv import load_dotenv
 from httpx import AsyncClient, MockTransport, Request, Response
 from tortoise import Tortoise
 
@@ -19,6 +20,8 @@ from services.event_bus import EventBus
 from services.file_editor import FileEditorService
 from services.git_manager import GitManagerService
 from services.session_context import SessionContext
+
+load_dotenv(dotenv_path=Path(__file__).resolve().parents[2] / '.env', override=False)
 
 
 TEST_REPO_PATH: str = '/tmp/loom-test-project'

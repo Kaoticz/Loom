@@ -54,11 +54,18 @@ from services.compaction import (
     narrowed_window,
     resolve_context_window,
 )
-from services.context_budget import context_window_complaint, estimate_fixed_overhead
+from services.context_budget import (
+    ProviderUsageDivergence,
+    ReportProviderUsage,
+    context_window_complaint,
+    estimate_fixed_overhead,
+    provider_usage_correction,
+    provider_usage_divergence,
+)
 from services.browser_tooling import BROWSER_GUIDANCE
 from services.frontend_detection import repository_has_frontend
 from services.indexing import IndexingService, clamp_chunk_lines
-from agents.planner import StructuredPlan, planner_agent
+from agents.planner import PLANNER_SYSTEM_PROMPT, StructuredPlan, planner_agent
 from services.plan_parser import (
     NO_STEPS_CORRECTION,
     ParsedPlan,
@@ -212,6 +219,10 @@ class AgentSession:
     _connection_lost: Event
     _has_frontend: bool | None
     _last_context_usage: ContextUsage | None
+    _last_estimated_input_tokens: int | None
+    _provider_usage_budget_correction: int
+    _provider_truncation_warning_emitted: bool
+    _provider_underestimate_warning_emitted: bool
     _measured_context_window: int | None
     _context_window_probe_completed: bool
     _context_window_warning_emitted: bool
@@ -289,6 +300,10 @@ class AgentSession:
         # arrives with its path, which is after this point.
         self._has_frontend = None
         self._last_context_usage = None
+        self._last_estimated_input_tokens = None
+        self._provider_usage_budget_correction = 0
+        self._provider_truncation_warning_emitted = False
+        self._provider_underestimate_warning_emitted = False
         self._measured_context_window = None
         self._context_window_probe_completed = False
         self._context_window_warning_emitted = False
@@ -697,7 +712,7 @@ class AgentSession:
             logger.warning('Task history is unavailable for this session: %s', error)
             self._recorder = None
 
-    async def _report_context_usage(self, usage: ContextUsage) -> None:
+    async def _report_context_usage(self, usage: ContextUsage, fixed_overhead: int = 0) -> None:
         """
         Publish how full the context is, measured rather than guessed.
 
@@ -711,13 +726,69 @@ class AgentSession:
         mark it as one.
 
         :param usage: The reading for the request about to be sent.
+        :param fixed_overhead: Tokens sent outside the compactable message history.
         """
         self._last_context_usage = usage
+        self._last_estimated_input_tokens = max(usage.used_tokens + fixed_overhead, 0)
         await self._events.emit(
             ContextUsageEvent(
                 used_tokens=max(usage.used_tokens, 0),
                 window_tokens=max(usage.window_tokens, 1),
                 resolved=usage.resolved,
+            )
+        )
+
+    async def _reconcile_provider_usage(self, provider_input_tokens: int) -> None:
+        """
+        Compare the preceding request estimate with provider-reported prompt usage.
+
+        The provider is the authority on what it processed. A severe shortfall is
+        useful evidence of server-side truncation, while a severe excess reserves
+        room from subsequent compaction budgets without changing the request that
+        is already in flight.
+
+        :param provider_input_tokens: Prompt tokens reported by the successful response.
+        """
+        estimated_input_tokens: int | None = self._last_estimated_input_tokens
+        if estimated_input_tokens is None:
+            return
+
+        divergence: ProviderUsageDivergence = provider_usage_divergence(
+            estimated_input_tokens, provider_input_tokens
+        )
+        if divergence is ProviderUsageDivergence.input_truncated:
+            if self._provider_truncation_warning_emitted:
+                return
+            self._provider_truncation_warning_emitted = True
+            await self._events.emit(
+                WarningEvent(
+                    content=(
+                        f'The model/server processed {provider_input_tokens:,} prompt tokens, but Loom '
+                        f'estimated {estimated_input_tokens:,}. It appears to be truncating input to fit '
+                        'its context limit. Check the model\'s num_ctx setting and lower Loom\'s configured '
+                        'context window if needed.'
+                    )
+                )
+            )
+            return
+
+        if divergence is not ProviderUsageDivergence.estimate_too_low:
+            return
+
+        correction: int = provider_usage_correction(estimated_input_tokens, provider_input_tokens)
+        self._provider_usage_budget_correction = max(
+            self._provider_usage_budget_correction, correction
+        )
+        if self._provider_underestimate_warning_emitted:
+            return
+        self._provider_underestimate_warning_emitted = True
+        await self._events.emit(
+            WarningEvent(
+                content=(
+                    f'The provider processed {provider_input_tokens:,} prompt tokens, but Loom estimated '
+                    f'{estimated_input_tokens:,}. Loom will reserve {correction:,} additional context tokens '
+                    'for later requests so its compaction budget reflects the provider\'s accounting.'
+                )
             )
         )
 
@@ -728,22 +799,53 @@ class AgentSession:
         :param context_window: The effective window for the current run path.
         :returns: The configured compaction capability.
         """
-        if self._measured_context_window is None:
-            return build_compaction(context_window)
-        return build_compaction(context_window, allow_subminimum=True)
+        corrected_window: int = context_window
+        if self._provider_usage_budget_correction:
+            corrected_window = max(
+                resolve_context_window(context_window) - self._provider_usage_budget_correction, 1
+            )
+        if self._measured_context_window is None and not self._provider_usage_budget_correction:
+            return build_compaction(corrected_window)
+        return build_compaction(corrected_window, allow_subminimum=True)
 
-    def _usage_monitor_for(self, context_window: int) -> ReportContextUsage:
+    def _usage_monitor_for(
+        self,
+        context_window: int,
+        system_prompt: str = CODER_SYSTEM_PROMPT,
+        agent: Agent[Any, Any] | None = None,
+    ) -> ReportContextUsage:
         """
         Build a usage monitor against this session's effective window.
 
         :param context_window: The effective window for the current run path.
+        :param system_prompt: The prompt sent outside the compactable history.
+        :param agent: The agent whose tool schemas are sent with the prompt.
         :returns: The configured usage-monitoring capability.
         """
+        overhead_agent: Agent[Any, Any] = agent if agent is not None else coder_agent
+        fixed_overhead: int = estimate_fixed_overhead(system_prompt, overhead_agent)
+
+        async def report(usage: ContextUsage) -> None:
+            """
+            Record the history estimate with this run path's fixed overhead.
+
+            :param usage: The harness's pre-request history estimate.
+            """
+            await self._report_context_usage(usage, fixed_overhead)
+
         if self._measured_context_window is None:
-            return build_usage_monitor(context_window, self._report_context_usage)
+            return build_usage_monitor(context_window, report)
         return build_usage_monitor(
-            context_window, self._report_context_usage, allow_subminimum=True
+            context_window, report, allow_subminimum=True
         )
+
+    def _provider_usage_monitor(self) -> ReportProviderUsage:
+        """
+        Build the capability that receives each successful provider response.
+
+        :returns: The response-usage reporting capability.
+        """
+        return ReportProviderUsage(self._reconcile_provider_usage)
 
     def _model_settings_for(self, context_window: int) -> OpenAIChatModelSettings:
         """
@@ -905,7 +1007,10 @@ class AgentSession:
                     self._compaction_for(self._coder_context_window),
                     # After the ladder, so the reading describes the history
                     # actually being sent rather than what triggered it.
-                    self._usage_monitor_for(self._coder_context_window),
+                    self._usage_monitor_for(
+                        self._coder_context_window, CODER_SYSTEM_PROMPT, agent
+                    ),
+                    self._provider_usage_monitor(),
                 ],
             )
 
@@ -1138,7 +1243,10 @@ class AgentSession:
                 usage_limits=UsageLimits(request_limit=None),
                 capabilities=[
                     self._compaction_for(self._planner_context_window),
-                    self._usage_monitor_for(self._planner_context_window),
+                    self._usage_monitor_for(
+                        self._planner_context_window, PLANNER_SYSTEM_PROMPT, planner_agent
+                    ),
+                    self._provider_usage_monitor(),
                 ],
             )
 
@@ -1196,7 +1304,10 @@ class AgentSession:
                 usage_limits=UsageLimits(request_limit=None),
                 capabilities=[
                     self._compaction_for(self._planner_context_window),
-                    self._usage_monitor_for(self._planner_context_window),
+                    self._usage_monitor_for(
+                        self._planner_context_window, PLANNER_SYSTEM_PROMPT, planner_agent
+                    ),
+                    self._provider_usage_monitor(),
                 ],
             )
 

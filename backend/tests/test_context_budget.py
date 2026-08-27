@@ -1,9 +1,12 @@
 from agents.coder import CODER_SYSTEM_PROMPT, coder_agent
 from services.compaction import DEFAULT_CONTEXT_WINDOW
 from services.context_budget import (
+    ProviderUsageDivergence,
     WORKING_HEADROOM_TOKENS,
     context_window_complaint,
     estimate_fixed_overhead,
+    provider_usage_correction,
+    provider_usage_divergence,
 )
 
 
@@ -63,3 +66,15 @@ def test_the_default_window_can_carry_the_real_overhead() -> None:
         f'the fixed overhead has grown to {overhead} tokens, which no longer leaves '
         f'{WORKING_HEADROOM_TOKENS} tokens of room in the default {DEFAULT_CONTEXT_WINDOW}'
     )
+
+
+def test_provider_usage_divergence_uses_deliberately_wide_thresholds() -> None:
+    """
+    Normal estimator variation must not look like either failure precursor.
+    """
+    assert provider_usage_divergence(1_000, 500) is ProviderUsageDivergence.input_truncated
+    assert provider_usage_divergence(1_000, 1_500) is ProviderUsageDivergence.estimate_too_low
+    assert provider_usage_divergence(1_000, 1_200) is ProviderUsageDivergence.agreement
+    assert provider_usage_divergence(1_000, 0) is ProviderUsageDivergence.unavailable
+    assert provider_usage_correction(1_000, 1_500) == 500
+    assert provider_usage_correction(1_000, 1_200) == 0

@@ -77,6 +77,7 @@ What exists today, and why it produces the reported symptom ("The model had no r
 ### Phase 0: Environment Setup — Status: Done
 - Python 3.14.x required (per `backend/AGENTS.md`). If `.venv` does not exist: `cd backend && python -m venv .venv && source .venv/bin/activate && pip install -e ".[dev]"`.
 - Confirm `git` availability (repo already verified as a git repository).
+- `TEST_DATABASE_URL=postgres://loom:loom_password@localhost:5432/loom_db` is defined in the root `.env` and `env.example`; the backend test bootstrap loads that root file, so the suite uses the local Compose Postgres service without a per-command export.
 - Run the baseline test suite per Global Rules and record results. Note: suites requiring `TEST_DATABASE_URL` (Postgres with pgvector) skip themselves when it is unset — record which mode applied, since later phases must compare like against like. `ast-grep` must be on `PATH` (or `AST_GREP_BIN` set) for indexing tests to run rather than skip.
 - Run `mypy . && basedpyright .` once to record the linting baseline.
 
@@ -128,27 +129,27 @@ What exists today, and why it produces the reported symptom ("The model had no r
   - [x] Stop/disconnect conditions are never retried. — verified by: `test_stop_requested_during_text_planning_is_not_retried`; the shared predicate propagates any unrecognised exception, including disconnects.
 - **Testing Notes:** Stub exceptions mirroring both failure shapes (empty-generation `UnexpectedModelBehavior`; provider error with status + message). Reuse the session fixtures from `test_execution_loop.py`.
 
-### Phase 3: Reconcile Loom's estimate against provider-reported usage — Status: Not Started
+### Phase 3: Reconcile Loom's estimate against provider-reported usage — Status: Done
 - **Goal:** Use the provider's own accounting, available on every successful response, to catch the two failure precursors a success can legitimately reveal: silent input truncation (provider processed far less than Loom sent — small models clamping `num_ctx`) and hidden token growth (provider billed far more than Loom's heuristic sees — content invisible to the char-based estimator).
 - **Requirements:**
-  - [ ] After each successful model response on a long run, compare the provider-reported prompt/input token count against Loom's own estimate of what that request carried (fixed overhead from `estimate_fixed_overhead()` plus the estimated history at send time — reuse whatever accounting the compaction/monitor path already computes rather than recounting).
-  - [ ] Classify divergence in both directions with named constants for the thresholds (chosen sensibly, e.g., provider-under ≲ half of estimate signals likely truncation; provider-over ≳ 1.5× signals unseen content — exact values are the agent's to tune and document):
-    - Provider processed substantially *less* than sent → warn once per session that the model/server appears to be truncating input, naming the observed vs expected figures and pointing at `num_ctx`.
-    - Provider processed substantially *more* than estimated → warn once per session that Loom's estimate understates reality, and feed the correction back so subsequent budgets account for it (e.g., adopt the larger observed figure into the working overhead/history accounting for the remainder of the session — the mechanism is the agent's choice; the requirement is that later requests budget against the corrected view).
-  - [ ] Each direction warns at most once per session; subsequent divergences update the correction silently without new events, so the feed is never spammed.
-  - [ ] Nothing here may change what is sent to the model mid-run other than the budget correction above; no history edits, no narrowing triggered by divergence alone (narrowing remains failure-driven from Phase 2).
-  - [ ] The existing `ContextUsageEvent` contract and header gauge stay untouched.
+  - [x] After each successful model response on a long run, compare the provider-reported prompt/input token count against Loom's own estimate of what that request carried (fixed overhead from `estimate_fixed_overhead()` plus the estimated history at send time — reuse whatever accounting the compaction/monitor path already computes rather than recounting). — verified by: the `ReportProviderUsage.after_model_request()` capability calls the session reconciliation hook after every response, paired with the existing pre-request usage monitor.
+  - [x] Classify divergence in both directions with named constants for the thresholds (chosen sensibly, e.g., provider-under ≲ half of estimate signals likely truncation; provider-over ≳ 1.5× signals unseen content — exact values are the agent's to tune and document):
+    - Provider processed substantially *less* than sent → warn once per session that the model/server appears to be truncating input, naming the observed vs expected figures and pointing at `num_ctx`. — verified by: `test_provider_input_truncation_warns_once_with_concrete_counts`.
+    - Provider processed substantially *more* than estimated → warn once per session that Loom's estimate understates reality, and feed the correction back so subsequent budgets account for it (e.g., adopt the larger observed figure into the working overhead/history accounting for the remainder of the session — the mechanism is the agent's choice; the requirement is that later requests budget against the corrected view). — verified by: `test_provider_underestimate_reserves_budget_and_warns_once`.
+  - [x] Each direction warns at most once per session; subsequent divergences update the correction silently without new events, so the feed is never spammed. — verified by: repeated under- and over-estimate assertions in the focused execution-loop tests.
+  - [x] Nothing here may change what is sent to the model mid-run other than the budget correction above; no history edits, no narrowing triggered by divergence alone (narrowing remains failure-driven from Phase 2). — verified by: tracing the correction exclusively to `_compaction_for()`; model settings and context-usage event payloads are unchanged.
+  - [x] The existing `ContextUsageEvent` contract and header gauge stay untouched. — verified by: schema inspection and the existing context-usage tests.
 - **Edge Cases & Error Handling:**
   - Runs shorter than two responses produce at most one comparison point — acceptable; the feature targets long ReAct loops.
   - Providers reporting zero/absent usage → skip reconciliation silently for that response.
   - Divergence caused by a Phase 2 retry boundary (fresh attempt after narrowing) must not double-warn; the once-per-session-per-direction rule covers it.
 - **Affected Areas:** `api/v1/agent_session.py` (per-response hook on the streaming path and both planner paths), `services/context_budget.py` or `services/compaction.py` (threshold constants + correction helper), tests in `test_execution_loop.py` or a focused new module.
 - **Acceptance Criteria:**
-  - [ ] A synthetic run whose provider reports roughly half the estimated prompt tokens emits the truncation warning once with concrete numbers. — verified by: unit test with scripted usage figures.
-  - [ ] A synthetic run whose provider reports ~1.5×+ the estimate emits the underestimate warning once and subsequent requests budget with the correction. — verified by: unit test asserting the adjusted budget reaches `build_compaction`.
-  - [ ] Agreement within thresholds emits nothing new. — verified by: unit test.
-  - [ ] Repeat divergences in the same session/direction add no further warnings. — verified by: unit test.
-  - [ ] Existing suite green; `ContextUsageEvent` shape untouched. — verified by: pytest run + schema inspection.
+  - [x] A synthetic run whose provider reports roughly half the estimated prompt tokens emits the truncation warning once with concrete numbers. — verified by: `test_provider_input_truncation_warns_once_with_concrete_counts`.
+  - [x] A synthetic run whose provider reports ~1.5×+ the estimate emits the underestimate warning once and subsequent requests budget with the correction. — verified by: `test_provider_underestimate_reserves_budget_and_warns_once`.
+  - [x] Agreement within thresholds emits nothing new. — verified by: `test_agreeing_or_absent_provider_usage_emits_no_warning`.
+  - [x] Repeat divergences in the same session/direction add no further warnings. — verified by: `test_provider_input_truncation_warns_once_with_concrete_counts` and `test_provider_underestimate_reserves_budget_and_warns_once`.
+  - [x] Existing suite green; `ContextUsageEvent` shape untouched. — verified by: `env -u TEST_DATABASE_URL pytest` loaded the configured root `.env` and reported 897 passed and 4 skipped, plus schema inspection.
 - **Testing Notes:** Drive the comparison logic directly against synthetic (estimated, reported) pairs; wire-level coverage only needs one integration point asserted end-to-end.
 
 ### Phase 4: Make compaction visible, in the log and in the feed — Status: Not Started
@@ -194,7 +195,7 @@ What exists today, and why it produces the reported symptom ("The model had no r
 - Final one-shot summary written covering all phases, plus recommendations for anything noticed but left out of scope (candidates already known: persisting the discovered window, vLLM/LM Studio metadata probing, distinct planner model).
 
 ## Open Questions
-- **Exact divergence thresholds and correction mechanics (Phase 3):** intentionally left to the implementing agent's judgment with the recommended starting points stated in the requirements; document the chosen values in the phase summary rather than asking mid-flight, unless real usage data suggests the defaults are badly wrong.
+  - **Exact divergence thresholds and correction mechanics (Phase 3):** settled at provider input <= 0.5x Loom's estimate for likely truncation and >= 1.5x for unseen growth. The largest observed excess is reserved from later compaction windows for the session; provider settings and request history remain unchanged.
 - **Shared `/api/show` parsing seam (Phase 1):** extract-from-`embedding.py` vs new standalone module — agent's judgment; whichever keeps `EmbeddingService` behavior byte-identical (its own tests must pass unmodified).
 - **Compaction detection seam (Phase 4):** the observing wrapper around `TieredCompaction` is the recommendation, with `ContextUsage`-delta inference as the fallback — the agent's judgment, documented in the phase summary. Settled and not open: the notice reaches the interface as its own `compaction` message type carrying the counts as numbers, rather than as a reworded `system` announcement.
 - **Modelfile `num_ctx` preference (Phase 1):** if reading the tighter of parameters-vs-architecture proves unreliable across Ollama versions, fall back to the architecture context length alone and note it in the summary — this is latitude, not a blocker.
