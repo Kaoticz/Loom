@@ -13,7 +13,7 @@ from agents.reviewer import ReviewResult, reviewer_agent
 from fastapi import WebSocket
 from pydantic_ai import Agent, RunContext, UsageLimits
 from pydantic_ai.capabilities import AbstractCapability
-from pydantic_ai_harness.compaction import ContextUsage, ReportContextUsage
+from pydantic_ai_harness.compaction import ContextUsage, ReportContextUsage, estimate_token_count
 from pydantic_ai.agent import AgentRunResult
 from pydantic_ai.messages import (
     AgentStreamEvent,
@@ -21,6 +21,7 @@ from pydantic_ai.messages import (
     PartStartEvent,
     TextPart,
     TextPartDelta,
+    ModelMessage,
 )
 from pydantic_ai.models.openai import OpenAIChatModel, OpenAIChatModelSettings
 from pydantic_ai.providers.openai import OpenAIProvider
@@ -52,10 +53,12 @@ from services.git_manager import CommitResult, FileChange, GitManagerService
 from services.code_search import CodeSearchService
 from services.compaction import (
     build_compaction,
+    force_summarize_history,
     build_proactive_tool_pruning,
     build_usage_monitor,
     looks_like_context_overflow,
     narrowed_window,
+    RequestHistoryCapture,
     resolve_context_window,
 )
 from services.context_budget import (
@@ -225,7 +228,8 @@ class AgentSession:
     _last_context_usage: ContextUsage | None
     _last_estimated_input_tokens: int | None
     _provider_usage_budget_correction: int
-    _provider_truncation_warning_emitted: bool
+    _provider_usage_observation: int
+    _provider_truncation_recovery_observation: int | None
     _provider_underestimate_warning_emitted: bool
     _measured_context_window: int | None
     _context_window_probe_completed: bool
@@ -306,7 +310,8 @@ class AgentSession:
         self._last_context_usage = None
         self._last_estimated_input_tokens = None
         self._provider_usage_budget_correction = 0
-        self._provider_truncation_warning_emitted = False
+        self._provider_usage_observation = 0
+        self._provider_truncation_recovery_observation = None
         self._provider_underestimate_warning_emitted = False
         self._measured_context_window = None
         self._context_window_probe_completed = False
@@ -734,6 +739,7 @@ class AgentSession:
         """
         self._last_context_usage = usage
         self._last_estimated_input_tokens = max(usage.used_tokens + fixed_overhead, 0)
+        self._provider_usage_observation += 1
         await self._events.emit(
             ContextUsageEvent(
                 used_tokens=max(usage.used_tokens, 0),
@@ -761,18 +767,13 @@ class AgentSession:
             estimated_input_tokens, provider_input_tokens
         )
         if divergence is ProviderUsageDivergence.input_truncated:
-            if self._provider_truncation_warning_emitted:
+            if self._provider_truncation_recovery_observation == self._provider_usage_observation:
                 return
-            self._provider_truncation_warning_emitted = True
-            await self._events.emit(
-                WarningEvent(
-                    content=(
-                        f'The model/server processed {provider_input_tokens:,} prompt tokens, but Loom '
-                        f'estimated {estimated_input_tokens:,}. It appears to be truncating input to fit '
-                        'its context limit. Check the model\'s num_ctx setting and lower Loom\'s configured '
-                        'context window if needed.'
-                    )
-                )
+            self._provider_truncation_recovery_observation = self._provider_usage_observation
+            _ = await self._narrow_after_input_truncation(
+                resolve_context_window(self._coder_context_window),
+                estimated_input_tokens,
+                provider_input_tokens,
             )
             return
 
@@ -950,20 +951,21 @@ class AgentSession:
             context_window, allow_subminimum=self._measured_context_window is not None
         )
 
-    async def _narrow_after_overflow(self, budget: int) -> bool:
+    async def _narrow_context_window(
+        self,
+        budget: int,
+        warning_content: Callable[[int, int], str],
+    ) -> bool:
         """
-        React to a run that had no room to answer in.
+        Halve both working windows unless their fixed overhead makes that useless.
 
-        The configured window has been shown to be larger than the model's real
-        one, which Loom has no way to ask for. Narrowing what it budgets against
-        makes the next attempt smaller, and repeating that closes the gap without
-        anybody having to know the true figure.
-
-        :param budget: The window the failed run was budgeted against.
-        :returns: True if the window was narrowed and the run is worth retrying.
+        :param budget: The window demonstrated to be too optimistic.
+        :param warning_content: Builds the cause-specific warning after narrowing.
+        :returns: True if the window was narrowed and another run is worthwhile.
         """
         narrower: int = narrowed_window(budget)
-        if narrower >= resolve_context_window(budget):
+        configured: int = resolve_context_window(budget)
+        if narrower >= configured:
             return False
 
         overhead: int = estimate_fixed_overhead(CODER_SYSTEM_PROMPT, coder_agent)
@@ -981,22 +983,122 @@ class AgentSession:
         self._planner_context_window = min(
             narrower, resolve_context_window(self._planner_context_window)
         )
+        await self._events.emit(WarningEvent(content=warning_content(configured, narrower)))
+        return True
+
+    async def _narrow_after_overflow(self, budget: int) -> bool:
+        """
+        React to a run that had no room to answer in.
+
+        The configured window has been shown to be larger than the model's real
+        one, which Loom has no way to ask for. Narrowing what it budgets against
+        makes the next attempt smaller, and repeating that closes the gap without
+        anybody having to know the true figure.
+
+        :param budget: The window the failed run was budgeted against.
+        :returns: True if the window was narrowed and the run is worth retrying.
+        """
+        return await self._narrow_context_window(
+            budget,
+            lambda configured, narrower: (
+                f'The model had no room to reply, so its context window is smaller than the '
+                f'{configured:,} tokens configured. Retrying with {narrower:,}. Set the context '
+                'window to what the model actually supports to avoid this.'
+            ),
+        )
+
+    async def _narrow_after_input_truncation(
+        self,
+        budget: int,
+        estimated_input_tokens: int,
+        provider_input_tokens: int,
+    ) -> bool:
+        """
+        Reduce the working window after a provider reports truncated input.
+
+        :param budget: The active coder window before the correction.
+        :param estimated_input_tokens: Loom's estimate for the truncated request.
+        :param provider_input_tokens: Tokens the provider reports processing.
+        :returns: True if a smaller working window was applied.
+        """
+        return await self._narrow_context_window(
+            budget,
+            lambda configured, narrower: (
+                f'The model/server processed {provider_input_tokens:,} prompt tokens, but Loom '
+                f'estimated {estimated_input_tokens:,}. It appears to be truncating input to fit '
+                f'its context limit, so Loom reduced its context window from {configured:,} to '
+                f'{narrower:,}. Set the context window to what the model actually supports to '
+                'avoid this.'
+            ),
+        )
+
+    async def _summarize_after_overflow(
+        self,
+        history: RequestHistoryCapture,
+        budget: int,
+        run_path: CompactionRunPath,
+    ) -> list[ModelMessage] | None:
+        """
+        Force one summary of a failed request before reducing its window.
+
+        :param history: The last compacted request history from the failed run.
+        :param budget: The unchanged window against which that request ran.
+        :param run_path: The agent path whose request is being recovered.
+        :returns: A smaller history worth retrying, or None when narrowing is needed.
+        """
+        messages: list[ModelMessage] = history.messages
+        if not messages:
+            return None
+
+        before: int = estimate_token_count(messages)
+        try:
+            compacted: list[ModelMessage] = await force_summarize_history(
+                messages,
+                budget,
+                resolve_model(self._coder_model),
+                allow_subminimum=self._measured_context_window is not None,
+            )
+        except Exception:
+            logger.exception('Could not summarize the request history after a context overflow.')
+            await self._events.emit(
+                WarningEvent(
+                    content=(
+                        'The model had no room to reply. Loom tried summarizing the preceding request, '
+                        'but the summary could not be created before reducing the context window.'
+                    )
+                )
+            )
+            return None
+
+        after: int = estimate_token_count(compacted)
+        if after >= before:
+            await self._events.emit(
+                WarningEvent(
+                    content=(
+                        'The model had no room to reply. Loom tried summarizing the preceding request, '
+                        'but it did not free enough context to retry before reducing the context window.'
+                    )
+                )
+            )
+            return None
+
+        await self._report_compaction(run_path, before, after)
         await self._events.emit(
             WarningEvent(
                 content=(
-                    f'The model had no room to reply, so its context window is smaller than the '
-                    f'{resolve_context_window(budget):,} tokens configured. Retrying with '
-                    f'{narrower:,}. Set the context window to what the model actually supports '
-                    'to avoid this.'
+                    'The model had no room to reply. Loom summarized the preceding request and will '
+                    'retry before reducing the context window.'
                 )
             )
         )
-        return True
+        return compacted
 
     async def _run_with_overflow_recovery(
         self,
-        run: Callable[[], Awaitable[_RunResult]],
+        run: Callable[[list[ModelMessage] | None], Awaitable[_RunResult]],
         context_window: Callable[[], int],
+        history: RequestHistoryCapture,
+        run_path: CompactionRunPath,
         on_retry: Callable[[], object] | None = None,
     ) -> _RunResult:
         """
@@ -1006,19 +1108,31 @@ class AgentSession:
         the coder or planner budget. Narrowing still updates both budgets because
         they use the same serving model.
 
-        :param run: Starts one model-run attempt.
+        :param run: Starts one model-run attempt with optional recovered history.
         :param context_window: Reads the budget that owns each attempt.
+        :param history: Captures the final compacted request before a failed call.
+        :param run_path: Identifies recovery compaction in the event feed.
         :param on_retry: Clears state belonging to an abandoned attempt.
         :returns: The successful model-run result.
         :raises Exception: If the failure is unrelated or cannot be recovered.
         """
+        message_history: list[ModelMessage] | None = None
+        summary_attempted_window: int | None = None
         while True:
             try:
-                return await run()
+                return await run(message_history)
             except Exception as error:
                 if not looks_like_context_overflow(error):
                     raise
-                if not await self._narrow_after_overflow(context_window()):
+                budget: int = context_window()
+                if summary_attempted_window != budget:
+                    summary_attempted_window = budget
+                    message_history = await self._summarize_after_overflow(history, budget, run_path)
+                    if message_history is not None:
+                        if on_retry is not None:
+                            _ = on_retry()
+                        continue
+                if not await self._narrow_after_overflow(budget):
                     raise
                 if on_retry is not None:
                     _ = on_retry()
@@ -1079,7 +1193,9 @@ class AgentSession:
                     for thought in buffer.add(event.delta.content_delta, monotonic()):
                         await self._say(thought)
 
-        async def run_coder() -> AgentRunResult[str]:
+        history: RequestHistoryCapture = RequestHistoryCapture()
+
+        async def run_coder(message_history: list[ModelMessage] | None) -> AgentRunResult[str]:
             """
             Run one streaming coder attempt.
 
@@ -1087,6 +1203,7 @@ class AgentSession:
             """
             return await agent.run(
                 prompt,
+                message_history=message_history,
                 deps=self._deps,
                 model=resolve_model(self._coder_model),
                 model_settings=self._model_settings_for(self._coder_context_window),
@@ -1099,6 +1216,7 @@ class AgentSession:
                     *self._compaction_capabilities_for(
                         self._coder_context_window, CompactionRunPath.coder_streaming
                     ),
+                    history,
                     # After the ladder, so the reading describes the history
                     # actually being sent rather than what triggered it.
                     self._usage_monitor_for(
@@ -1113,6 +1231,8 @@ class AgentSession:
         result: AgentRunResult[str] = await self._run_with_overflow_recovery(
             run_coder,
             lambda: self._coder_context_window,
+            history,
+            CompactionRunPath.coder_streaming,
             buffer.flush,
         )
 
@@ -1323,7 +1443,11 @@ class AgentSession:
         :param prompt: The planning prompt.
         :returns: The plan, structured if it could be, parsed from text if not.
         """
-        async def run_structured() -> AgentRunResult[StructuredPlan]:
+        history: RequestHistoryCapture = RequestHistoryCapture()
+
+        async def run_structured(
+            message_history: list[ModelMessage] | None,
+        ) -> AgentRunResult[StructuredPlan]:
             """
             Run one structured-planning attempt.
 
@@ -1331,6 +1455,7 @@ class AgentSession:
             """
             return await planner_agent.run(
                 prompt,
+                message_history=message_history,
                 deps=self._deps,
                 model=resolve_model(self._coder_model),
                 model_settings=self._model_settings_for(self._planner_context_window),
@@ -1339,6 +1464,7 @@ class AgentSession:
                     *self._compaction_capabilities_for(
                         self._planner_context_window, CompactionRunPath.structured_planning
                     ),
+                    history,
                     self._usage_monitor_for(
                         self._planner_context_window, PLANNER_SYSTEM_PROMPT, planner_agent
                     ),
@@ -1350,6 +1476,8 @@ class AgentSession:
             result: AgentRunResult[StructuredPlan] = await self._run_with_overflow_recovery(
                 run_structured,
                 lambda: self._planner_context_window,
+                history,
+                CompactionRunPath.structured_planning,
             )
         except Exception as error:
             if looks_like_context_overflow(error):
@@ -1385,7 +1513,9 @@ class AgentSession:
         :param prompt: The prompt to send.
         :returns: The planner's output, as text.
         """
-        async def run_text() -> AgentRunResult[str]:
+        history: RequestHistoryCapture = RequestHistoryCapture()
+
+        async def run_text(message_history: list[ModelMessage] | None) -> AgentRunResult[str]:
             """
             Run one text-planning attempt.
 
@@ -1393,6 +1523,7 @@ class AgentSession:
             """
             return await planner_agent.run(
                 prompt,
+                message_history=message_history,
                 output_type=str,
                 deps=self._deps,
                 model=resolve_model(self._coder_model),
@@ -1402,6 +1533,7 @@ class AgentSession:
                     *self._compaction_capabilities_for(
                         self._planner_context_window, CompactionRunPath.text_planning
                     ),
+                    history,
                     self._usage_monitor_for(
                         self._planner_context_window, PLANNER_SYSTEM_PROMPT, planner_agent
                     ),
@@ -1412,6 +1544,8 @@ class AgentSession:
         result: AgentRunResult[str] = await self._run_with_overflow_recovery(
             run_text,
             lambda: self._planner_context_window,
+            history,
+            CompactionRunPath.text_planning,
         )
         return result.output
 

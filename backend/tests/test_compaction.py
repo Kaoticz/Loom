@@ -30,9 +30,11 @@ from services.compaction import (
     IRRECOVERABLE_TOOLS,
     DEFAULT_CONTEXT_WINDOW,
     MINIMUM_CONTEXT_WINDOW,
+    RequestHistoryCapture,
     TARGET_FRACTION,
     ObservedCompaction,
     build_compaction,
+    build_forced_summarization,
     build_proactive_tool_pruning,
     read_file_key,
     resolve_context_window,
@@ -217,6 +219,17 @@ def test_the_expensive_tiers_sit_behind_the_free_ones() -> None:
     )
 
 
+def test_forced_summarization_uses_the_failed_request_window() -> None:
+    """
+    Overflow recovery summarizes against the original budget before narrowing it.
+    """
+    summary: SummarizingCompaction[Any] = build_forced_summarization(16_384)
+
+    assert summary.context_window == 16_384
+    assert summary.keep_messages == 20
+    assert summary.model is None
+
+
 def test_a_single_message_may_not_fill_the_window() -> None:
     """
     One tool result must not be able to crowd out the conversation it belongs to.
@@ -355,6 +368,23 @@ class StubCompaction(AbstractCapability[Any]):
         """
         request_context.messages = self._result
         return request_context
+
+
+async def test_request_history_capture_keeps_the_compacted_request() -> None:
+    """
+    Overflow recovery receives the history after ordinary compaction has run.
+    """
+    messages: list[ModelMessage] = history_with_file_reads(3, 'x' * 400)
+    shortened: list[ModelMessage] = messages[-1:]
+    capture: RequestHistoryCapture = RequestHistoryCapture()
+
+    result: ModelRequestContext = await capture.before_model_request(
+        run_context(quiet_model()), request_context(shortened)
+    )
+
+    assert result.messages == shortened
+    assert capture.messages == shortened
+    assert capture.messages is not shortened
 
 
 async def test_an_observed_compaction_reports_one_real_history_reduction() -> None:

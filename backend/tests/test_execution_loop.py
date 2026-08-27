@@ -1816,6 +1816,16 @@ async def test_a_workable_window_is_not_complained_about(
     session, events = prepare(monkeypatch, [], git_repo)
     session._plan = three_step_plan()
     session._coder_context_window = 64_000
+
+    async def ignore_provider_usage(provider_input_tokens: int) -> None:
+        """
+        Keep this fixed-overhead test independent of provider usage simulation.
+
+        :param provider_input_tokens: The reported usage, deliberately ignored.
+        """
+        _ = provider_input_tokens
+
+    monkeypatch.setattr(session, '_reconcile_provider_usage', ignore_provider_usage)
     monkeypatch.setattr(agent_session_module, 'resolve_model', lambda name: quiet_model())
 
     await session._handle_executing()
@@ -1911,11 +1921,11 @@ async def test_an_unresolved_window_is_passed_through(
     assert readings[0].resolved is False
 
 
-async def test_provider_input_truncation_warns_once_with_concrete_counts(
+async def test_provider_input_truncation_narrows_once_with_concrete_counts(
     monkeypatch: pytest.MonkeyPatch, git_repo: GitManagerService
 ) -> None:
     """
-    A server processing half the estimated prompt is surfaced without feed spam.
+    A server processing half the estimated prompt corrects the next request.
     """
     from pydantic_ai_harness.compaction import ContextUsage
 
@@ -1933,7 +1943,147 @@ async def test_provider_input_truncation_warns_once_with_concrete_counts(
     assert len(warnings) == 1
     assert '400 prompt tokens' in warnings[0].content
     assert '1,000' in warnings[0].content
-    assert 'num_ctx' in warnings[0].content
+    assert 'reduced its context window from 32,768 to 16,384' in warnings[0].content
+    assert session._coder_context_window == 16_384
+    assert session._planner_context_window == 16_384
+
+
+async def test_new_provider_truncation_observations_each_narrow_the_window(
+    monkeypatch: pytest.MonkeyPatch, git_repo: GitManagerService
+) -> None:
+    """
+    Each request can independently prove the serving window remains too large.
+    """
+    from pydantic_ai_harness.compaction import ContextUsage
+
+    session, _ = prepare(monkeypatch, [], git_repo)
+    session._coder_context_window = 128_048
+    session._planner_context_window = 128_048
+
+    await session._report_context_usage(
+        ContextUsage(used_tokens=900, window_tokens=128_048, resolved=True), fixed_overhead=100
+    )
+    await session._reconcile_provider_usage(400)
+    await session._report_context_usage(
+        ContextUsage(used_tokens=900, window_tokens=64_024, resolved=True), fixed_overhead=100
+    )
+    await session._reconcile_provider_usage(400)
+
+    assert session._coder_context_window == 32_012
+    assert session._planner_context_window == 32_012
+
+
+async def test_forced_summary_precedes_narrowing_and_retries_with_its_history(
+    monkeypatch: pytest.MonkeyPatch, git_repo: GitManagerService
+) -> None:
+    """
+    A recovered summary is retried before a same-window reduction is considered.
+    """
+    from pydantic_ai.exceptions import UnexpectedModelBehavior
+
+    from services.compaction import RequestHistoryCapture
+
+    session, _ = prepare(monkeypatch, [], git_repo)
+    history: RequestHistoryCapture = RequestHistoryCapture()
+    compacted: list[ModelMessage] = [ModelResponse(parts=[TextPart(content='Summary.')])]
+    calls: list[str] = []
+
+    async def summarize(
+        captured: RequestHistoryCapture,
+        budget: int,
+        run_path: CompactionRunPath,
+    ) -> list[ModelMessage] | None:
+        """
+        Record one successful forced-summary recovery.
+
+        :param captured: The failed request history, unused by this stand-in.
+        :param budget: The unchanged recovery budget, unused by this stand-in.
+        :param run_path: The recovered agent path, unused by this stand-in.
+        :returns: The history for the retry.
+        """
+        _ = captured
+        _ = budget
+        _ = run_path
+        calls.append('summary')
+        return compacted
+
+    async def run(message_history: list[ModelMessage] | None) -> str:
+        """
+        Fail once, then verify that the summary was supplied to the retry.
+
+        :param message_history: The optional history supplied to this attempt.
+        :returns: The recovered output.
+        :raises UnexpectedModelBehavior: On the simulated first context overflow.
+        """
+        if message_history is None:
+            calls.append('first-run')
+            raise UnexpectedModelBehavior(
+                'Model token limit (8192) exceeded before any response was generated.'
+            )
+        calls.append('summary-retry')
+        assert message_history == compacted
+        return 'recovered'
+
+    async def narrow(budget: int) -> bool:
+        """
+        Record an unexpected narrowing attempt.
+
+        :param budget: The rejected budget, unused by this stand-in.
+        :returns: Always False because the call is a test failure.
+        """
+        _ = budget
+        calls.append('narrow')
+        return False
+
+    monkeypatch.setattr(session, '_summarize_after_overflow', summarize)
+    monkeypatch.setattr(session, '_narrow_after_overflow', narrow)
+
+    result: str = await session._run_with_overflow_recovery(
+        run,
+        lambda: 32_768,
+        history,
+        CompactionRunPath.coder_streaming,
+    )
+
+    assert result == 'recovered'
+    assert calls == ['first-run', 'summary', 'summary-retry']
+
+
+async def test_forced_summary_emits_a_distinct_recovery_warning(
+    monkeypatch: pytest.MonkeyPatch, git_repo: GitManagerService
+) -> None:
+    """
+    Users can distinguish successful summary recovery from window narrowing.
+    """
+    from services.compaction import RequestHistoryCapture
+    from services.event_bus import WarningEvent
+
+    session, events = prepare(monkeypatch, [], git_repo)
+    history: RequestHistoryCapture = RequestHistoryCapture()
+    messages: list[ModelMessage] = [
+        ModelResponse(parts=[TextPart(content='Long context that needs summarizing.' * 100)])
+    ]
+    history._messages = messages
+    compacted: list[ModelMessage] = [ModelResponse(parts=[TextPart(content='Summary.')])]
+
+    async def summarize(*_: object, **__: object) -> list[ModelMessage]:
+        """
+        Replace the failed history with a shorter summary.
+
+        :returns: The shortened history.
+        """
+        return compacted
+
+    monkeypatch.setattr(agent_session_module, 'force_summarize_history', summarize)
+
+    result: list[ModelMessage] | None = await session._summarize_after_overflow(
+        history, 32_768, CompactionRunPath.coder_streaming
+    )
+
+    warnings: list[WarningEvent] = [event for event in events if isinstance(event, WarningEvent)]
+    assert result == compacted
+    assert len(warnings) == 1
+    assert 'summarized the preceding request' in warnings[0].content
 
 
 async def test_provider_underestimate_reserves_budget_and_warns_once(

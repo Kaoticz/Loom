@@ -5,7 +5,7 @@ from logging import Logger, getLogger
 from typing import TYPE_CHECKING, Any, overload, override
 
 from pydantic_ai.capabilities import AbstractCapability
-from pydantic_ai.messages import ToolCallPart
+from pydantic_ai.messages import ModelMessage, ToolCallPart
 from pydantic_ai_harness.compaction import (
     ClampOversizedMessages,
     ClearToolResults,
@@ -15,6 +15,7 @@ from pydantic_ai_harness.compaction import (
     SlidingWindowCompaction,
     SummarizingCompaction,
     TieredCompaction,
+    compact_now,
     estimate_token_count,
 )
 from pydantic_ai.exceptions import ModelHTTPError
@@ -325,6 +326,95 @@ class ObservedCompaction(AbstractCapability[Any]):
         except Exception:
             logger.exception('Could not report a compaction event.')
         return compacted
+
+
+class RequestHistoryCapture(AbstractCapability[Any]):
+    """
+    Retain the most recent compacted request history for recovery.
+
+    The agent discards its graph state when a model request raises. Capturing the
+    history after ordinary capabilities run lets the session retry from a forced
+    summary instead of throwing that useful context away before narrowing.
+    """
+
+    def __init__(self) -> None:
+        """
+        Create an empty request-history capture.
+        """
+        super().__init__()
+        self._messages: list[ModelMessage] = []
+
+    @property
+    def messages(self) -> list[ModelMessage]:
+        """
+        Return a copy of the last captured request history.
+
+        :returns: The history prepared for the most recent model request.
+        """
+        return list(self._messages)
+
+    @override
+    async def before_model_request(
+        self,
+        ctx: RunContext[Any],
+        request_context: ModelRequestContext,
+    ) -> ModelRequestContext:
+        """
+        Save the already-compacted history without changing the request.
+
+        :param ctx: The active model run context, unused by this observer.
+        :param request_context: The request whose prepared history is retained.
+        :returns: The original request context, unchanged.
+        """
+        self._messages = list(request_context.messages)
+        return request_context
+
+
+def build_forced_summarization(
+    context_window: int | None,
+    *,
+    allow_subminimum: bool = False,
+) -> SummarizingCompaction[Any]:
+    """
+    Build the summary strategy used immediately after a context overflow.
+
+    `compact_now` drives this strategy directly, bypassing its normal budget
+    trigger. The normal fraction remains configured so the strategy's shape
+    matches ordinary summary compaction while its pass is deliberately forced.
+
+    :param context_window: The effective window of the failed request.
+    :param allow_subminimum: Preserve a positive model measurement below Loom's floor.
+    :returns: A summarization strategy for one forced recovery attempt.
+    """
+    window: int = _window_for_consumer(context_window, allow_subminimum)
+    return SummarizingCompaction(
+        max_fraction=TARGET_FRACTION,
+        context_window=window,
+        keep_messages=KEEP_RECENT_MESSAGES,
+        model=None,
+    )
+
+
+async def force_summarize_history(
+    messages: list[ModelMessage],
+    context_window: int | None,
+    model: Any,
+    *,
+    allow_subminimum: bool = False,
+) -> list[ModelMessage]:
+    """
+    Summarize a failed request history outside an active agent run.
+
+    :param messages: The compacted history sent to the failed model request.
+    :param context_window: The effective window of that failed request.
+    :param model: The model that writes the recovery summary.
+    :param allow_subminimum: Preserve a positive model measurement below Loom's floor.
+    :returns: The summarized history, or the original history when no summary is possible.
+    """
+    strategy: SummarizingCompaction[Any] = build_forced_summarization(
+        context_window, allow_subminimum=allow_subminimum
+    )
+    return await compact_now(strategy, messages, model=model)
 
 
 @overload
