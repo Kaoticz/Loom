@@ -95,12 +95,17 @@ async def measure_ollama_context_window(
 
 def effective_context_window(configured: int | None, measured: int | None) -> int:
     """
-    Choose the smaller configured and measured context-window ceiling.
+    Choose the effective context-window ceiling.
 
     :param configured: The user's requested window, or None for the default.
     :param measured: The window Ollama reported, or None when unavailable.
     :returns: The effective window to use for a run.
     """
+    if configured is None or configured <= 0:
+        if measured is not None:
+            return measured
+        return resolve_context_window(configured)
+
     configured_window: int = resolve_context_window(configured)
     if measured is None:
         return configured_window

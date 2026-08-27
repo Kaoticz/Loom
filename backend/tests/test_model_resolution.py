@@ -182,12 +182,33 @@ async def test_an_unreachable_or_unsuccessful_ollama_falls_back_silently() -> No
     await failed_client.aclose()
 
 
-def test_the_effective_window_never_exceeds_the_configured_ceiling() -> None:
+def test_auto_mode_uses_the_full_measured_window() -> None:
     """
-    Measurements reduce budgets but never enlarge a user's ceiling.
+    Auto mode trusts Ollama's serving limit instead of Loom's generic fallback.
+    """
+    assert effective_context_window(None, 131_072) == 131_072
+    assert effective_context_window(0, 131_072) == 131_072
+
+
+def test_auto_mode_keeps_a_smaller_measured_window() -> None:
+    """
+    Auto mode still respects a serving limit below Loom's fallback.
+    """
+    assert effective_context_window(None, 8_192) == 8_192
+
+
+def test_a_manual_window_remains_a_ceiling() -> None:
+    """
+    An explicit hardware-constrained setting must not be enlarged by measurement.
     """
     assert effective_context_window(128_048, 8_192) == 8_192
     assert effective_context_window(8_192, 131_072) == 8_192
+
+
+def test_auto_mode_falls_back_when_measurement_is_unavailable() -> None:
+    """
+    A failed measurement preserves the documented generic default.
+    """
     assert effective_context_window(None, None) == 32_768
 
 

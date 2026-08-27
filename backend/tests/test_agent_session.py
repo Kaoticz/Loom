@@ -2103,6 +2103,29 @@ async def test_a_measured_window_budgets_every_long_run_path() -> None:
     }
 
 
+async def test_auto_context_windows_use_a_larger_measurement() -> None:
+    """
+    An unset setting does not cap a measured model at Loom's generic default.
+    """
+    session, _, _, _ = build_session([json.dumps({'prompt': 'do it'})])
+
+    async def measured(model_name: str) -> int | None:
+        """
+        Report a serving window larger than the generic fallback.
+
+        :param model_name: The model that would have been probed.
+        :returns: The model's measured context window.
+        """
+        _ = model_name
+        return 131_072
+
+    session._context_window_probe = measured
+
+    assert await session._measure_context_window() == 131_072
+    assert session._coder_context_window == 131_072
+    assert session._planner_context_window == 131_072
+
+
 async def test_compaction_capabilities_put_proactive_pruning_before_the_ladder() -> None:
     """
     Every long-running path evaluates the eager cap before reactive compaction.
