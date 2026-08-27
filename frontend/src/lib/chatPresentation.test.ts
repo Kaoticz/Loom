@@ -40,6 +40,12 @@ describe('chat presentation', () => {
         expect(typeStyles.session_busy).not.toBe(typeStyles.error);
     });
 
+    it('distinguishes compaction from system announcements and warnings', () => {
+        expect(typeStyles.compaction).not.toBe(typeStyles.system);
+        expect(typeStyles.compaction).not.toBe(typeStyles.warning);
+        expect(MARKDOWN_TYPES).not.toContain('compaction');
+    });
+
     it('renders only prose types as markdown', () => {
         // Tool output, commits and system announcements contain file paths and
         // command output that markdown would mangle.

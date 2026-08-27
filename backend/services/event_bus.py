@@ -32,6 +32,7 @@ class AgentEventType(str, Enum):
     system = 'system'
     sandbox_unavailable = 'sandbox_unavailable'
     question = 'question'
+    compaction = 'compaction'
 
 
 INDEXING_PROGRESS_KEY: str = 'indexing_progress'
@@ -97,6 +98,16 @@ class ToolStatus(str, Enum):
     running = 'running'
     success = 'success'
     failure = 'failure'
+
+
+class CompactionRunPath(str, Enum):
+    """
+    The long-running agent path whose request history was shortened.
+    """
+
+    coder_streaming = 'coder_streaming'
+    structured_planning = 'structured_planning'
+    text_planning = 'text_planning'
 
 
 class BaseAgentEvent(BaseModel):
@@ -251,6 +262,20 @@ class ContextUsageEvent(BaseAgentEvent):
     resolved: Annotated[bool, Field()] = True
 
 
+class CompactionEvent(BaseAgentEvent):
+    """
+    A request history shortened so it can fit the model's context window.
+
+    The counts are Loom estimates, not provider-reported usage, so the interface
+    can explain the routine housekeeping without parsing prose.
+    """
+
+    type: Annotated[Literal[AgentEventType.compaction], Field()] = AgentEventType.compaction
+    tokens_before: Annotated[int, Field(ge=0, description='Estimated tokens in the request history before compaction.')]
+    tokens_after: Annotated[int, Field(ge=0, description='Estimated tokens in the request history after compaction.')]
+    run_path: Annotated[CompactionRunPath, Field(description='The long-running agent path whose request was compacted.')]
+
+
 class WarningEvent(BaseAgentEvent):
     """
     Emitted when something failed but the session is carrying on regardless.
@@ -315,6 +340,7 @@ AgentEvent = Annotated[
     | ErrorEvent
     | WarningEvent
     | ContextUsageEvent
+    | CompactionEvent
     | SystemEvent
     | SandboxUnavailableEvent,
     Field(discriminator='type'),

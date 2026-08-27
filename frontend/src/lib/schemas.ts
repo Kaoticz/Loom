@@ -129,6 +129,13 @@ const contextUsageMessageSchema = z.object({
     resolved: z.boolean().default(true)
 });
 
+const compactionMessageSchema = z.object({
+    type: z.literal('compaction'),
+    tokens_before: z.number().int().nonnegative(),
+    tokens_after: z.number().int().nonnegative(),
+    run_path: z.enum(['coder_streaming', 'structured_planning', 'text_planning'])
+});
+
 const sessionBusyMessageSchema = z.object({
     type: z.literal('session_busy'),
     content: z.string(),
@@ -197,6 +204,7 @@ export const agentMessageSchema = z.discriminatedUnion('type', [
     errorMessageSchema,
     warningMessageSchema,
     contextUsageMessageSchema,
+    compactionMessageSchema,
     sessionBusyMessageSchema,
     systemMessageSchema,
     sandboxUnavailableMessageSchema

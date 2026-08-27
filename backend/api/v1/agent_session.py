@@ -12,7 +12,8 @@ from agents.coder import CODER_SYSTEM_PROMPT, AgentDeps, answering_agent, coder_
 from agents.reviewer import ReviewResult, reviewer_agent
 from fastapi import WebSocket
 from pydantic_ai import Agent, RunContext, UsageLimits
-from pydantic_ai_harness.compaction import ContextUsage, ReportContextUsage, TieredCompaction
+from pydantic_ai.capabilities import AbstractCapability
+from pydantic_ai_harness.compaction import ContextUsage, ReportContextUsage
 from pydantic_ai.agent import AgentRunResult
 from pydantic_ai.messages import (
     AgentStreamEvent,
@@ -28,6 +29,8 @@ from services.conversation_history import ConversationHistory, TurnRole
 from services.embedding import DEFAULT_EMBEDDING_MODEL, EmbeddingService
 from services.event_bus import (
     CommitEvent,
+    CompactionEvent,
+    CompactionRunPath,
     WarningEvent,
     INDEXING_PROGRESS_KEY,
     DoneEvent,
@@ -792,11 +795,44 @@ class AgentSession:
             )
         )
 
-    def _compaction_for(self, context_window: int) -> TieredCompaction[Any]:
+    async def _report_compaction(
+        self,
+        run_path: CompactionRunPath,
+        tokens_before: int,
+        tokens_after: int,
+    ) -> None:
+        """
+        Log and publish one request-history compaction.
+
+        :param run_path: The long-running path whose request was compacted.
+        :param tokens_before: Estimated history tokens before compaction.
+        :param tokens_after: Estimated history tokens after compaction.
+        """
+        try:
+            logger.info(
+                'Compacted %s request history from an estimated %s to %s tokens.',
+                run_path.value,
+                tokens_before,
+                tokens_after,
+            )
+            await self._events.emit(
+                CompactionEvent(
+                    tokens_before=tokens_before,
+                    tokens_after=tokens_after,
+                    run_path=run_path,
+                )
+            )
+        except Exception:
+            logger.exception('Could not publish a compaction event.')
+
+    def _compaction_for(
+        self, context_window: int, run_path: CompactionRunPath
+    ) -> AbstractCapability[Any]:
         """
         Build a compaction ladder against this session's effective window.
 
         :param context_window: The effective window for the current run path.
+        :param run_path: The long-running path the capability is attached to.
         :returns: The configured compaction capability.
         """
         corrected_window: int = context_window
@@ -804,9 +840,20 @@ class AgentSession:
             corrected_window = max(
                 resolve_context_window(context_window) - self._provider_usage_budget_correction, 1
             )
+        async def report(tokens_before: int, tokens_after: int) -> None:
+            """
+            Attach this capability's path to a compaction notice.
+
+            :param tokens_before: Estimated history tokens before compaction.
+            :param tokens_after: Estimated history tokens after compaction.
+            """
+            await self._report_compaction(run_path, tokens_before, tokens_after)
+
         if self._measured_context_window is None and not self._provider_usage_budget_correction:
-            return build_compaction(corrected_window)
-        return build_compaction(corrected_window, allow_subminimum=True)
+            return build_compaction(corrected_window, on_compaction=report)
+        return build_compaction(
+            corrected_window, allow_subminimum=True, on_compaction=report
+        )
 
     def _usage_monitor_for(
         self,
@@ -1004,7 +1051,9 @@ class AgentSession:
                 # a user setting, and a capability attached at import time
                 # could not see it.
                 capabilities=[
-                    self._compaction_for(self._coder_context_window),
+                    self._compaction_for(
+                        self._coder_context_window, CompactionRunPath.coder_streaming
+                    ),
                     # After the ladder, so the reading describes the history
                     # actually being sent rather than what triggered it.
                     self._usage_monitor_for(
@@ -1242,7 +1291,9 @@ class AgentSession:
                 model_settings=self._model_settings_for(self._planner_context_window),
                 usage_limits=UsageLimits(request_limit=None),
                 capabilities=[
-                    self._compaction_for(self._planner_context_window),
+                    self._compaction_for(
+                        self._planner_context_window, CompactionRunPath.structured_planning
+                    ),
                     self._usage_monitor_for(
                         self._planner_context_window, PLANNER_SYSTEM_PROMPT, planner_agent
                     ),
@@ -1303,7 +1354,9 @@ class AgentSession:
                 model_settings=self._model_settings_for(self._planner_context_window),
                 usage_limits=UsageLimits(request_limit=None),
                 capabilities=[
-                    self._compaction_for(self._planner_context_window),
+                    self._compaction_for(
+                        self._planner_context_window, CompactionRunPath.text_planning
+                    ),
                     self._usage_monitor_for(
                         self._planner_context_window, PLANNER_SYSTEM_PROMPT, planner_agent
                     ),

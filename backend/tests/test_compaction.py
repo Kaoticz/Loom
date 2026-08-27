@@ -1,7 +1,8 @@
-from typing import Any
+from typing import Any, override
 
 import pytest
 from pydantic_ai import RunContext
+from pydantic_ai.capabilities import AbstractCapability
 from pydantic_ai.messages import (
     ModelMessage,
     ModelRequest,
@@ -10,6 +11,7 @@ from pydantic_ai.messages import (
     ToolCallPart,
     ToolReturnPart,
 )
+from pydantic_ai.models import ModelRequestContext, ModelRequestParameters
 from pydantic_ai.models.function import AgentInfo, FunctionModel
 from pydantic_ai.usage import RunUsage
 from pydantic_ai_harness.compaction import (
@@ -19,6 +21,7 @@ from pydantic_ai_harness.compaction import (
     SlidingWindowCompaction,
     SummarizingCompaction,
     TieredCompaction,
+    estimate_token_count,
 )
 
 from services.compaction import (
@@ -27,6 +30,7 @@ from services.compaction import (
     DEFAULT_CONTEXT_WINDOW,
     MINIMUM_CONTEXT_WINDOW,
     TARGET_FRACTION,
+    ObservedCompaction,
     build_compaction,
     read_file_key,
     resolve_context_window,
@@ -291,6 +295,125 @@ def quiet_model() -> FunctionModel:
         return ModelResponse(parts=[TextPart('Done.')])
 
     return FunctionModel(call)
+
+
+def request_context(messages: list[ModelMessage]) -> ModelRequestContext:
+    """
+    Build a model request context for an observing capability test.
+
+    :param messages: The request history the capability will inspect.
+    :returns: A request context with no tools or settings.
+    """
+    return ModelRequestContext(
+        model=quiet_model(),
+        messages=messages,
+        model_settings=None,
+        model_request_parameters=ModelRequestParameters(),
+    )
+
+
+class StubCompaction(AbstractCapability[Any]):
+    """
+    Replace a request history with a predetermined result.
+
+    :param result: The history this capability returns.
+    """
+
+    def __init__(self, result: list[ModelMessage]) -> None:
+        """
+        Create the deterministic compaction stand-in.
+
+        :param result: The history to leave on the request context.
+        """
+        super().__init__()
+        self._result: list[ModelMessage] = result
+
+    @override
+    async def before_model_request(
+        self, ctx: RunContext[Any], request_context: ModelRequestContext
+    ) -> ModelRequestContext:
+        """
+        Replace the request's history.
+
+        :param ctx: The active run context, unused by the stand-in.
+        :param request_context: The request whose history should be replaced.
+        :returns: The same request context with its predetermined history.
+        """
+        request_context.messages = self._result
+        return request_context
+
+
+async def test_an_observed_compaction_reports_one_real_history_reduction() -> None:
+    """
+    A changed history yields one callback carrying its before and after estimates.
+    """
+    messages: list[ModelMessage] = history_with_file_reads(3, 'x' * 400)
+    shortened: list[ModelMessage] = messages[-1:]
+    reports: list[tuple[int, int]] = []
+
+    async def report(before: int, after: int) -> None:
+        """
+        Record the observed compaction.
+
+        :param before: Estimated tokens before compaction.
+        :param after: Estimated tokens after compaction.
+        """
+        reports.append((before, after))
+
+    observer: ObservedCompaction = ObservedCompaction(StubCompaction(shortened), report)
+    result: ModelRequestContext = await observer.before_model_request(
+        run_context(quiet_model()), request_context(messages)
+    )
+
+    assert result.messages == shortened
+    assert reports == [(estimate_token_count(messages), estimate_token_count(shortened))]
+
+
+async def test_an_observed_compaction_stays_silent_when_history_is_unchanged() -> None:
+    """
+    A trigger that reclaims nothing must not produce a misleading notice.
+    """
+    messages: list[ModelMessage] = history_with_file_reads(2, 'x' * 400)
+    reports: list[tuple[int, int]] = []
+
+    async def report(before: int, after: int) -> None:
+        """
+        Record a compaction that should not occur.
+
+        :param before: Estimated tokens before compaction.
+        :param after: Estimated tokens after compaction.
+        """
+        reports.append((before, after))
+
+    observer: ObservedCompaction = ObservedCompaction(StubCompaction(messages), report)
+    await observer.before_model_request(run_context(quiet_model()), request_context(messages))
+
+    assert reports == []
+
+
+async def test_a_failing_compaction_observer_does_not_interrupt_the_request() -> None:
+    """
+    Losing a notice must not prevent the model request from continuing.
+    """
+    messages: list[ModelMessage] = history_with_file_reads(3, 'x' * 400)
+    shortened: list[ModelMessage] = messages[-1:]
+
+    async def fail(before: int, after: int) -> None:
+        """
+        Simulate an unavailable reporting destination.
+
+        :param before: Estimated tokens before compaction.
+        :param after: Estimated tokens after compaction.
+        :raises RuntimeError: Always, to exercise observer isolation.
+        """
+        raise RuntimeError('event bus unavailable')
+
+    observer: ObservedCompaction = ObservedCompaction(StubCompaction(shortened), fail)
+    result: ModelRequestContext = await observer.before_model_request(
+        run_context(quiet_model()), request_context(messages)
+    )
+
+    assert result.messages == shortened
 
 
 async def test_a_history_under_budget_is_left_alone() -> None:

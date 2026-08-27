@@ -9,6 +9,7 @@ from schemas.agent_messages import (
     ActionMessage,
     AgentMessage,
     CommitMessage,
+    CompactionMessage,
     DiffMessage,
     DoneMessage,
     ErrorMessage,
@@ -26,6 +27,8 @@ from schemas.agent_messages import (
 from services.event_bus import (
     BaseAgentEvent,
     CommitEvent,
+    CompactionEvent,
+    CompactionRunPath,
     DiffEvent,
     DoneEvent,
     ErrorEvent,
@@ -57,6 +60,8 @@ def test_every_message_type_is_defined() -> None:
         'warning',
         # Counts for a gauge, consumed as status rather than shown in the feed.
         'context_usage',
+        # A history shortened to fit, shown as routine feed housekeeping.
+        'compaction',
         # Not produced from an event: sent directly when a connection is refused.
         'session_busy',
         # Loom talking about the session, as opposed to the model reasoning.
@@ -84,6 +89,14 @@ def test_every_message_type_is_defined() -> None:
         (
             ContextUsageEvent(used_tokens=79_400, window_tokens=128_048),
             ContextUsageMessage,
+        ),
+        (
+            CompactionEvent(
+                tokens_before=21_300,
+                tokens_after=12_840,
+                run_path=CompactionRunPath.coder_streaming,
+            ),
+            CompactionMessage,
         ),
     ],
     ids=lambda value: type(value).__name__,
@@ -129,6 +142,18 @@ def test_fields_survive_conversion() -> None:
     )
     assert isinstance(commit, CommitMessage)
     assert commit.files_changed == ['a.py']
+
+    compaction = to_message(
+        CompactionEvent(
+            tokens_before=21_300,
+            tokens_after=12_840,
+            run_path=CompactionRunPath.structured_planning,
+        )
+    )
+    assert isinstance(compaction, CompactionMessage)
+    assert compaction.tokens_before == 21_300
+    assert compaction.tokens_after == 12_840
+    assert compaction.run_path is CompactionRunPath.structured_planning
 
 
 def test_failure_status_survives_conversion() -> None:

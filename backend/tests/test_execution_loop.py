@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import logging
 from pathlib import Path
 from typing import Any
 from unittest.mock import MagicMock
@@ -15,6 +16,8 @@ import api.v1.agent_session as agent_session_module
 from api.v1.agent_session import AgentSession
 from services.event_bus import (
     AgentEvent,
+    CompactionEvent,
+    CompactionRunPath,
     DoneEvent,
     SessionStatus,
     SystemEvent,
@@ -601,7 +604,7 @@ async def test_a_node_backend_is_not_mistaken_for_a_frontend(
     assert 'agent-browser' not in '\n'.join(seen)
 
 
-def budget_recording(seen: list[int | None]) -> Callable[[int | None], TieredCompaction[Any]]:
+def budget_recording(seen: list[int | None]) -> Callable[..., TieredCompaction[Any]]:
     """
     Wrap `build_compaction` so the window it was asked for is observable.
 
@@ -613,11 +616,37 @@ def budget_recording(seen: list[int | None]) -> Callable[[int | None], TieredCom
     :returns: A stand-in for `build_compaction`.
     """
 
-    def record(context_window: int | None) -> TieredCompaction[Any]:
+    def record(context_window: int | None, **kwargs: object) -> TieredCompaction[Any]:
         seen.append(context_window)
         return build_compaction(context_window)
 
     return record
+
+
+async def test_a_compaction_notice_logs_and_emits_its_path(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """
+    One compaction becomes one structured event and one informative log line.
+    """
+    session, _, events, _ = build_session([])
+    caplog.set_level(logging.INFO, logger=agent_session_module.__name__)
+
+    await session._report_compaction(CompactionRunPath.coder_streaming, 21_300, 12_840)
+
+    notices: list[CompactionEvent] = [
+        event for event in events if isinstance(event, CompactionEvent)
+    ]
+    assert notices == [
+        CompactionEvent(
+            tokens_before=21_300,
+            tokens_after=12_840,
+            run_path=CompactionRunPath.coder_streaming,
+        )
+    ]
+    assert caplog.messages == [
+        'Compacted coder_streaming request history from an estimated 21300 to 12840 tokens.'
+    ]
 
 
 async def test_the_coder_run_carries_the_configured_budget(
@@ -1924,9 +1953,13 @@ async def test_provider_underestimate_reserves_budget_and_warns_once(
 
     await session._reconcile_provider_usage(1_600)
 
-    assert session._compaction_for(10_000).context_window == 9_400
+    capability: object = session._compaction_for(
+        10_000, CompactionRunPath.coder_streaming
+    )
+    assert getattr(capability, '_inner').context_window == 9_400
     await session._reconcile_provider_usage(2_000)
-    assert session._compaction_for(10_000).context_window == 9_000
+    capability = session._compaction_for(10_000, CompactionRunPath.coder_streaming)
+    assert getattr(capability, '_inner').context_window == 9_000
 
     warnings: list[WarningEvent] = [event for event in events if isinstance(event, WarningEvent)]
     assert len(warnings) == 1

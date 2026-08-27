@@ -24,6 +24,7 @@ export type MessageType =
     | 'done'
     | 'error'
     | 'warning'
+    | 'compaction'
     | 'session_busy'
     | 'question'
     | 'reply'
@@ -827,6 +828,12 @@ function createAgentStore() {
                     // Deliberately leaves `status` alone. The session is still
                     // running, and marking it failed would say otherwise.
                     newMessage.content = data.content;
+                    break;
+                case 'compaction':
+                    newMessage.content =
+                        'Loom shortened the conversation to fit the context window ' +
+                        `(estimated ${data.tokens_before.toLocaleString()} to ` +
+                        `${data.tokens_after.toLocaleString()} tokens).`;
                     break;
                 case 'question':
                     newMessage.content = data.question;

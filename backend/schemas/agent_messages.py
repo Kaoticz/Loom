@@ -10,6 +10,8 @@ from services.plan_parser import PlanFormat, PlanStep
 from services.event_bus import (
     BaseAgentEvent,
     CommitEvent,
+    CompactionEvent,
+    CompactionRunPath,
     DiffEvent,
     DoneEvent,
     ErrorEvent,
@@ -89,6 +91,7 @@ class MessageType(str, Enum):
     question = 'question'
     system = 'system'
     sandbox_unavailable = 'sandbox_unavailable'
+    compaction = 'compaction'
 
 
 class BaseAgentMessage(BaseModel):
@@ -230,6 +233,20 @@ class ContextUsageMessage(BaseAgentMessage):
     resolved: Annotated[bool, Field(description='False when the window is a fallback rather than the model\'s own, making the percentage a guess.')] = True
 
 
+class CompactionMessage(BaseAgentMessage):
+    """
+    A request history Loom shortened to fit the context window.
+
+    The figures are estimated from the history rather than provider-reported
+    counts, allowing the interface to word the notice without parsing prose.
+    """
+
+    type: Annotated[Literal[MessageType.compaction], Field()] = MessageType.compaction
+    tokens_before: Annotated[int, Field(ge=0, description='Estimated tokens in the request history before compaction.')]
+    tokens_after: Annotated[int, Field(ge=0, description='Estimated tokens in the request history after compaction.')]
+    run_path: Annotated[CompactionRunPath, Field(description='The long-running agent path whose request was compacted.')]
+
+
 class WarningMessage(BaseAgentMessage):
     """
     Something failed but the session is carrying on.
@@ -301,6 +318,7 @@ AgentMessage = Annotated[
     | ErrorMessage
     | WarningMessage
     | ContextUsageMessage
+    | CompactionMessage
     | SessionBusyMessage
     | SystemMessage
     | SandboxUnavailableMessage,
@@ -379,6 +397,12 @@ def to_message(event: BaseAgentEvent) -> AgentMessage:
             used_tokens=event.used_tokens,
             window_tokens=event.window_tokens,
             resolved=event.resolved,
+        )
+    if isinstance(event, CompactionEvent):
+        return CompactionMessage(
+            tokens_before=event.tokens_before,
+            tokens_after=event.tokens_after,
+            run_path=event.run_path,
         )
     if isinstance(event, SandboxUnavailableEvent):
         return SandboxUnavailableMessage(stage=event.stage, reason=event.reason)

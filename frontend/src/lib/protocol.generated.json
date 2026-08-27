@@ -15,7 +15,8 @@
         "session_busy",
         "question",
         "system",
-        "sandbox_unavailable"
+        "sandbox_unavailable",
+        "compaction"
     ],
     "session_status": [
         "indexing",

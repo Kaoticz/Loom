@@ -1,8 +1,10 @@
 from __future__ import annotations
 
 from collections.abc import Awaitable, Callable
-from typing import Any
+from logging import Logger, getLogger
+from typing import TYPE_CHECKING, Any, overload, override
 
+from pydantic_ai.capabilities import AbstractCapability
 from pydantic_ai.messages import ToolCallPart
 from pydantic_ai_harness.compaction import (
     ClampOversizedMessages,
@@ -13,8 +15,16 @@ from pydantic_ai_harness.compaction import (
     SlidingWindowCompaction,
     SummarizingCompaction,
     TieredCompaction,
+    estimate_token_count,
 )
 from pydantic_ai.exceptions import ModelHTTPError
+
+if TYPE_CHECKING:
+    from pydantic_ai.models import ModelRequestContext
+    from pydantic_ai.tools import RunContext
+
+
+logger: Logger = getLogger(__name__)
 
 DEFAULT_CONTEXT_WINDOW: int = 32_768
 """
@@ -59,6 +69,15 @@ How much of the window the conversation may occupy before compaction runs.
 The remaining 30% is not spare: the model's next response and the tool results
 it triggers have to fit alongside the history, and both arrive after the point
 where the budget was last measured.
+"""
+
+COMPACTION_REPORT_MINIMUM_RECLAIM_TOKENS: int = 1
+"""
+The smallest estimated reduction that counts as a compaction notice.
+
+A ladder may run because its trigger fired yet leave the messages intact. Only a
+history that became smaller is useful to announce, and one token is enough to
+show that it did.
 """
 
 IRRECOVERABLE_TOOLS: frozenset[str] = frozenset({'ask_user'})
@@ -243,9 +262,86 @@ def resolve_context_window(configured: int | None) -> int:
     return max(configured, MINIMUM_CONTEXT_WINDOW)
 
 
+class ObservedCompaction(AbstractCapability[Any]):
+    """
+    Observe a compaction capability without changing its decisions.
+
+    :param inner: The compaction capability that may rewrite request messages.
+    :param on_compaction: Receives the estimated token counts before and after a rewrite.
+    """
+
+    def __init__(
+        self,
+        inner: AbstractCapability[Any],
+        on_compaction: Callable[[int, int], Awaitable[None]],
+    ) -> None:
+        """
+        Create a compaction observer.
+
+        :param inner: The capability that performs compaction.
+        :param on_compaction: Receives counts when the capability shortened a request.
+        """
+        super().__init__()
+        self._inner: AbstractCapability[Any] = inner
+        self._on_compaction: Callable[[int, int], Awaitable[None]] = on_compaction
+
+    @override
+    async def before_model_request(
+        self,
+        ctx: RunContext[Any],
+        request_context: ModelRequestContext,
+    ) -> ModelRequestContext:
+        """
+        Delegate compaction and report a genuine reduction when one occurred.
+
+        Observer failures are deliberately contained: a missing notice must not
+        prevent the model request it was meant to describe.
+
+        :param ctx: The active model run context.
+        :param request_context: The model request that may be compacted.
+        :returns: The request context returned by the wrapped capability.
+        """
+        try:
+            before: int = estimate_token_count(request_context.messages)
+        except Exception:
+            logger.exception('Could not measure request tokens before compaction.')
+            return await self._inner.before_model_request(ctx, request_context)
+
+        compacted: ModelRequestContext = await self._inner.before_model_request(ctx, request_context)
+        try:
+            after: int = estimate_token_count(compacted.messages)
+            if before - after < COMPACTION_REPORT_MINIMUM_RECLAIM_TOKENS:
+                return compacted
+            await self._on_compaction(before, after)
+        except Exception:
+            logger.exception('Could not report a compaction event.')
+        return compacted
+
+
+@overload
 def build_compaction(
-    context_window: int | None, *, allow_subminimum: bool = False
-) -> TieredCompaction[Any]:
+    context_window: int | None,
+    *,
+    allow_subminimum: bool = False,
+    on_compaction: None = None,
+) -> TieredCompaction[Any]: ...
+
+
+@overload
+def build_compaction(
+    context_window: int | None,
+    *,
+    allow_subminimum: bool = False,
+    on_compaction: Callable[[int, int], Awaitable[None]],
+) -> ObservedCompaction: ...
+
+
+def build_compaction(
+    context_window: int | None,
+    *,
+    allow_subminimum: bool = False,
+    on_compaction: Callable[[int, int], Awaitable[None]] | None = None,
+) -> TieredCompaction[Any] | ObservedCompaction:
     """
     Build the compaction ladder for one agent run.
 
@@ -271,11 +367,12 @@ def build_compaction(
 
     :param context_window: The configured or measured window in tokens, or None for the default.
     :param allow_subminimum: Preserve a positive model measurement below Loom's usual floor.
+    :param on_compaction: Receives estimates whenever the ladder shortens a request.
     :returns: The capability to pass to a single `Agent.run()`.
     """
     window: int = _window_for_consumer(context_window, allow_subminimum)
 
-    return TieredCompaction(
+    ladder: TieredCompaction[Any] = TieredCompaction(
         tiers=[
             DeduplicateFileReads(file_key=read_file_key),
             ClampOversizedMessages(
@@ -307,6 +404,9 @@ def build_compaction(
         target_fraction=TARGET_FRACTION,
         context_window=window,
     )
+    if on_compaction is None:
+        return ladder
+    return ObservedCompaction(ladder, on_compaction)
 
 
 def build_usage_monitor(

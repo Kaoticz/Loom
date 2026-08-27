@@ -49,6 +49,9 @@ export const typeStyles: Record<MessageType, string> = {
     // Amber rather than red: something failed but the run is still going, and
     // red would tell the user their session had died when it has not.
     warning: 'bg-amber-50 border-amber-300 text-amber-900',
+    // Routine context housekeeping: informative but neither a phase announcement
+    // nor a fault.
+    compaction: 'bg-cyan-50 border-cyan-200 text-cyan-900 text-xs',
     // A refusal, not a fault: distinct from `error` so a busy slot does not look
     // like the run failed.
     session_busy: 'bg-amber-50 border-amber-200 text-amber-900',

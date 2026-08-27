@@ -2091,7 +2091,12 @@ async def test_a_measured_window_budgets_every_long_run_path() -> None:
     assert await session._measure_context_window() == 8_192
     assert calls == [session._coder_model]
 
-    assert session._compaction_for(session._coder_context_window).context_window == 8_192
+    from services.event_bus import CompactionRunPath
+
+    capability: object = session._compaction_for(
+        session._coder_context_window, CompactionRunPath.coder_streaming
+    )
+    assert getattr(capability, '_inner').context_window == 8_192
     assert session._usage_monitor_for(session._planner_context_window).context_window == 8_192
     assert session._model_settings_for(session._coder_context_window).get('extra_body') == {
         'options': {'num_ctx': 8_192}
@@ -2212,7 +2217,7 @@ async def test_the_text_fallback_uses_the_planner_budget(
     # would find this very function and recurse.
     original = build_compaction
 
-    def record(context_window: int | None) -> object:
+    def record(context_window: int | None, **kwargs: object) -> object:
         windows.append(context_window)
         return original(context_window)
 

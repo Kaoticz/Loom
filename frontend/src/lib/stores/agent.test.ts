@@ -67,6 +67,23 @@ class FakeSocket {
 /** The address the tests connect to, and the one a retry must reuse. */
 const TEST_URL = 'ws://test/agent-session';
 
+/** In-memory browser storage for tests running without a DOM-provided implementation. */
+const localStorageStub = {
+    values: new Map<string, string>(),
+    getItem(key: string): string | null {
+        return this.values.get(key) ?? null;
+    },
+    setItem(key: string, value: string): void {
+        this.values.set(key, value);
+    },
+    removeItem(key: string): void {
+        this.values.delete(key);
+    },
+    clear(): void {
+        this.values.clear();
+    }
+};
+
 /**
  * Store instances this test file has brought into being.
  *
@@ -96,6 +113,8 @@ beforeEach(() => {
     // anything out, and a presence query that can never time out would make
     // the assertions below pass for entirely the wrong reason.
     vi.unstubAllGlobals();
+    localStorageStub.clear();
+    vi.stubGlobal('localStorage', localStorageStub);
     for (const tab of openTabs.splice(0)) tab.disconnect();
     FakeSocket.instances = [];
 });
@@ -309,6 +328,34 @@ describe('message handling', () => {
             status: 're_working'
         });
         expect(get(store).status).toBe('re_working');
+    });
+
+    it('appends each compaction with formatted estimates without changing state', async () => {
+        const { store, socket } = await connected();
+        const before = get(store);
+
+        socket.deliver({
+            type: 'compaction',
+            tokens_before: 21_300,
+            tokens_after: 12_840,
+            run_path: 'coder_streaming'
+        });
+        socket.deliver({
+            type: 'compaction',
+            tokens_before: 15_000,
+            tokens_after: 9_000,
+            run_path: 'text_planning'
+        });
+
+        const after = get(store);
+        expect(after.messages).toHaveLength(2);
+        expect(after.messages[0].type).toBe('compaction');
+        expect(after.messages[0].content).toContain('21,300');
+        expect(after.messages[0].content).toContain('12,840');
+        expect(after.status).toBe(before.status);
+        expect(after.requiresAction).toBe(before.requiresAction);
+        expect(after.pendingQuestion).toBe(before.pendingQuestion);
+        expect(after.contextUsage).toBe(before.contextUsage);
     });
 });
 

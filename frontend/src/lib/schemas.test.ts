@@ -70,6 +70,30 @@ describe('forward compatibility', () => {
     });
 });
 
+describe('compaction messages', () => {
+    it('accepts estimated history counts and the run path', () => {
+        const result = agentMessageSchema.safeParse({
+            type: 'compaction',
+            tokens_before: 21_300,
+            tokens_after: 12_840,
+            run_path: 'coder_streaming'
+        });
+
+        expect(result.success).toBe(true);
+    });
+
+    it('rejects a negative estimated token count', () => {
+        expect(
+            agentMessageSchema.safeParse({
+                type: 'compaction',
+                tokens_before: -1,
+                tokens_after: 0,
+                run_path: 'text_planning'
+            }).success
+        ).toBe(false);
+    });
+});
+
 describe('task shapes', () => {
     const task = {
         id: 'abc',
