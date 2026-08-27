@@ -13,7 +13,7 @@ from agents.reviewer import ReviewResult, reviewer_agent
 from fastapi import WebSocket
 from pydantic_ai import Agent, RunContext, UsageLimits
 from pydantic_ai.exceptions import UnexpectedModelBehavior
-from pydantic_ai_harness.compaction import ContextUsage
+from pydantic_ai_harness.compaction import ContextUsage, ReportContextUsage, TieredCompaction
 from pydantic_ai.agent import AgentRunResult
 from pydantic_ai.messages import (
     AgentStreamEvent,
@@ -22,7 +22,7 @@ from pydantic_ai.messages import (
     TextPart,
     TextPartDelta,
 )
-from pydantic_ai.models.openai import OpenAIChatModel
+from pydantic_ai.models.openai import OpenAIChatModel, OpenAIChatModelSettings
 from pydantic_ai.providers.openai import OpenAIProvider
 from schemas.agent_commands import CommandAction, SessionCommand, parse_command
 from services.conversation_history import ConversationHistory, TurnRole
@@ -69,7 +69,12 @@ from services.plan_parser import (
     render_plan,
 )
 from services.review_context import build_review_prompt, collect_review_diffs
-from services.model_resolution import model_settings, resolve_model
+from services.model_resolution import (
+    effective_context_window,
+    measure_ollama_context_window,
+    model_settings,
+    resolve_model,
+)
 from services.session_context import SessionContext
 from services.session_inbox import SessionInbox
 from services.user_questions import (
@@ -206,6 +211,10 @@ class AgentSession:
     _connection_lost: Event
     _has_frontend: bool | None
     _last_context_usage: ContextUsage | None
+    _measured_context_window: int | None
+    _context_window_probe_completed: bool
+    _context_window_warning_emitted: bool
+    _context_window_probe: Callable[[str], Awaitable[int | None]]
 
     def __init__(
         self,
@@ -219,6 +228,7 @@ class AgentSession:
         machine: SessionStateMachine,
         limits: IterationLimits,
         connection_lost: Event | None = None,
+        context_window_probe: Callable[[str], Awaitable[int | None]] | None = None,
     ) -> None:
         """
         Create a session driver.
@@ -233,6 +243,7 @@ class AgentSession:
         :param machine: The state machine to drive.
         :param limits: The iteration ceilings to enforce.
         :param connection_lost: Set when the client can no longer be reached.
+        :param context_window_probe: Optional source for serving-model context limits.
         """
         self._websocket = websocket
         self._inbox = SessionInbox(websocket.receive_text, on_stop=self._interrupt_work)
@@ -251,6 +262,11 @@ class AgentSession:
         self._machine = machine
         self._limits = limits
         self._connection_lost = connection_lost if connection_lost is not None else Event()
+        self._context_window_probe = (
+            context_window_probe
+            if context_window_probe is not None
+            else measure_ollama_context_window
+        )
 
         self._task = ''
         self._branch_name = f'ai-task-{session_id}'
@@ -272,6 +288,9 @@ class AgentSession:
         # arrives with its path, which is after this point.
         self._has_frontend = None
         self._last_context_usage = None
+        self._measured_context_window = None
+        self._context_window_probe_completed = False
+        self._context_window_warning_emitted = False
         self._task_id = ''
         self._recorder = None
 
@@ -348,6 +367,8 @@ class AgentSession:
         :returns: The terminal state the session ended in.
         """
         await self._receive_task()
+        _ = await self._measure_context_window()
+        await self._warn_if_context_is_too_small()
         # Only now is a task genuinely under way. The slot was taken when the
         # socket connected, which is too early to stand for "an agent is
         # working": anything reading that would block on an idle tab.
@@ -463,6 +484,29 @@ class AgentSession:
             self._services.search.repo_path = repo_path
 
         self._history.add(TurnRole.user, self._task)
+
+    async def _measure_context_window(self) -> int | None:
+        """
+        Measure the configured Ollama model once and apply its serving limit.
+
+        :returns: The measured context window, or None when it could not be read.
+        """
+        if self._context_window_probe_completed:
+            return self._measured_context_window
+
+        measured: int | None = await self._context_window_probe(self._coder_model)
+        self._context_window_probe_completed = True
+        self._measured_context_window = measured
+        if measured is None:
+            return None
+
+        self._coder_context_window = effective_context_window(
+            self._coder_context_window, measured
+        )
+        self._planner_context_window = effective_context_window(
+            self._planner_context_window, measured
+        )
+        return measured
 
     async def _say(self, content: str) -> None:
         """
@@ -676,6 +720,41 @@ class AgentSession:
             )
         )
 
+    def _compaction_for(self, context_window: int) -> TieredCompaction[Any]:
+        """
+        Build a compaction ladder against this session's effective window.
+
+        :param context_window: The effective window for the current run path.
+        :returns: The configured compaction capability.
+        """
+        if self._measured_context_window is None:
+            return build_compaction(context_window)
+        return build_compaction(context_window, allow_subminimum=True)
+
+    def _usage_monitor_for(self, context_window: int) -> ReportContextUsage:
+        """
+        Build a usage monitor against this session's effective window.
+
+        :param context_window: The effective window for the current run path.
+        :returns: The configured usage-monitoring capability.
+        """
+        if self._measured_context_window is None:
+            return build_usage_monitor(context_window, self._report_context_usage)
+        return build_usage_monitor(
+            context_window, self._report_context_usage, allow_subminimum=True
+        )
+
+    def _model_settings_for(self, context_window: int) -> OpenAIChatModelSettings:
+        """
+        Build provider settings against this session's effective window.
+
+        :param context_window: The effective window for the current run path.
+        :returns: The provider settings for the run.
+        """
+        return model_settings(
+            context_window, allow_subminimum=self._measured_context_window is not None
+        )
+
     async def _narrow_after_overflow(self, budget: int) -> bool:
         """
         React to a run that had no room to answer in.
@@ -781,19 +860,17 @@ class AgentSession:
                     prompt,
                     deps=self._deps,
                     model=resolve_model(self._coder_model),
-                    model_settings=model_settings(self._coder_context_window),
+                    model_settings=self._model_settings_for(self._coder_context_window),
                     event_stream_handler=stream_thoughts,
                     usage_limits=UsageLimits(request_limit=None),
                     # Built per run rather than fixed on the agent: the budget is
                     # a user setting, and a capability attached at import time
                     # could not see it.
                     capabilities=[
-                        build_compaction(self._coder_context_window),
+                        self._compaction_for(self._coder_context_window),
                         # After the ladder, so the reading describes the history
                         # actually being sent rather than what triggered it.
-                        build_usage_monitor(
-                            self._coder_context_window, self._report_context_usage
-                        ),
+                        self._usage_monitor_for(self._coder_context_window),
                     ],
                 )
                 break
@@ -1023,13 +1100,11 @@ class AgentSession:
                 prompt,
                 deps=self._deps,
                 model=resolve_model(self._coder_model),
-                model_settings=model_settings(self._planner_context_window),
+                model_settings=self._model_settings_for(self._planner_context_window),
                 usage_limits=UsageLimits(request_limit=None),
                 capabilities=[
-                    build_compaction(self._planner_context_window),
-                    build_usage_monitor(
-                        self._planner_context_window, self._report_context_usage
-                    ),
+                    self._compaction_for(self._planner_context_window),
+                    self._usage_monitor_for(self._planner_context_window),
                 ],
             )
         except Exception as error:
@@ -1069,11 +1144,11 @@ class AgentSession:
             output_type=str,
             deps=self._deps,
             model=resolve_model(self._coder_model),
-            model_settings=model_settings(self._planner_context_window),
+            model_settings=self._model_settings_for(self._planner_context_window),
             usage_limits=UsageLimits(request_limit=None),
             capabilities=[
-                build_compaction(self._planner_context_window),
-                build_usage_monitor(self._planner_context_window, self._report_context_usage),
+                self._compaction_for(self._planner_context_window),
+                self._usage_monitor_for(self._planner_context_window),
             ],
         )
         return result.output
@@ -1229,12 +1304,21 @@ class AgentSession:
         change. Checked before the first step rather than after a failure,
         because by then the run is over.
         """
+        if self._context_window_warning_emitted:
+            return
+
+        window: int = (
+            self._coder_context_window
+            if self._measured_context_window is not None
+            else resolve_context_window(self._coder_context_window)
+        )
         complaint: str = context_window_complaint(
-            resolve_context_window(self._coder_context_window),
+            window,
             estimate_fixed_overhead(CODER_SYSTEM_PROMPT, coder_agent),
         )
         if complaint:
             await self._events.emit(WarningEvent(content=complaint))
+            self._context_window_warning_emitted = True
 
     async def _sweep_uncommitted(self) -> None:
         """

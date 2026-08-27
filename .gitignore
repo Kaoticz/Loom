@@ -1,8 +1,6 @@
 # Compose reads this for variable substitution. It holds host-specific paths and
 # group ids, and must never be committed.
-.env
-.env.*
-!.env.example
+.*
 
 # The repository Loom works on is mounted here, not tracked.
 data/repo/

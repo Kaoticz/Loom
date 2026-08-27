@@ -214,7 +214,9 @@ def resolve_context_window(configured: int | None) -> int:
     return max(configured, MINIMUM_CONTEXT_WINDOW)
 
 
-def build_compaction(context_window: int | None) -> TieredCompaction[Any]:
+def build_compaction(
+    context_window: int | None, *, allow_subminimum: bool = False
+) -> TieredCompaction[Any]:
     """
     Build the compaction ladder for one agent run.
 
@@ -238,10 +240,11 @@ def build_compaction(context_window: int | None) -> TieredCompaction[Any]:
     to resolve itself, the fraction is taken of whatever a model registry
     reports, and a locally-hosted model is not in that registry.
 
-    :param context_window: The configured window in tokens, or None for the default.
+    :param context_window: The configured or measured window in tokens, or None for the default.
+    :param allow_subminimum: Preserve a positive model measurement below Loom's usual floor.
     :returns: The capability to pass to a single `Agent.run()`.
     """
-    window: int = resolve_context_window(context_window)
+    window: int = _window_for_consumer(context_window, allow_subminimum)
 
     return TieredCompaction(
         tiers=[
@@ -280,6 +283,8 @@ def build_compaction(context_window: int | None) -> TieredCompaction[Any]:
 def build_usage_monitor(
     context_window: int | None,
     on_usage: Callable[[ContextUsage], Awaitable[None]],
+    *,
+    allow_subminimum: bool = False,
 ) -> ReportContextUsage:
     """
     Build the capability that reports how full the context actually is.
@@ -293,11 +298,25 @@ def build_usage_monitor(
     which is False when the window is a fallback rather than the model's own —
     so a reading that is a guess can say so instead of being mistaken for fact.
 
-    :param context_window: The configured window in tokens, or None for the default.
+    :param context_window: The configured or measured window in tokens, or None for the default.
     :param on_usage: Called with each reading.
+    :param allow_subminimum: Preserve a positive model measurement below Loom's usual floor.
     :returns: The monitoring capability.
     """
     return ReportContextUsage(
         on_usage=on_usage,
-        context_window=resolve_context_window(context_window),
+        context_window=_window_for_consumer(context_window, allow_subminimum),
     )
+
+
+def _window_for_consumer(context_window: int | None, allow_subminimum: bool) -> int:
+    """
+    Resolve a requested window while preserving a known small model limit.
+
+    :param context_window: The requested window, or None for the default.
+    :param allow_subminimum: Whether a positive window may remain below Loom's floor.
+    :returns: The window suitable for compaction or monitoring.
+    """
+    if allow_subminimum and context_window is not None and context_window > 0:
+        return context_window
+    return resolve_context_window(context_window)

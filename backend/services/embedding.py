@@ -4,13 +4,17 @@ from typing import Annotated, Any
 
 from httpx import AsyncClient, HTTPError, Response
 from pydantic import BaseModel, Field
+from services.ollama_model_metadata import (
+    ARCHITECTURE_KEY,
+    CONTEXT_LENGTH_SUFFIX,
+    context_length_from_model_info,
+    positive_int,
+)
 
 DEFAULT_EMBEDDING_MODEL: str = 'nomic-embed-text'
 DIMENSION_PROBE_TEXT: str = 'dimension probe'
 
-CONTEXT_LENGTH_SUFFIX: str = '.context_length'
 EMBEDDING_LENGTH_SUFFIX: str = '.embedding_length'
-ARCHITECTURE_KEY: str = 'general.architecture'
 
 
 class EmbeddingError(RuntimeError):
@@ -224,8 +228,8 @@ class EmbeddingService:
             return ModelDescription()
 
         return ModelDescription(
-            dimensions=_positive_int(info.get(f'{architecture}{EMBEDDING_LENGTH_SUFFIX}')),
-            context_length=_positive_int(info.get(f'{architecture}{CONTEXT_LENGTH_SUFFIX}')),
+            dimensions=positive_int(info.get(f'{architecture}{EMBEDDING_LENGTH_SUFFIX}')),
+            context_length=context_length_from_model_info(info),
         )
 
     async def detect_context_length(self) -> int | None:
@@ -286,13 +290,3 @@ def _is_length_complaint(detail: str) -> bool:
     """
     lowered: str = detail.lower()
     return 'context' in lowered and ('exceed' in lowered or 'too long' in lowered)
-
-
-def _positive_int(value: Any) -> int | None:
-    """
-    Accept a value only if it is a usable positive whole number.
-
-    :param value: The value as the model reported it.
-    :returns: The number, or None if it is missing or unusable.
-    """
-    return value if isinstance(value, int) and not isinstance(value, bool) and value > 0 else None

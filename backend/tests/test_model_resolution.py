@@ -1,9 +1,17 @@
 from __future__ import annotations
 
+import json
+
 import pytest
+from httpx import AsyncClient, ConnectError, MockTransport, Request, Response
 from pydantic_ai.models.openai import OpenAIChatModel
 
-from services.model_resolution import resolve_model
+from services.model_resolution import (
+    effective_context_window,
+    measure_ollama_context_window,
+    model_settings,
+    resolve_model,
+)
 
 """
 Turning a configured model name into something an agent can run.
@@ -94,3 +102,98 @@ def test_a_name_that_merely_contains_ollama_is_not_treated_as_one() -> None:
     The prefix is a prefix, not a substring.
     """
     assert resolve_model('openai:ollama-tuned') == 'openai:ollama-tuned'
+
+
+async def test_the_ollama_context_window_probe_preserves_the_model_tag() -> None:
+    """
+    The `/api/show` request names the exact model the user pulled.
+    """
+    requested_models: list[str] = []
+
+    def handler(request: Request) -> Response:
+        assert request.url.path == '/api/show'
+        requested_models.append(json.loads(request.content)['model'])
+        return Response(
+            200,
+            json={
+                'model_info': {
+                    'general.architecture': 'llama',
+                    'llama.context_length': 8192,
+                }
+            },
+        )
+
+    client: AsyncClient = AsyncClient(transport=MockTransport(handler))
+    assert await measure_ollama_context_window('ollama:gurubot/gpt-oss:20b', client=client) == 8192
+    assert requested_models == ['gurubot/gpt-oss:20b']
+    await client.aclose()
+
+
+async def test_a_non_ollama_model_is_never_probed() -> None:
+    """
+    Foreign providers keep their existing no-request behavior.
+    """
+    calls: list[Request] = []
+
+    def handler(request: Request) -> Response:
+        calls.append(request)
+        return Response(500)
+
+    client: AsyncClient = AsyncClient(transport=MockTransport(handler))
+    assert await measure_ollama_context_window('openai:gpt-4o', client=client) is None
+    assert calls == []
+    await client.aclose()
+
+
+@pytest.mark.parametrize(
+    'payload',
+    [
+        {},
+        {'model_info': None},
+        {'model_info': {'general.architecture': 'llama'}},
+        {'model_info': {'general.architecture': 'llama', 'llama.context_length': '8192'}},
+        {'model_info': {'general.architecture': 'llama', 'llama.context_length': True}},
+    ],
+)
+async def test_unusable_metadata_falls_back_silently(payload: dict[str, object]) -> None:
+    """
+    Metadata that cannot prove a limit produces no measurement.
+    """
+    client: AsyncClient = AsyncClient(
+        transport=MockTransport(lambda request: Response(200, json=payload))
+    )
+    assert await measure_ollama_context_window('ollama:llama3', client=client) is None
+    await client.aclose()
+
+
+async def test_an_unreachable_or_unsuccessful_ollama_falls_back_silently() -> None:
+    """
+    A failed metadata probe cannot stop a model run.
+    """
+    def unreachable(request: Request) -> Response:
+        raise ConnectError('connection refused', request=request)
+
+    unreachable_client: AsyncClient = AsyncClient(transport=MockTransport(unreachable))
+    failed_client: AsyncClient = AsyncClient(transport=MockTransport(lambda request: Response(500)))
+
+    assert await measure_ollama_context_window('ollama:llama3', client=unreachable_client) is None
+    assert await measure_ollama_context_window('ollama:llama3', client=failed_client) is None
+    await unreachable_client.aclose()
+    await failed_client.aclose()
+
+
+def test_the_effective_window_never_exceeds_the_configured_ceiling() -> None:
+    """
+    Measurements reduce budgets but never enlarge a user's ceiling.
+    """
+    assert effective_context_window(128_048, 8_192) == 8_192
+    assert effective_context_window(8_192, 131_072) == 8_192
+    assert effective_context_window(None, None) == 32_768
+
+
+def test_a_small_measured_window_reaches_ollama_unchanged() -> None:
+    """
+    A real sub-minimum model limit must not be raised before it is sent back.
+    """
+    settings = model_settings(1_024, allow_subminimum=True)
+    assert settings.get('extra_body') == {'options': {'num_ctx': 1_024}}

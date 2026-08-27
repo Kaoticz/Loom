@@ -74,36 +74,38 @@ What exists today, and why it produces the reported symptom ("The model had no r
 
 ## Phases
 
-### Phase 0: Environment Setup — Status: Not Started
+### Phase 0: Environment Setup — Status: Done
 - Python 3.14.x required (per `backend/AGENTS.md`). If `.venv` does not exist: `cd backend && python -m venv .venv && source .venv/bin/activate && pip install -e ".[dev]"`.
 - Confirm `git` availability (repo already verified as a git repository).
 - Run the baseline test suite per Global Rules and record results. Note: suites requiring `TEST_DATABASE_URL` (Postgres with pgvector) skip themselves when it is unset — record which mode applied, since later phases must compare like against like. `ast-grep` must be on `PATH` (or `AST_GREP_BIN` set) for indexing tests to run rather than skip.
 - Run `mypy . && basedpyright .` once to record the linting baseline.
 
-### Phase 1: Measure the model's real context window from Ollama — Status: Not Started
+### Phase 1: Measure the model's real context window from Ollama — Status: Done
 - **Goal:** Budget against `min(configured-or-default, measured)` instead of the configured number alone, and set Ollama's `num_ctx` to that same effective value.
 - **Requirements:**
-  - [ ] Add a way to ask the serving Ollama instance for a chat model's context length: POST `/api/show` with the resolved model name (the `ollama:` prefix stripped, tags preserved — mirror `resolve_model()`'s splitting rules), honoring `OLLAMA_BASE_URL` and its default. Read `model_info["<architecture>.context_length"]`, tolerating missing/unexpected shapes by yielding None, following the precedent and None-tolerant style of `EmbeddingService.describe_model()`/`_model_info()`. Prefer extracting whatever parsing can be shared with `embedding.py` over duplicating it; judge the cleanest seam (a small shared helper vs a new module) and note the choice.
-  - [ ] Probe at most once per session, at session start, for the coder/planner model (they share one setting today). Cache the result for the session's lifetime; do not probe again mid-session even if the model setting were changed.
-  - [ ] Compute the effective window: when a measurement exists, use the smaller of `resolve_context_window(configured)` and the measurement; when it does not, use `resolve_context_window(configured)` unchanged. Do NOT raise a sub-minimum measurement up to `MINIMUM_CONTEXT_WINDOW`: a model genuinely reporting less than 2,048 tokens cannot honor the floor, and pretending otherwise recreates the failure loop this plan removes. Let the complaint machinery speak instead (next item).
-  - [ ] Feed the effective window into every consumer that currently takes the configured value: `build_compaction()`, `build_usage_monitor()`, `model_settings()` (so `num_ctx` asks Ollama to allocate exactly what the budget assumes — never more than the model supports), and `_warn_if_context_is_too_small()`'s check. All three long-run paths (`_run_coder_streaming`, `_plan_structured`, `_plan_as_text`) must use it.
-  - [ ] When the effective window fails `context_window_complaint()` (window below overhead + headroom), emit that complaint once via the existing `_warn_if_context_is_too_small()` path and proceed — the run will fail informatively rather than loop. This replaces any temptation to keep halving below reality.
-  - [ ] Fallback is silent and total: non-Ollama names, connection errors, non-200s, unparsable bodies, missing keys → behave byte-for-byte as today (configured/default window), emitting nothing new.
+  - [x] Add a way to ask the serving Ollama instance for a chat model's context length: POST `/api/show` with the resolved model name (the `ollama:` prefix stripped, tags preserved — mirror `resolve_model()`'s splitting rules), honoring `OLLAMA_BASE_URL` and its default. Read `model_info["<architecture>.context_length"]`, tolerating missing/unexpected shapes by yielding None, following the precedent and None-tolerant style of `EmbeddingService.describe_model()`/`_model_info()`. Prefer extracting whatever parsing can be shared with `embedding.py` over duplicating it; judge the cleanest seam (a small shared helper vs a new module) and note the choice.
+  - [x] Probe at most once per session, at session start, for the coder/planner model (they share one setting today). Cache the result for the session's lifetime; do not probe again mid-session even if the model setting were changed.
+  - [x] Compute the effective window: when a measurement exists, use the smaller of `resolve_context_window(configured)` and the measurement; when it does not, use `resolve_context_window(configured)` unchanged. Do NOT raise a sub-minimum measurement up to `MINIMUM_CONTEXT_WINDOW`: a model genuinely reporting less than 2,048 tokens cannot honor the floor, and pretending otherwise recreates the failure loop this plan removes. Let the complaint machinery speak instead (next item).
+  - [x] Feed the effective window into every consumer that currently takes the configured value: `build_compaction()`, `build_usage_monitor()`, `model_settings()` (so `num_ctx` asks Ollama to allocate exactly what the budget assumes — never more than the model supports), and `_warn_if_context_is_too_small()`'s check. All three long-run paths (`_run_coder_streaming`, `_plan_structured`, `_plan_as_text`) must use it.
+  - [x] When the effective window fails `context_window_complaint()` (window below overhead + headroom), emit that complaint once via the existing `_warn_if_context_is_too_small()` path and proceed — the run will fail informatively rather than loop. This replaces any temptation to keep halving below reality.
+  - [x] Fallback is silent and total: non-Ollama names, connection errors, non-200s, unparsable bodies, missing keys → behave byte-for-byte as today (configured/default window), emitting nothing new.
 - **Edge Cases & Error Handling:**
-  - Model name carries a tag (`ollama:qwen2.5-coder:14b`) — the full tagged name goes to `/api/show`, matching how the model was pulled.
+  - Model name carries a tag (`ollama:gurubot/gpt-oss-derestricted:20b`) — the full tagged name goes to `/api/show`, matching how the model was pulled.
   - Ollama reports a context length larger than configured — configured wins (never *raise* the user's ceiling).
   - Measurement succeeds but the model also has a Modelfile-level `num_ctx` override smaller than the trained maximum — `/api/show`'s top-level parameters may report it; prefer the tighter of what the metadata offers if straightforwardly available, else fall back to the architecture context length. If this proves murky, use the architecture length and say so in the phase summary.
   - Probe latency/failure must never delay or block session startup beyond a short timeout comparable to `EmbeddingService`'s.
   - `TestModel`/unit contexts: the probe is injectable/mockable (transport injection like `test_embedding.py`) so tests never need a live Ollama.
 - **Affected Areas:** `services/model_resolution.py` or a sibling module (probe + effective-resolution); `services/embedding.py` (optional shared parsing extraction); `api/v1/agent_session.py` (session-start probe, effective-window plumbing into all three run paths and the warning); `tests/test_model_resolution.py` or a new test module; possibly `tests/test_agent_session.py`/`test_execution_loop.py` for plumbing assertions.
 - **Acceptance Criteria:**
-  - [ ] With a mocked `/api/show` reporting e.g. 8,192 tokens and a configured 128,048, the compaction capability, usage monitor, and `num_ctx` payload all carry 8,192. — verified by: unit tests with transport-injected responses.
-  - [ ] With configured 8,192 and a measured 131,072, everything still uses 8,192 (measurement never raises the ceiling). — verified by: unit test.
-  - [ ] Non-Ollama model name → no HTTP request is issued and behavior matches current code paths exactly. — verified by: unit test asserting no client call occurs.
-  - [ ] Unreachable/malformed `/api/show` → silent fallback to configured/default; no new events emitted. — verified by: unit test with failing transport.
-  - [ ] A measured window too small for overhead + headroom produces the existing human-facing complaint once at session start. — verified by: unit test asserting the warning event content.
-  - [ ] Existing suite green apart from intentional updates to tests that pinned old plumbing. — verified by: pytest run.
+  - [x] With a mocked `/api/show` reporting e.g. 8,192 tokens and a configured 128,048, the compaction capability, usage monitor, and `num_ctx` payload all carry 8,192. — verified by: transport-injected probe and session-plumbing unit tests.
+  - [x] With configured 8,192 and a measured 131,072, everything still uses 8,192 (measurement never raises the ceiling). — verified by: `effective_context_window` unit test.
+  - [x] Non-Ollama model name → no HTTP request is issued and behavior matches current code paths exactly. — verified by: MockTransport unit test asserting no client call occurs.
+  - [x] Unreachable/malformed `/api/show` → silent fallback to configured/default; no new events emitted. — verified by: failing-transport and malformed-payload unit tests.
+  - [x] A measured window too small for overhead + headroom produces the existing human-facing complaint once at session start. — verified by: session unit test asserting one warning event contains the existing complaint.
+  - [x] Existing suite green apart from intentional updates to tests that pinned old plumbing. — verified by: `TEST_DATABASE_URL=postgres://loom:loom_password@localhost:5432/loom_db pytest` reported 887 passed and 4 skipped.
 - **Testing Notes:** Fake `/api/show` with `MockTransport` following `tests/test_embedding.py`'s handler pattern. Cover: happy path, tag-bearing names, missing `model_info`, wrong-typed values, non-200, connect error. Assert on the numbers reaching `build_compaction`/`model_settings` via the recording patterns already used in `test_execution_loop.py` (budget-recording stand-ins).
+
+**Phase 1 implementation notes:** Metadata parsing was extracted into `services/ollama_model_metadata.py` and shared with `EmbeddingService`, keeping both consumers tolerant of unavailable or malformed `/api/show` responses. The probe uses the architecture context length; Modelfile-level `num_ctx` parameters were not used because their shape is not stable enough across Ollama responses.
 
 ### Phase 2: One recoverable-overflow path shared by every long run — Status: Not Started
 - **Goal:** Narrow-and-retry works identically for coder streaming, structured planning, and text planning — and additionally recognizes hard provider rejections, not just empty generations.

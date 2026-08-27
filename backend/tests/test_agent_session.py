@@ -27,6 +27,7 @@ from services.event_bus import (
     SessionStatus,
     SystemEvent,
     ThoughtEvent,
+    WarningEvent,
 )
 from services.indexing_progress import ProgressReporter
 from services.file_editor import FileEditorService
@@ -279,6 +280,16 @@ class FakeServices:
         self.docker.check_reachable = reachable
 
 
+async def no_context_window_measurement(model_name: str) -> int | None:
+    """
+    Avoid external Ollama requests in session tests that do not cover probing.
+
+    :param model_name: The model that would have been measured.
+    :returns: None, matching an unavailable metadata probe.
+    """
+    return None
+
+
 def build_session(
     inbound: list[str],
     git: FakeGit | None = None,
@@ -324,6 +335,7 @@ def build_session(
         history=ConversationHistory(),
         machine=SessionStateMachine(),
         limits=limits or IterationLimits(),
+        context_window_probe=no_context_window_measurement,
     )
     return session, socket, captured, services
 
@@ -1959,6 +1971,63 @@ async def test_the_context_windows_reach_the_session(monkeypatch: pytest.MonkeyP
 
     assert session._coder_context_window == 40_000
     assert session._planner_context_window == 8_192
+
+
+async def test_a_measured_window_budgets_every_long_run_path() -> None:
+    """
+    The serving model's limit reaches compaction, monitoring, and `num_ctx`.
+    """
+    session, _, _, _ = build_session([json.dumps({'prompt': 'do it'})])
+    session._coder_context_window = 128_048
+    session._planner_context_window = 128_048
+    calls: list[str] = []
+
+    async def measured(model_name: str) -> int | None:
+        """
+        Report the model limit the probe discovered.
+
+        :param model_name: The model that would have been probed.
+        :returns: The serving context window.
+        """
+        calls.append(model_name)
+        return 8_192
+
+    session._context_window_probe = measured
+    assert await session._measure_context_window() == 8_192
+    assert await session._measure_context_window() == 8_192
+    assert calls == [session._coder_model]
+
+    assert session._compaction_for(session._coder_context_window).context_window == 8_192
+    assert session._usage_monitor_for(session._planner_context_window).context_window == 8_192
+    assert session._model_settings_for(session._coder_context_window).get('extra_body') == {
+        'options': {'num_ctx': 8_192}
+    }
+
+
+async def test_a_too_small_measured_window_warns_once_before_any_agent_run() -> None:
+    """
+    A known-unworkable serving limit receives the existing human-facing warning.
+    """
+    session, _, events, _ = build_session([json.dumps({'prompt': 'do it'})])
+
+    async def measured(model_name: str) -> int | None:
+        """
+        Report a context window too small for the coder's fixed overhead.
+
+        :param model_name: The model that would have been probed.
+        :returns: The serving context window.
+        """
+        return 2_048
+
+    session._context_window_probe = measured
+    await session._receive_task()
+    _ = await session._measure_context_window()
+    await session._warn_if_context_is_too_small()
+    await session._warn_if_context_is_too_small()
+
+    warnings: list[WarningEvent] = [event for event in events if isinstance(event, WarningEvent)]
+    assert len(warnings) == 1
+    assert 'about 2,048 tokens' in warnings[0].content
 
 
 @pytest.mark.parametrize(
