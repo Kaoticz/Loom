@@ -52,6 +52,7 @@ from services.git_manager import CommitResult, FileChange, GitManagerService
 from services.code_search import CodeSearchService
 from services.compaction import (
     build_compaction,
+    build_proactive_tool_pruning,
     build_usage_monitor,
     looks_like_context_overflow,
     narrowed_window,
@@ -855,6 +856,50 @@ class AgentSession:
             corrected_window, allow_subminimum=True, on_compaction=report
         )
 
+    def _proactive_tool_pruning_for(
+        self, context_window: int, run_path: CompactionRunPath
+    ) -> AbstractCapability[Any]:
+        """
+        Build the eager tool-result cap against this session's effective window.
+
+        It is a separate top-level capability, so its message-count trigger is
+        evaluated before the reactive compaction ladder and never relies on the
+        token estimate.
+
+        :param context_window: The effective window for the current run path.
+        :param run_path: The long-running path the capability is attached to.
+        :returns: The configured, observed proactive pruning capability.
+        """
+        async def report(tokens_before: int, tokens_after: int) -> None:
+            """
+            Attach this capability's path to a compaction notice.
+
+            :param tokens_before: Estimated history tokens before compaction.
+            :param tokens_after: Estimated history tokens after compaction.
+            """
+            await self._report_compaction(run_path, tokens_before, tokens_after)
+
+        if self._measured_context_window is None:
+            return build_proactive_tool_pruning(context_window, on_compaction=report)
+        return build_proactive_tool_pruning(
+            context_window, allow_subminimum=True, on_compaction=report
+        )
+
+    def _compaction_capabilities_for(
+        self, context_window: int, run_path: CompactionRunPath
+    ) -> list[AbstractCapability[Any]]:
+        """
+        Build the ordered compaction capabilities for one long-running run.
+
+        :param context_window: The effective window for the current run path.
+        :param run_path: The long-running path the capabilities are attached to.
+        :returns: The eager cap followed by the reactive compaction ladder.
+        """
+        return [
+            self._proactive_tool_pruning_for(context_window, run_path),
+            self._compaction_for(context_window, run_path),
+        ]
+
     def _usage_monitor_for(
         self,
         context_window: int,
@@ -1051,7 +1096,7 @@ class AgentSession:
                 # a user setting, and a capability attached at import time
                 # could not see it.
                 capabilities=[
-                    self._compaction_for(
+                    *self._compaction_capabilities_for(
                         self._coder_context_window, CompactionRunPath.coder_streaming
                     ),
                     # After the ladder, so the reading describes the history
@@ -1291,7 +1336,7 @@ class AgentSession:
                 model_settings=self._model_settings_for(self._planner_context_window),
                 usage_limits=UsageLimits(request_limit=None),
                 capabilities=[
-                    self._compaction_for(
+                    *self._compaction_capabilities_for(
                         self._planner_context_window, CompactionRunPath.structured_planning
                     ),
                     self._usage_monitor_for(
@@ -1354,7 +1399,7 @@ class AgentSession:
                 model_settings=self._model_settings_for(self._planner_context_window),
                 usage_limits=UsageLimits(request_limit=None),
                 capabilities=[
-                    self._compaction_for(
+                    *self._compaction_capabilities_for(
                         self._planner_context_window, CompactionRunPath.text_planning
                     ),
                     self._usage_monitor_for(

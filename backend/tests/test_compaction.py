@@ -25,13 +25,15 @@ from pydantic_ai_harness.compaction import (
 )
 
 from services.compaction import (
+    EAGER_KEEP_RECENT_TOOL_PAIRS,
+    EAGER_TOOL_RESULT_MAX_MESSAGES,
     IRRECOVERABLE_TOOLS,
-    KEEP_RECENT_TOOL_PAIRS,
     DEFAULT_CONTEXT_WINDOW,
     MINIMUM_CONTEXT_WINDOW,
     TARGET_FRACTION,
     ObservedCompaction,
     build_compaction,
+    build_proactive_tool_pruning,
     read_file_key,
     resolve_context_window,
 )
@@ -238,13 +240,25 @@ def test_clamping_keeps_both_ends_of_a_message() -> None:
     assert clamp.keep_tail_chars > 0
 
 
-def test_recent_tool_results_survive_clearing() -> None:
+def test_reactive_clearing_purges_every_tool_result() -> None:
     """
-    The results the agent is actively reasoning about are never the ones blanked.
+    The ladder is the last resort after proactive pruning has retained its tail.
     """
     clear: Any = build_compaction(None).tiers[2]
 
-    assert clear.keep_pairs >= 1
+    assert clear.keep_pairs == 0
+
+
+def test_proactive_clearing_keeps_a_generous_recent_tool_window() -> None:
+    """
+    The standalone cap starts near ten pairs and retains exactly that many.
+    """
+    pruning: ClearToolResults[Any] = build_proactive_tool_pruning(None)
+
+    assert pruning.max_messages == EAGER_TOOL_RESULT_MAX_MESSAGES
+    assert pruning.keep_pairs == EAGER_KEEP_RECENT_TOOL_PAIRS
+    assert pruning.max_tokens is None
+    assert pruning.max_fraction is None
 
 
 def history_with_file_reads(repeats: int, body: str) -> list[ModelMessage]:
@@ -428,6 +442,109 @@ async def test_a_history_under_budget_is_left_alone() -> None:
     assert result == messages
 
 
+async def test_proactive_pruning_runs_under_the_reactive_token_budget() -> None:
+    """
+    More than ten pairs are trimmed even when the estimate is far under budget.
+    """
+    body: str = 'file contents'
+    messages: list[ModelMessage] = history_with_file_reads(12, body)
+    pruning: ClearToolResults[Any] = build_proactive_tool_pruning(1_000_000)
+    context: ModelRequestContext = request_context(messages)
+
+    assert estimate_token_count(messages) < int(1_000_000 * TARGET_FRACTION)
+    result: ModelRequestContext = await pruning.before_model_request(
+        run_context(quiet_model()), context
+    )
+    returns: list[str] = [
+        str(part.content)
+        for message in result.messages
+        for part in message.parts
+        if isinstance(part, ToolReturnPart)
+    ]
+
+    assert returns[:2] == ['[tool result cleared]', '[tool result cleared]']
+    assert returns[2:] == [body] * EAGER_KEEP_RECENT_TOOL_PAIRS
+
+
+async def test_proactive_pruning_preserves_old_user_answers() -> None:
+    """
+    A protected `ask_user` result survives even outside the recent pair window.
+    """
+    answer: str = 'Use exponential backoff with a 30s cap.'
+    messages: list[ModelMessage] = history_with_an_answer(12, 'file contents', answer)
+    pruning: ClearToolResults[Any] = build_proactive_tool_pruning(None)
+
+    result: ModelRequestContext = await pruning.before_model_request(
+        run_context(quiet_model()), request_context(messages)
+    )
+    answers: list[str] = [
+        str(part.content)
+        for message in result.messages
+        for part in message.parts
+        if isinstance(part, ToolReturnPart) and part.tool_name == 'ask_user'
+    ]
+
+    assert answers == [answer]
+
+
+async def test_reactive_purge_follows_proactive_pruning_when_the_tail_is_too_large() -> None:
+    """
+    The ladder clears every remaining result when its target still is not met.
+    """
+    body: str = 'x' * 10_000
+    messages: list[ModelMessage] = history_with_file_reads(12, body)
+    reports: list[tuple[int, int]] = []
+
+    async def report(before: int, after: int) -> None:
+        """
+        Capture one observed compaction reduction.
+
+        :param before: Estimated tokens before compaction.
+        :param after: Estimated tokens after compaction.
+        """
+        reports.append((before, after))
+
+    proactive: ObservedCompaction = build_proactive_tool_pruning(2_048, on_compaction=report)
+    ladder: ObservedCompaction = build_compaction(2_048, on_compaction=report)
+    context: ModelRequestContext = request_context(messages)
+
+    context = await proactive.before_model_request(run_context(quiet_model()), context)
+    result: ModelRequestContext = await ladder.before_model_request(run_context(quiet_model()), context)
+    returns: list[str] = [
+        str(part.content)
+        for message in result.messages
+        for part in message.parts
+        if isinstance(part, ToolReturnPart)
+    ]
+
+    assert body not in returns
+    assert returns == ['[tool result cleared]'] * 12
+    assert len(reports) == 2
+
+
+async def test_deduplication_still_reclaims_superseded_reads_after_proactive_pruning() -> None:
+    """
+    The reactive ladder can replace eager placeholders with cheaper deduplication.
+    """
+    body: str = 'x' * 15_000
+    messages: list[ModelMessage] = history_with_file_reads(12, body)
+    proactive: ClearToolResults[Any] = build_proactive_tool_pruning(50_000)
+    ladder: TieredCompaction[Any] = build_compaction(50_000)
+    context: ModelRequestContext = request_context(messages)
+
+    context = await proactive.before_model_request(run_context(quiet_model()), context)
+    result: ModelRequestContext = await ladder.before_model_request(run_context(quiet_model()), context)
+    returns: list[str] = [
+        str(part.content)
+        for message in result.messages
+        for part in message.parts
+        if isinstance(part, ToolReturnPart)
+    ]
+
+    assert returns[:-1] == ['[superseded file read]'] * 11
+    assert returns[-1] == body
+
+
 async def test_repeated_reads_of_one_file_are_deduplicated() -> None:
     """
     The cheapest tier fires first and is enough on its own here.
@@ -536,7 +653,7 @@ async def test_a_users_answer_survives_the_blanking_tiers() -> None:
     messages: list[ModelMessage] = history_with_an_answer(40, 'y' * 4_000, answer)
     blanking: ClearToolResults[Any] = ClearToolResults(
         max_tokens=1_000,
-        keep_pairs=KEEP_RECENT_TOOL_PAIRS,
+        keep_pairs=EAGER_KEEP_RECENT_TOOL_PAIRS,
         exclude_tools=IRRECOVERABLE_TOOLS,
     )
 

@@ -100,13 +100,22 @@ away the step it is part way through, which is the one part of the history it
 cannot do without.
 """
 
-KEEP_RECENT_TOOL_PAIRS: int = 5
+EAGER_TOOL_RESULT_MAX_MESSAGES: int = 20
 """
-How many recent tool call/result pairs `ClearToolResults` leaves intact.
+The whole-message threshold for proactive tool-result clearing.
 
-A coder working a step reads a file, edits it, runs the tests, reads the
-failure and edits again. Five pairs keeps that cycle whole, so the results the
-agent is actively reasoning about are never the ones blanked.
+`ClearToolResults` can count messages but not tool pairs. Twenty represents ten
+ideal call/result pairs, so the capability starts trimming as soon as activity
+has plausibly grown beyond the retained window. Non-tool messages can make it
+fire earlier; the precise result after it fires is still the latest ten pairs.
+"""
+
+EAGER_KEEP_RECENT_TOOL_PAIRS: int = 10
+"""
+How many recent tool call/result pairs proactive clearing leaves intact.
+
+Ten pairs preserve a generous working cycle of reads, edits, test runs and
+follow-up inspection on every request, independent of token estimation.
 """
 
 CLAMP_KEEP_HEAD_CHARS: int = 2_000
@@ -319,6 +328,55 @@ class ObservedCompaction(AbstractCapability[Any]):
 
 
 @overload
+def build_proactive_tool_pruning(
+    context_window: int | None,
+    *,
+    allow_subminimum: bool = False,
+    on_compaction: None = None,
+) -> ClearToolResults[Any]: ...
+
+
+@overload
+def build_proactive_tool_pruning(
+    context_window: int | None,
+    *,
+    allow_subminimum: bool = False,
+    on_compaction: Callable[[int, int], Awaitable[None]],
+) -> ObservedCompaction: ...
+
+
+def build_proactive_tool_pruning(
+    context_window: int | None,
+    *,
+    allow_subminimum: bool = False,
+    on_compaction: Callable[[int, int], Awaitable[None]] | None = None,
+) -> ClearToolResults[Any] | ObservedCompaction:
+    """
+    Build the estimate-independent tool-result cap for one agent run.
+
+    Registered outside the tiered ladder, where its own message-count trigger is
+    honoured on every request. `context_window` is accepted to share the same
+    builder shape as the other per-run capabilities; this trigger deliberately
+    does not use it, token counts, or fractions.
+
+    :param context_window: The configured or measured window, unused by this trigger.
+    :param allow_subminimum: Kept for the shared per-run builder interface.
+    :param on_compaction: Receives estimates whenever the cap shortens a request.
+    :returns: The proactive clearing capability, optionally wrapped for reporting.
+    """
+    _ = context_window
+    _ = allow_subminimum
+    pruning: ClearToolResults[Any] = ClearToolResults(
+        max_messages=EAGER_TOOL_RESULT_MAX_MESSAGES,
+        keep_pairs=EAGER_KEEP_RECENT_TOOL_PAIRS,
+        exclude_tools=IRRECOVERABLE_TOOLS,
+    )
+    if on_compaction is None:
+        return pruning
+    return ObservedCompaction(pruning, on_compaction)
+
+
+@overload
 def build_compaction(
     context_window: int | None,
     *,
@@ -383,7 +441,7 @@ def build_compaction(
             ClearToolResults(
                 max_fraction=TARGET_FRACTION,
                 context_window=window,
-                keep_pairs=KEEP_RECENT_TOOL_PAIRS,
+                keep_pairs=0,
                 exclude_tools=IRRECOVERABLE_TOOLS,
             ),
             SummarizingCompaction(

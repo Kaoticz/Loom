@@ -2103,6 +2103,25 @@ async def test_a_measured_window_budgets_every_long_run_path() -> None:
     }
 
 
+async def test_compaction_capabilities_put_proactive_pruning_before_the_ladder() -> None:
+    """
+    Every long-running path evaluates the eager cap before reactive compaction.
+    """
+    from pydantic_ai.capabilities import AbstractCapability
+    from services.compaction import ObservedCompaction
+    from services.event_bus import CompactionRunPath
+
+    session, _, _, _ = build_session([json.dumps({'prompt': 'do it'})])
+    capabilities: list[AbstractCapability[Any]] = session._compaction_capabilities_for(
+        32_768, CompactionRunPath.coder_streaming
+    )
+
+    assert len(capabilities) == 2
+    assert all(isinstance(capability, ObservedCompaction) for capability in capabilities)
+    assert type(getattr(capabilities[0], '_inner')).__name__ == 'ClearToolResults'
+    assert type(getattr(capabilities[1], '_inner')).__name__ == 'TieredCompaction'
+
+
 async def test_a_too_small_measured_window_warns_once_before_any_agent_run() -> None:
     """
     A known-unworkable serving limit receives the existing human-facing warning.
