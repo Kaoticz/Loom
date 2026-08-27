@@ -1,7 +1,7 @@
 from time import monotonic
 from asyncio import Event
 from collections.abc import AsyncIterable, Sequence
-from typing import Any, Awaitable, Callable, Protocol
+from typing import Any, Awaitable, Callable, Protocol, TypeVar
 
 from agents.classifier import (
     ClassificationResult,
@@ -12,7 +12,6 @@ from agents.coder import CODER_SYSTEM_PROMPT, AgentDeps, answering_agent, coder_
 from agents.reviewer import ReviewResult, reviewer_agent
 from fastapi import WebSocket
 from pydantic_ai import Agent, RunContext, UsageLimits
-from pydantic_ai.exceptions import UnexpectedModelBehavior
 from pydantic_ai_harness.compaction import ContextUsage, ReportContextUsage, TieredCompaction
 from pydantic_ai.agent import AgentRunResult
 from pydantic_ai.messages import (
@@ -51,7 +50,7 @@ from services.code_search import CodeSearchService
 from services.compaction import (
     build_compaction,
     build_usage_monitor,
-    looks_like_no_room_to_answer,
+    looks_like_context_overflow,
     narrowed_window,
     resolve_context_window,
 )
@@ -96,6 +95,8 @@ import logging
 import os
 
 logger = logging.getLogger(__name__)
+
+_RunResult = TypeVar('_RunResult')
 
 
 def _read_secrets(raw: Any) -> dict[str, str]:
@@ -798,12 +799,42 @@ class AgentSession:
         )
         return True
 
+    async def _run_with_overflow_recovery(
+        self,
+        run: Callable[[], Awaitable[_RunResult]],
+        context_window: Callable[[], int],
+        on_retry: Callable[[], object] | None = None,
+    ) -> _RunResult:
+        """
+        Retry a long-running model call after a recoverable context overflow.
+
+        The supplied window reader identifies whether this attempt belongs to
+        the coder or planner budget. Narrowing still updates both budgets because
+        they use the same serving model.
+
+        :param run: Starts one model-run attempt.
+        :param context_window: Reads the budget that owns each attempt.
+        :param on_retry: Clears state belonging to an abandoned attempt.
+        :returns: The successful model-run result.
+        :raises Exception: If the failure is unrelated or cannot be recovered.
+        """
+        while True:
+            try:
+                return await run()
+            except Exception as error:
+                if not looks_like_context_overflow(error):
+                    raise
+                if not await self._narrow_after_overflow(context_window()):
+                    raise
+                if on_retry is not None:
+                    _ = on_retry()
+
     async def _run_coder_streaming(self, prompt: str, agent: Agent[AgentDeps, str]) -> str:
         """
         Run a coder agent, streaming its reasoning to the client as it goes.
 
         Distinct from `_plan_as_text`, which planning uses: a plan is a single
-        artefact the client is shown once it exists, while executing and
+        artifact the client is shown once it exists, while executing and
         answering are long runs whose reasoning is worth watching arrive.
 
         The graph is run with `run()` and an event stream handler rather than
@@ -854,39 +885,37 @@ class AgentSession:
                     for thought in buffer.add(event.delta.content_delta, monotonic()):
                         await self._say(thought)
 
-        while True:
-            try:
-                result: AgentRunResult[str] = await agent.run(
-                    prompt,
-                    deps=self._deps,
-                    model=resolve_model(self._coder_model),
-                    model_settings=self._model_settings_for(self._coder_context_window),
-                    event_stream_handler=stream_thoughts,
-                    usage_limits=UsageLimits(request_limit=None),
-                    # Built per run rather than fixed on the agent: the budget is
-                    # a user setting, and a capability attached at import time
-                    # could not see it.
-                    capabilities=[
-                        self._compaction_for(self._coder_context_window),
-                        # After the ladder, so the reading describes the history
-                        # actually being sent rather than what triggered it.
-                        self._usage_monitor_for(self._coder_context_window),
-                    ],
-                )
-                break
-            except UnexpectedModelBehavior as error:
-                # The prompt filled the model's real window, so nothing came back.
-                # Retried against a narrower window rather than failed: the run
-                # is recoverable, and the alternative is losing the step over a
-                # number the user could only have guessed at.
-                if not looks_like_no_room_to_answer(error):
-                    raise
-                if not await self._narrow_after_overflow(self._coder_context_window):
-                    raise
-                # Anything half-streamed belongs to the abandoned attempt, and
-                # emitting it alongside the retry's output would read as the
-                # model repeating itself.
-                _ = buffer.flush()
+        async def run_coder() -> AgentRunResult[str]:
+            """
+            Run one streaming coder attempt.
+
+            :returns: The coder's completed result.
+            """
+            return await agent.run(
+                prompt,
+                deps=self._deps,
+                model=resolve_model(self._coder_model),
+                model_settings=self._model_settings_for(self._coder_context_window),
+                event_stream_handler=stream_thoughts,
+                usage_limits=UsageLimits(request_limit=None),
+                # Built per run rather than fixed on the agent: the budget is
+                # a user setting, and a capability attached at import time
+                # could not see it.
+                capabilities=[
+                    self._compaction_for(self._coder_context_window),
+                    # After the ladder, so the reading describes the history
+                    # actually being sent rather than what triggered it.
+                    self._usage_monitor_for(self._coder_context_window),
+                ],
+            )
+
+        # Anything half-streamed belongs to an abandoned attempt, and emitting it
+        # alongside the retry's output would read as the model repeating itself.
+        result: AgentRunResult[str] = await self._run_with_overflow_recovery(
+            run_coder,
+            lambda: self._coder_context_window,
+            buffer.flush,
+        )
 
         remaining: str | None = buffer.flush()
         if remaining is not None:
@@ -1095,8 +1124,13 @@ class AgentSession:
         :param prompt: The planning prompt.
         :returns: The plan, structured if it could be, parsed from text if not.
         """
-        try:
-            result: AgentRunResult[StructuredPlan] = await planner_agent.run(
+        async def run_structured() -> AgentRunResult[StructuredPlan]:
+            """
+            Run one structured-planning attempt.
+
+            :returns: The planner's structured result.
+            """
+            return await planner_agent.run(
                 prompt,
                 deps=self._deps,
                 model=resolve_model(self._coder_model),
@@ -1107,7 +1141,15 @@ class AgentSession:
                     self._usage_monitor_for(self._planner_context_window),
                 ],
             )
+
+        try:
+            result: AgentRunResult[StructuredPlan] = await self._run_with_overflow_recovery(
+                run_structured,
+                lambda: self._planner_context_window,
+            )
         except Exception as error:
+            if looks_like_context_overflow(error):
+                raise
             logger.warning('Structured planning failed, falling back to text: %s', error)
             return parse_plan(await self._plan_as_text(prompt))
 
@@ -1139,17 +1181,28 @@ class AgentSession:
         :param prompt: The prompt to send.
         :returns: The planner's output, as text.
         """
-        result: AgentRunResult[str] = await planner_agent.run(
-            prompt,
-            output_type=str,
-            deps=self._deps,
-            model=resolve_model(self._coder_model),
-            model_settings=self._model_settings_for(self._planner_context_window),
-            usage_limits=UsageLimits(request_limit=None),
-            capabilities=[
-                self._compaction_for(self._planner_context_window),
-                self._usage_monitor_for(self._planner_context_window),
-            ],
+        async def run_text() -> AgentRunResult[str]:
+            """
+            Run one text-planning attempt.
+
+            :returns: The planner's text result.
+            """
+            return await planner_agent.run(
+                prompt,
+                output_type=str,
+                deps=self._deps,
+                model=resolve_model(self._coder_model),
+                model_settings=self._model_settings_for(self._planner_context_window),
+                usage_limits=UsageLimits(request_limit=None),
+                capabilities=[
+                    self._compaction_for(self._planner_context_window),
+                    self._usage_monitor_for(self._planner_context_window),
+                ],
+            )
+
+        result: AgentRunResult[str] = await self._run_with_overflow_recovery(
+            run_text,
+            lambda: self._planner_context_window,
         )
         return result.output
 

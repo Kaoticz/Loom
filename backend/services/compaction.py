@@ -14,6 +14,7 @@ from pydantic_ai_harness.compaction import (
     SummarizingCompaction,
     TieredCompaction,
 )
+from pydantic_ai.exceptions import ModelHTTPError
 
 DEFAULT_CONTEXT_WINDOW: int = 32_768
 """
@@ -186,6 +187,34 @@ def looks_like_no_room_to_answer(error: Exception) -> bool:
     """
     message: str = str(error).lower()
     return 'token limit' in message and 'before any response' in message
+
+
+def looks_like_context_overflow(error: Exception) -> bool:
+    """
+    Recognize an empty generation or provider rejection caused by a full context.
+
+    Pydantic AI wraps an empty length-finished generation in
+    ``UnexpectedModelBehavior``. Providers that reject an oversized request
+    before generation instead surface a 4xx ``ModelHTTPError``. Both failures
+    prove the working window is too optimistic, while other model failures must
+    retain their existing handling.
+
+    :param error: The exception that ended the model run.
+    :returns: True when narrowing the context window may let a retry succeed.
+    """
+    if looks_like_no_room_to_answer(error):
+        return True
+    if not isinstance(error, ModelHTTPError) or not 400 <= error.status_code < 500:
+        return False
+
+    message: str = str(error).lower()
+    context_markers: tuple[str, ...] = (
+        'context length',
+        'context window',
+        'maximum context',
+        'token limit',
+    )
+    return any(marker in message for marker in context_markers)
 
 
 def narrowed_window(context_window: int | None) -> int:

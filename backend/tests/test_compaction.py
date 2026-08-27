@@ -488,6 +488,38 @@ def test_an_overflow_failure_is_recognised() -> None:
     assert looks_like_no_room_to_answer(unrelated) is False
 
 
+def test_a_provider_context_rejection_is_recognised() -> None:
+    """
+    A provider can reject an oversized request before it generates anything.
+
+    That shape does not carry the empty-generation wording, but it is the same
+    recoverable signal when it is a client error that specifically names context.
+    """
+    from pydantic_ai.exceptions import ModelHTTPError
+
+    from services.compaction import looks_like_context_overflow
+
+    overflow: ModelHTTPError = ModelHTTPError(
+        400,
+        'ollama:model',
+        {'error': 'requested context length exceeds the model limit'},
+    )
+    unrelated: ModelHTTPError = ModelHTTPError(
+        400,
+        'ollama:model',
+        {'error': 'the requested model does not exist'},
+    )
+    server_error: ModelHTTPError = ModelHTTPError(
+        500,
+        'ollama:model',
+        {'error': 'context length exceeds the model limit'},
+    )
+
+    assert looks_like_context_overflow(overflow) is True
+    assert looks_like_context_overflow(unrelated) is False
+    assert looks_like_context_overflow(server_error) is False
+
+
 def test_narrowing_closes_the_gap_and_then_stops() -> None:
     """
     Halving converges on a real window without anyone knowing the figure.

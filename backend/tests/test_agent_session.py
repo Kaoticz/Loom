@@ -1915,6 +1915,100 @@ async def test_planning_falls_back_to_text_when_structure_fails(
     assert plan.format is PlanFormat.text
 
 
+async def test_a_structured_planning_overflow_retries_structure(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """
+    A recoverable overflow must retry structured output instead of falling back to text.
+    """
+    from agents.planner import PlannedStep, StructuredPlan
+    from pydantic_ai.exceptions import UnexpectedModelBehavior
+    import agents.planner as planner_module
+    from services.plan_parser import PlanFormat
+
+    session, _, _, _ = build_session([json.dumps({'prompt': 'do something'})])
+    session._planner_context_window = 128_048
+    attempts: list[int] = []
+
+    class Result:
+        """Provide the successful structured planner output."""
+
+        output: StructuredPlan = StructuredPlan(
+            steps=[PlannedStep(title='Read the file.', description='Inspect it.')]
+        )
+
+    async def overflow_once(*_: object, **__: object) -> Result:
+        attempts.append(session._planner_context_window)
+        if len(attempts) == 1:
+            raise UnexpectedModelBehavior(
+                'Model token limit (8192) exceeded before any response was generated.'
+            )
+        return Result()
+
+    monkeypatch.setattr(planner_module.planner_agent, 'run', overflow_once)
+
+    plan = await session._plan_structured('irrelevant')
+
+    assert attempts == [128_048, 64_024]
+    assert plan.titles == ['Read the file.']
+    assert plan.format is PlanFormat.structured
+
+
+async def test_a_text_planning_overflow_is_narrowed_and_retried(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """
+    Text planning uses the same recoverable-overflow loop as the other long runs.
+    """
+    from pydantic_ai.exceptions import UnexpectedModelBehavior
+    import agents.planner as planner_module
+
+    session, _, _, _ = build_session([json.dumps({'prompt': 'do something'})])
+    session._planner_context_window = 128_048
+    attempts: list[int] = []
+
+    class Result:
+        """Provide the successful text planner output."""
+
+        output: str = '1. Read the file.'
+
+    async def overflow_once(*_: object, **__: object) -> Result:
+        attempts.append(session._planner_context_window)
+        if len(attempts) == 1:
+            raise UnexpectedModelBehavior(
+                'Model token limit (8192) exceeded before any response was generated.'
+            )
+        return Result()
+
+    monkeypatch.setattr(planner_module.planner_agent, 'run', overflow_once)
+
+    assert await session._plan_as_text('irrelevant') == '1. Read the file.'
+    assert attempts == [128_048, 64_024]
+
+
+async def test_stop_requested_during_text_planning_is_not_retried(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """
+    A stop request must propagate rather than becoming another model attempt.
+    """
+    import agents.planner as planner_module
+
+    session, _, _, _ = build_session([json.dumps({'prompt': 'do something'})])
+    attempts: list[int] = []
+
+    async def stop(*_: object, **__: object) -> object:
+        attempts.append(1)
+        raise StopRequested()
+
+    monkeypatch.setattr(planner_module.planner_agent, 'run', stop)
+
+    with pytest.raises(StopRequested):
+        await session._plan_as_text('irrelevant')
+
+    assert attempts == [1]
+
+
 async def test_structure_that_says_nothing_falls_back_too(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:

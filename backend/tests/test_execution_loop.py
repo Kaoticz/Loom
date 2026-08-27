@@ -1716,6 +1716,41 @@ async def test_an_unrelated_model_failure_is_not_retried(
     assert len(attempts) == 1, 'an unrelated failure should not be retried'
 
 
+async def test_a_provider_context_rejection_is_narrowed_and_retried(
+    monkeypatch: pytest.MonkeyPatch, git_repo: GitManagerService
+) -> None:
+    """
+    A hard 400 context rejection carries the same recovery signal as an empty generation.
+    """
+    from pydantic_ai.exceptions import ModelHTTPError
+
+    session, _ = prepare(monkeypatch, [], git_repo)
+    session._coder_context_window = 128_048
+    session._session.record_classification(True)
+
+    import agents.coder as coder_module
+
+    attempts: list[int] = []
+    original = coder_module.coder_agent.run
+
+    async def reject_once(*args: Any, **kwargs: Any) -> Any:
+        attempts.append(session._coder_context_window)
+        if len(attempts) == 1:
+            raise ModelHTTPError(
+                400,
+                'ollama:model',
+                {'error': 'requested context length exceeds the model limit'},
+            )
+        return await original(*args, **kwargs)
+
+    monkeypatch.setattr(agent_session_module, 'resolve_model', lambda name: quiet_model())
+    monkeypatch.setattr(coder_module.coder_agent, 'run', reject_once)
+
+    await session._handle_executing()
+
+    assert attempts == [128_048, 64_024]
+
+
 async def test_an_unworkable_window_is_explained_before_the_first_step(
     monkeypatch: pytest.MonkeyPatch, git_repo: GitManagerService
 ) -> None:
