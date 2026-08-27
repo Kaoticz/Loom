@@ -1717,11 +1717,11 @@ async def test_a_window_too_large_is_narrowed_and_the_run_retried(
     assert 'smaller than' in warnings[0].content
 
 
-async def test_an_unrelated_model_failure_is_not_retried(
+async def test_tool_retry_exhaustion_retries_once_after_compaction(
     monkeypatch: pytest.MonkeyPatch, git_repo: GitManagerService
 ) -> None:
     """
-    Narrowing on any failure would retry a broken run down to a useless window.
+    One retry can recover from a malformed tool call without abandoning the step.
     """
     from pydantic_ai.exceptions import UnexpectedModelBehavior
 
@@ -1732,17 +1732,134 @@ async def test_an_unrelated_model_failure_is_not_retried(
 
     attempts: list[int] = []
 
-    async def always_fails(*args: Any, **kwargs: Any) -> Any:
+    original = coder_module.coder_agent.run
+
+    async def fails_once(*args: Any, **kwargs: Any) -> Any:
+        """
+        Raise the exhausted-tool error once, then allow normal execution.
+
+        :param args: Positional run arguments.
+        :param kwargs: Keyword run arguments.
+        :returns: The normal agent result after recovery.
+        :raises UnexpectedModelBehavior: For the simulated first exhausted tool call.
+        """
+        attempts.append(1)
+        if len(attempts) == 1:
+            raise UnexpectedModelBehavior("Tool 'edit_file' exceeded max retries count of 5.")
+        return await original(*args, **kwargs)
+
+    compactions: list[int] = []
+
+    async def compact(*_: object) -> None:
+        """
+        Record the one forced compaction before retrying.
+
+        :returns: No retained history for this mocked failed run.
+        """
+        compactions.append(1)
+        return None
+
+    monkeypatch.setattr(agent_session_module, 'resolve_model', lambda name: quiet_model())
+    monkeypatch.setattr(coder_module.coder_agent, 'run', fails_once)
+    monkeypatch.setattr(session, '_compact_after_tool_retry_exhaustion', compact)
+
+    await session._handle_executing()
+
+    assert len(attempts) == 2
+    assert compactions == [1]
+
+
+async def test_persistent_tool_retry_exhaustion_marks_the_step_incomplete(
+    monkeypatch: pytest.MonkeyPatch, git_repo: GitManagerService
+) -> None:
+    """
+    A second exhausted-tool failure is recorded and execution continues safely.
+    """
+    from pydantic_ai.exceptions import UnexpectedModelBehavior
+
+    from services.event_bus import WarningEvent
+
+    session, events = prepare(monkeypatch, [], git_repo)
+    session._session.record_classification(True)
+
+    import agents.coder as coder_module
+
+    attempts: list[int] = []
+    compactions: list[int] = []
+
+    async def always_fails(*_: object, **__: object) -> None:
+        """
+        Simulate a tool whose retries remain exhausted after recovery.
+
+        :raises UnexpectedModelBehavior: Always, for the tool retry exhaustion.
+        """
         attempts.append(1)
         raise UnexpectedModelBehavior("Tool 'edit_file' exceeded max retries count of 5.")
 
+    async def compact(*_: object) -> None:
+        """
+        Record the sole recovery compaction.
+
+        :returns: No retained history for this mocked failed run.
+        """
+        compactions.append(1)
+        return None
+
     monkeypatch.setattr(agent_session_module, 'resolve_model', lambda name: quiet_model())
     monkeypatch.setattr(coder_module.coder_agent, 'run', always_fails)
+    monkeypatch.setattr(session, '_compact_after_tool_retry_exhaustion', compact)
 
-    with pytest.raises(UnexpectedModelBehavior):
-        await session._handle_executing()
+    state: SessionState = await session._handle_executing()
 
-    assert len(attempts) == 1, 'an unrelated failure should not be retried'
+    warnings: list[WarningEvent] = [event for event in events if isinstance(event, WarningEvent)]
+    assert state is SessionState.reviewing
+    assert attempts == [1, 1]
+    assert compactions == [1]
+    assert len(session._session.step_summaries) == 1
+    assert 'incomplete because a tool exhausted its retry budget' in session._session.step_summaries[0]
+    assert 'compacted the request and retried once' in warnings[-1].content
+
+
+async def test_tool_retry_exhaustion_is_tolerated_for_an_unparsed_plan(
+    monkeypatch: pytest.MonkeyPatch, git_repo: GitManagerService
+) -> None:
+    """
+    Whole-plan execution has the same recovery path when no step object exists.
+    """
+    from pydantic_ai.exceptions import UnexpectedModelBehavior
+
+    from services.event_bus import WarningEvent
+
+    session, events = prepare(monkeypatch, [], git_repo)
+    session._plan = ParsedPlan(steps=[])
+
+    import agents.coder as coder_module
+
+    async def always_fails(*_: object, **__: object) -> None:
+        """
+        Simulate persistent tool retry exhaustion.
+
+        :raises UnexpectedModelBehavior: Always, for the tool retry exhaustion.
+        """
+        raise UnexpectedModelBehavior("Tool 'search_code' exceeded max retries count of 5.")
+
+    async def compact(*_: object) -> None:
+        """
+        Provide the single recovery compaction expected by the executor.
+
+        :returns: No retained history for this mocked failed run.
+        """
+        return None
+
+    monkeypatch.setattr(coder_module.coder_agent, 'run', always_fails)
+    monkeypatch.setattr(session, '_compact_after_tool_retry_exhaustion', compact)
+
+    state: SessionState = await session._handle_executing()
+
+    warnings: list[WarningEvent] = [event for event in events if isinstance(event, WarningEvent)]
+    assert state is SessionState.reviewing
+    assert len(warnings) == 1
+    assert warnings[0].content.startswith('Step 1 could not complete')
 
 
 async def test_a_provider_context_rejection_is_narrowed_and_retried(

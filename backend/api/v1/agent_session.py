@@ -13,6 +13,7 @@ from agents.reviewer import ReviewResult, reviewer_agent
 from fastapi import WebSocket
 from pydantic_ai import Agent, RunContext, UsageLimits
 from pydantic_ai.capabilities import AbstractCapability
+from pydantic_ai.exceptions import UnexpectedModelBehavior
 from pydantic_ai_harness.compaction import ContextUsage, ReportContextUsage, estimate_token_count
 from pydantic_ai.agent import AgentRunResult
 from pydantic_ai.messages import (
@@ -1137,7 +1138,13 @@ class AgentSession:
                 if on_retry is not None:
                     _ = on_retry()
 
-    async def _run_coder_streaming(self, prompt: str, agent: Agent[AgentDeps, str]) -> str:
+    async def _run_coder_streaming(
+        self,
+        prompt: str,
+        agent: Agent[AgentDeps, str],
+        request_history: RequestHistoryCapture | None = None,
+        message_history: list[ModelMessage] | None = None,
+    ) -> str:
         """
         Run a coder agent, streaming its reasoning to the client as it goes.
 
@@ -1155,6 +1162,8 @@ class AgentSession:
         :param prompt: The instruction to give the agent.
         :param agent: The agent to run. The answering path uses a read-only one,
             so a task judged to need no changes cannot make any.
+        :param request_history: Captures requests for caller-managed recovery.
+        :param message_history: Prior history to resume after caller-managed recovery.
         :returns: The agent's final text output.
         :raises StopRequested: If the user asked for the session to stop.
         :raises ClientGone: If the client disconnected while the agent was running.
@@ -1193,9 +1202,13 @@ class AgentSession:
                     for thought in buffer.add(event.delta.content_delta, monotonic()):
                         await self._say(thought)
 
-        history: RequestHistoryCapture = RequestHistoryCapture()
+        history: RequestHistoryCapture = (
+            request_history if request_history is not None else RequestHistoryCapture()
+        )
 
-        async def run_coder(message_history: list[ModelMessage] | None) -> AgentRunResult[str]:
+        async def run_coder(
+            overflow_history: list[ModelMessage] | None,
+        ) -> AgentRunResult[str]:
             """
             Run one streaming coder attempt.
 
@@ -1203,7 +1216,9 @@ class AgentSession:
             """
             return await agent.run(
                 prompt,
-                message_history=message_history,
+                message_history=(
+                    overflow_history if overflow_history is not None else message_history
+                ),
                 deps=self._deps,
                 model=resolve_model(self._coder_model),
                 model_settings=self._model_settings_for(self._coder_context_window),
@@ -1677,7 +1692,29 @@ class AgentSession:
         if step is not None:
             self._session.begin_step(step.title)
 
-        await self._run_coder_streaming(self._build_step_prompt(step, position, total), coder_agent)
+        prompt: str = self._build_step_prompt(step, position, total)
+        history: RequestHistoryCapture = RequestHistoryCapture()
+        try:
+            await self._run_coder_streaming(prompt, coder_agent, request_history=history)
+        except UnexpectedModelBehavior as error:
+            if not _looks_like_tool_retry_exhaustion(error):
+                raise
+
+            compacted: list[ModelMessage] | None = await self._compact_after_tool_retry_exhaustion(
+                history
+            )
+            try:
+                await self._run_coder_streaming(
+                    prompt,
+                    coder_agent,
+                    request_history=history,
+                    message_history=compacted,
+                )
+            except UnexpectedModelBehavior as retry_error:
+                if not _looks_like_tool_retry_exhaustion(retry_error):
+                    raise
+                await self._record_tool_retry_exhaustion(step, position)
+                return
 
         if step is not None and len(self._session.step_summaries) == before:
             # Not a failure. The agent may well have done the work and simply
@@ -1690,6 +1727,66 @@ class AgentSession:
             self._session.record_step_completion(
                 f'{step.title} — the agent did not report what it did for this step.'
             )
+
+    async def _compact_after_tool_retry_exhaustion(
+        self, history: RequestHistoryCapture
+    ) -> list[ModelMessage] | None:
+        """
+        Force one summary pass before retrying an exhausted tool call.
+
+        :param history: The final compacted request from the failed coder run.
+        :returns: The compacted history for one retry, if request history was captured.
+        """
+        messages: list[ModelMessage] = history.messages
+        if not messages:
+            return None
+
+        before: int = estimate_token_count(messages)
+        try:
+            compacted: list[ModelMessage] = await force_summarize_history(
+                messages,
+                self._coder_context_window,
+                resolve_model(self._coder_model),
+                allow_subminimum=self._measured_context_window is not None,
+            )
+        except Exception:
+            logger.exception('Could not compact request history after tool retries were exhausted.')
+            return messages
+
+        after: int = estimate_token_count(compacted)
+        if after < before:
+            await self._report_compaction(CompactionRunPath.coder_streaming, before, after)
+        return compacted
+
+    async def _record_tool_retry_exhaustion(
+        self,
+        step: PlanStep | None,
+        position: int,
+    ) -> None:
+        """
+        Mark a persistently failing step incomplete and continue execution.
+
+        :param step: The failed step, or None when executing an unparsed plan.
+        :param position: The one-based position of the failed step.
+        """
+        description: str = (
+            f'Step {position}' if step is None else f'Step {position} ({step.title})'
+        )
+        await self._events.emit(
+            WarningEvent(
+                content=(
+                    f'{description} could not complete because a tool exhausted its retry budget even '
+                    'after Loom compacted the request and retried once. Continuing to the next step.'
+                )
+            )
+        )
+        if step is None:
+            return
+
+        self._session.record_step_completion(
+            f'{step.title} — incomplete because a tool exhausted its retry budget after one '
+            'compaction retry.'
+        )
 
     async def _warn_if_context_is_too_small(self) -> None:
         """
@@ -2175,6 +2272,16 @@ class AgentSession:
 
 
 
+
+
+def _looks_like_tool_retry_exhaustion(error: UnexpectedModelBehavior) -> bool:
+    """
+    Recognize a tool call that used all retries available to its agent.
+
+    :param error: The model-behavior error that interrupted a coder run.
+    :returns: True only for Pydantic AI's exhausted-tool-retry failure.
+    """
+    return 'exceeded max retries' in str(error).lower()
 
 
 def _read_chunk_lines(value: Any) -> int | None:

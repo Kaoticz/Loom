@@ -2122,6 +2122,28 @@ async def test_compaction_capabilities_put_proactive_pruning_before_the_ladder()
     assert type(getattr(capabilities[1], '_inner')).__name__ == 'TieredCompaction'
 
 
+async def test_all_agents_keep_five_tool_retries() -> None:
+    """
+    Graceful exhaustion recovery supplements, rather than reduces, agent retries.
+    """
+    from agents.adjudicator import adjudicator_agent
+    from agents.classifier import classifier_agent
+    from agents.coder import answering_agent, coder_agent
+    from agents.planner import planner_agent
+    from agents.reviewer import reviewer_agent
+
+    agents: tuple[object, ...] = (
+        coder_agent,
+        answering_agent,
+        classifier_agent,
+        reviewer_agent,
+        planner_agent,
+        adjudicator_agent,
+    )
+
+    assert all(getattr(agent, '_max_tool_retries') == 5 for agent in agents)
+
+
 async def test_a_too_small_measured_window_warns_once_before_any_agent_run() -> None:
     """
     A known-unworkable serving limit receives the existing human-facing warning.
