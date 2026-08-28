@@ -191,6 +191,67 @@ describe('message handling', () => {
         expect(latest(store).content).toBe('Edited a.py');
     });
 
+    it('removes tool messages after a successful step completion', async () => {
+        const { store, socket } = await connected();
+
+        socket.deliver({
+            type: 'thought',
+            content: 'I will make the change.',
+            stream_id: 'step:1'
+        });
+        socket.deliver({ type: 'action', tool_name: 'edit_file', arguments: { path: 'a.py' } });
+        socket.deliver({
+            type: 'observation',
+            tool_name: 'edit_file',
+            result: 'Edited a.py',
+            status: 'success'
+        });
+        socket.deliver({
+            type: 'action',
+            tool_name: 'complete_step',
+            arguments: { summary: 'Edited a.py' }
+        });
+        socket.deliver({
+            type: 'observation',
+            tool_name: 'complete_step',
+            result: 'Step marked complete.',
+            status: 'success'
+        });
+
+        expect(get(store).messages.map((message) => message.type)).toEqual(['thought']);
+    });
+
+    it('keeps tool messages when step completion is rejected', async () => {
+        const { store, socket } = await connected();
+
+        socket.deliver({ type: 'action', tool_name: 'edit_file', arguments: { path: 'a.py' } });
+        socket.deliver({
+            type: 'observation',
+            tool_name: 'complete_step',
+            result: 'complete_step was rejected.',
+            status: 'failure'
+        });
+
+        expect(get(store).messages.map((message) => message.type)).toEqual([
+            'action',
+            'observation'
+        ]);
+    });
+
+    it('clears tool messages after an investigative step completion', async () => {
+        const { store, socket } = await connected();
+
+        socket.deliver({ type: 'action', tool_name: 'read_file', arguments: { path: 'a.py' } });
+        socket.deliver({
+            type: 'observation',
+            tool_name: 'accept_step_without_changes',
+            result: 'Step marked complete with no file changes.',
+            status: 'success'
+        });
+
+        expect(get(store).messages).toHaveLength(0);
+    });
+
     it('shows a commit with a short hash', async () => {
         const { store, socket } = await connected();
 

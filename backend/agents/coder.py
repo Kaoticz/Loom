@@ -289,6 +289,17 @@ async def _search_code(ctx: RunContext[AgentDeps], query: str) -> CodeSearchOutc
     :param query: The natural language query.
     :returns: The rendered results, the files they came from, and any warnings.
     """
+    if not query.strip():
+        # Embedding an empty string raises, and there is nothing meaningful to
+        # search for anyway. Refuse with an explanation rather than let the
+        # exception abort the whole session.
+        return CodeSearchOutcome(
+            rendered='No query was given. Pass what you are looking for in plain '
+            'words, for example "where retries are configured".',
+            file_paths=[],
+            notices=[],
+        )
+
     embedding: list[float] = await ctx.deps.embedding.embed(query)
 
     sections: list[str] = []
@@ -418,6 +429,9 @@ async def get_symbol(ctx: RunContext[AgentDeps], symbol: str) -> str:
     :param symbol: The exact name of the function, class or method, without brackets or a module prefix.
     """
     async with report_tool(ctx.deps.events, 'get_symbol', {'symbol': symbol}) as report:
+        if not symbol.strip():
+            return report.fail('No symbol was given. Pass the exact name of the function, '
+                               'class or method to look up, for example "find_user".')
         found: list[SymbolDefinition] = await ctx.deps.search.get_symbol_definition(symbol)
 
         if not found:
@@ -496,10 +510,13 @@ async def create_file(
     """
     async with report_tool(ctx.deps.events, 'create_file', {'path': path}) as report:
         path = _repository_path(ctx, path)
+        if not path:
+            return report.fail('Could not create a file: no path was given. Pass a '
+                               'repository-relative path, for example "src/app.py".')
         original: str | None = await _read_base_version(ctx, path)
         try:
             await ctx.deps.editor.create_file(path, content)
-        except ValueError as error:
+        except (ValueError, OSError) as error:
             return report.fail(f'Could not create {path}: {error}')
 
         ctx.deps.session.record_modification(path)
@@ -530,10 +547,16 @@ async def edit_file(
     """
     async with report_tool(ctx.deps.events, 'edit_file', {'path': path}) as report:
         path = _repository_path(ctx, path)
+        if not path:
+            return report.fail('Could not edit a file: no path was given. Pass a '
+                               'repository-relative path, for example "src/app.py".')
+        if not search.strip():
+            return report.fail('Could not edit: a search block is required. Copy the exact '
+                               'text to replace from the file, character for character.')
         original: str | None = await _read_base_version(ctx, path)
         try:
             result: EditResult = await ctx.deps.editor.edit_file(path, search, replace)
-        except ValueError as error:
+        except (ValueError, OSError) as error:
             return report.fail(f'Could not edit {path}: {error}')
 
         if not result.success:
@@ -688,6 +711,10 @@ async def run_test_command(ctx: RunContext[AgentDeps], command: str) -> str:
     :param command: The shell command to run inside the sandbox, for example "pytest -q tests/".
     """
     async with report_tool(ctx.deps.events, 'run_test_command', {'command': command}) as report:
+        if not command.strip():
+            return report.fail('No command was given. Pass the test, build or lint command to '
+                               'run, for example "pytest -q tests/".')
+
         refusal: str | None = browser_automation_refusal(command)
         if refusal is not None:
             # Refused before reaching the sandbox rather than after: installing
@@ -785,6 +812,9 @@ async def web_search(ctx: RunContext[AgentDeps], query: str) -> str:
     :param query: What to search the web for, in plain words.
     """
     async with report_tool(ctx.deps.events, 'web_search', {'query': query}) as report:
+        if not query.strip():
+            return report.fail('No query was given. Pass what you want to search the web '
+                               'for, in plain words.')
         return report.succeed(await _web_search(query))
 
 
@@ -897,7 +927,10 @@ async def complete_task(ctx: RunContext[AgentDeps], summary: str) -> str:
                     'complete_task.'
                 )
 
-            recorded_answer: str = session.accept_completion_without_changes(summary)
+            try:
+                recorded_answer: str = session.accept_completion_without_changes(summary)
+            except ValueError as error:
+                return report.fail(f'complete_task was rejected: {error}')
             return report.succeed(f'Task marked complete with no file changes. Answer recorded: {recorded_answer}')
 
         try:

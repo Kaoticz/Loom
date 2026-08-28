@@ -2103,6 +2103,67 @@ async def test_a_measured_window_budgets_every_long_run_path() -> None:
     }
 
 
+async def test_the_classifier_and_reviewer_are_given_num_ctx(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """
+    Requirement: every Ollama run passes `num_ctx` so the model allocates its window.
+
+    The coder and planner already sent it. The classifier and the reviewer run
+    against the same serving model, so they must too, or those one-shot calls
+    fall back to Ollama's low default instead of the budget the session measured.
+    """
+    import agents.classifier as classifier_module
+    import agents.reviewer as reviewer_module
+    from agents.classifier import ClassificationResult
+    from agents.reviewer import ReviewResult
+
+    seen: dict[str, Any] = {'classifier': [], 'reviewer': []}
+
+    async def fake_classify(prompt: str, **kwargs: Any) -> Any:
+        """
+        Record the settings the classifier was asked to run with.
+
+        :param prompt: The classification prompt.
+        :param kwargs: The run keyword arguments.
+        :returns: A verdict requiring no changes.
+        """
+        seen['classifier'].append(kwargs.get('model_settings'))
+        result: Any = MagicMock()
+        result.output = ClassificationResult(changes_are_required=False, reason='Read-only answer.')
+        return result
+
+    async def fake_review(prompt: str, **kwargs: Any) -> Any:
+        """
+        Record the settings the reviewer was asked to run with.
+
+        :param prompt: The review prompt.
+        :param kwargs: The run keyword arguments.
+        :returns: An approving verdict.
+        """
+        seen['reviewer'].append(kwargs.get('model_settings'))
+        result: Any = MagicMock()
+        result.output = ReviewResult(approved=True, comments='Looks correct.')
+        return result
+
+    monkeypatch.setattr(classifier_module.classifier_agent, 'run', fake_classify)
+    monkeypatch.setattr(reviewer_module.reviewer_agent, 'run', fake_review)
+
+    session, _, _, _ = build_session([json.dumps({'prompt': 'do it'})])
+    session._coder_context_window = 8_192
+
+    await session._handle_classifying()
+
+    # The default FakeGit reports one changed file, so the reviewer actually runs.
+    assert await session._services.git.get_changed_files()
+
+    await session._handle_reviewing()
+
+    expected: dict[str, Any] = {'options': {'num_ctx': 8_192}}
+    assert seen['classifier'][0].get('extra_body') == expected
+    assert seen['reviewer'][0].get('extra_body') == expected
+
+
 async def test_auto_context_windows_use_a_larger_measurement() -> None:
     """
     An unset setting does not cap a measured model at Loom's generic default.

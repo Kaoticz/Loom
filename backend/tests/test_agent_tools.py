@@ -127,6 +127,27 @@ async def test_create_file_blocks_traversal(deps: AgentDeps) -> None:
     assert 'Could not create' in await invoke('create_file', deps, path='../escape.py', content='x')
 
 
+async def test_create_file_refuses_an_empty_path(deps: AgentDeps) -> None:
+    """
+    An empty path is refused with an explanation, never written to the root.
+    """
+    result: str = await invoke('create_file', deps, path='   ', content='x')
+
+    assert 'no path was given' in result
+    assert deps.session.modified_files == ()
+
+
+async def test_edit_file_refuses_an_empty_path_or_search(deps: AgentDeps) -> None:
+    """
+    An empty path or search block is refused rather than raising or misbehaving.
+    """
+    no_path: str = await invoke('edit_file', deps, path='  ', search='a', replace='b')
+    no_search: str = await invoke('edit_file', deps, path='m.py', search=' ', replace='b')
+
+    assert 'no path was given' in no_path
+    assert 'search block is required' in no_search
+
+
 async def test_read_file_variants(deps: AgentDeps) -> None:
     """
     Reading returns full content, numbered ranges, and clear errors.
@@ -168,6 +189,27 @@ async def test_run_test_command_reports_the_verdict(deps: AgentDeps) -> None:
     failing: str = await invoke('run_test_command', deps, command='pytest')
     assert 'FAILED with exit code 1' in failing
     assert deps.session.last_verification_passed is False
+
+
+@pytest.mark.parametrize('command', ['', '   '], ids=['empty', 'blank'])
+async def test_run_test_command_refuses_an_empty_command(deps: AgentDeps, command: str) -> None:
+    """
+    An empty command is refused without reaching the sandbox.
+    """
+    from services.docker_sandbox import CommandResult
+
+    ran: list[str] = []
+
+    async def record(value: str) -> CommandResult:
+        ran.append(value)
+        return CommandResult(exit_code=0, output='')
+
+    deps.docker.run_test_command = record  # type: ignore[method-assign]
+
+    result: str = await invoke('run_test_command', deps, command=command)
+
+    assert ran == [], 'the empty command should not have reached the sandbox'
+    assert 'No command was given' in result
 
 
 async def test_playwright_is_refused_before_reaching_the_sandbox(deps: AgentDeps) -> None:
@@ -474,6 +516,19 @@ async def test_web_search_failure_modes(
     assert expected in await invoke('web_search', deps, query='q')
 
 
+@pytest.mark.parametrize('query', ['', '   '], ids=['empty', 'blank'])
+async def test_web_search_refuses_an_empty_query(
+    deps: AgentDeps, monkeypatch: pytest.MonkeyPatch, query: str
+) -> None:
+    """
+    An empty query is refused without ever reaching SearXNG.
+    """
+    stub_searxng(monkeypatch, None, 200)
+    result: str = await invoke('web_search', deps, query=query)
+
+    assert 'No query was given' in result
+
+
 def collect(events: EventBus) -> list[AgentEvent]:
     """
     Subscribe a collector to the bus.
@@ -571,6 +626,25 @@ async def test_search_code_shows_paths_to_the_reader_and_code_to_the_agent(
     assert 'repo/users.py' in observation
     assert 'SECRET_MARKER' not in observation
     assert 'def find_user' not in observation
+
+
+@pytest.mark.usefixtures('db')
+@pytest.mark.parametrize('query', ['', '   '], ids=['empty', 'blank'])
+async def test_search_code_refuses_an_empty_query(
+    deps: AgentDeps, events: EventBus, query: str
+) -> None:
+    """
+    An empty semantic query is refused with an explanation, never embedded.
+
+    Embedding an empty string raises `EmbeddingError`; letting that escape would
+    abort the whole session instead of telling the agent what to fix.
+    """
+    returned, observation = await observation_for(
+        'search_code', deps, events, query=query
+    )
+
+    assert 'No query was given' in returned
+    assert 'No files matched' in observation
 
 
 @pytest.mark.usefixtures('db')
@@ -940,15 +1014,24 @@ async def test_the_ordinary_completion_gate_is_unchanged(deps: AgentDeps) -> Non
 
 
 async def test_an_empty_answer_is_refused_even_when_no_changes_were_needed(
-    deps: AgentDeps,
+    deps: AgentDeps, events: EventBus
 ) -> None:
     """
     A task that produced no answer has not been completed, whatever the verdict.
+
+    The refusal is reported back to the agent instead of being allowed to raise
+    and fail the session, the same way every tool failure is surfaced.
     """
     deps.session.record_classification(False)
+    seen: list[AgentEvent] = collect(events)
 
-    with pytest.raises(ValueError):
-        await invoke('complete_task', deps, summary='   ')
+    result: str = await invoke('complete_task', deps, summary='   ')
+
+    observations = [event for event in seen if isinstance(event, ToolObservationEvent)]
+    assert 'rejected' in result
+    assert 'summary is required' in result
+    assert len(observations) == 1
+    assert observations[0].status is ToolStatus.failure
 
 
 async def test_a_file_read_is_reported_as_one_line(
@@ -1075,6 +1158,16 @@ async def test_get_symbol_says_plainly_when_nothing_is_indexed(deps: AgentDeps) 
 
     assert 'No definition' in returned
     assert 'nowhere' in returned
+
+
+@pytest.mark.parametrize('symbol', ['', '   '], ids=['empty', 'blank'])
+async def test_get_symbol_refuses_an_empty_symbol(deps: AgentDeps, symbol: str) -> None:
+    """
+    An empty symbol is refused with an explanation rather than a lookup.
+    """
+    result: str = await invoke('get_symbol', deps, symbol=symbol)
+
+    assert 'No symbol was given' in result
 
 
 @pytest.mark.usefixtures('db')

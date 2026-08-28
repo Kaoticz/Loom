@@ -151,6 +151,9 @@ const MAX_VALIDATION_SLOTS = 5;
 const THOUGHT_TRUNCATION_NOTICE =
     '\n... (truncated: this run of reasoning grew too long to display in full)';
 
+/** Tools that confirm a plan step has finished successfully. */
+const STEP_COMPLETION_TOOLS = new Set(['complete_step', 'accept_step_without_changes']);
+
 /**
  * The values a WebSocket reports as its `readyState`, named.
  *
@@ -741,6 +744,21 @@ function createAgentStore() {
             // so it cannot go through the append path below either.
             if (data.type === 'thought') {
                 return applyThought(nextState, data);
+            }
+
+            if (
+                data.type === 'observation' &&
+                data.status === 'success' &&
+                STEP_COMPLETION_TOOLS.has(data.tool_name)
+            ) {
+                // A step summary carries the useful outcome forward; retaining its
+                // individual tool calls would only bury the next step's progress.
+                return {
+                    ...nextState,
+                    messages: state.messages.filter(
+                        (message) => message.type !== 'action' && message.type !== 'observation'
+                    )
+                };
             }
 
             // The question joins the feed and also becomes the state the

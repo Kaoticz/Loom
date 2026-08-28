@@ -1278,6 +1278,7 @@ class AgentSession:
             verdict: AgentRunResult[ClassificationResult] = await classifier_agent.run(
                 build_classification_prompt(self._task),
                 model=resolve_model(self._reviewer_model),
+                model_settings=self._model_settings_for(self._coder_context_window),
                 usage_limits=UsageLimits(request_limit=None),
             )
         except Exception as error:
@@ -2092,6 +2093,7 @@ class AgentSession:
                 self._task, changes, diffs, omitted=omitted, previous_feedback=previous
             ),
             model=resolve_model(self._reviewer_model),
+            model_settings=self._model_settings_for(self._coder_context_window),
             usage_limits=UsageLimits(request_limit=None),
         )
         self._last_review = review.output
