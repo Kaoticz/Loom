@@ -211,6 +211,7 @@ class DoneMessage(BaseAgentMessage):
     summary: Annotated[str, Field()]
     branch_name: Annotated[str, Field()] = ''
     total_commits: Annotated[int, Field(ge=0)] = 0
+    merged: Annotated[bool, Field()] = False
 
 
 class ErrorMessage(BaseAgentMessage):
@@ -387,6 +388,7 @@ def to_message(event: BaseAgentEvent) -> AgentMessage:
             summary=event.summary,
             branch_name=event.branch_name,
             total_commits=event.total_commits,
+            merged=event.merged,
         )
     if isinstance(event, ErrorEvent):
         return ErrorMessage(content=event.content)

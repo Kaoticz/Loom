@@ -321,17 +321,19 @@ def test_a_whole_session_runs_against_real_infrastructure(project: str) -> None:
             merged: list[dict[str, Any]] = drain(websocket, {'done', 'error'})
             assert merged[-1]['type'] == 'done'
             assert 'Merged' in merged[-1]['summary']
+            assert merged[-1]['merged'] is True
+            assert merged[-1]['total_commits'] == 1
 
     # The file really was written and committed on the real repository.
     assert (Path(project) / 'subtract.py').read_text().startswith('def subtract')
-    # The whole log, not --oneline: a step commits once, so what the agent said
-    # about an individual edit is in the commit body rather than the subject.
+    # The squashed result contains the generated subject, not the task branch's
+    # individual implementation commit message.
     log: str = subprocess.run(
         ['git', '-C', project, 'log'], capture_output=True, text=True
     ).stdout
-    assert 'add subtract helper' in log
-    # One commit for the step, not one per file written. The repository's own
-    # initial commit is not the agent's.
+    assert 'add subtract helper' not in log
+    # One squash commit contains all branch work. The repository's own initial
+    # commit is not part of the result.
     subjects: list[str] = [
         line
         for line in subprocess.run(
@@ -344,7 +346,7 @@ def test_a_whole_session_runs_against_real_infrastructure(project: str) -> None:
     branches: str = subprocess.run(
         ['git', '-C', project, 'branch'], capture_output=True, text=True
     ).stdout
-    assert 'ai-task-' in branches
+    assert 'ai-task-' not in branches
 
 
 @pytest.mark.usefixtures('integration_database', 'wired')

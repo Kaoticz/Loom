@@ -52,7 +52,7 @@ async def test_merge_returns_to_the_base_branch(tmp_path: Path) -> None:
     Path(root, 'feature.txt').write_text('new feature\n')
     await git.commit_changes('Add feature')
 
-    assert await git.merge_branch('ai-task-abc') == 'trunk'
+    assert await git.merge_branch('ai-task-abc', 'Add feature') == 'trunk'
     assert git.repo.active_branch.name == 'trunk'
     assert Path(root, 'feature.txt').exists()
 
@@ -66,7 +66,7 @@ async def test_explicit_merge_target_is_honoured(git_repo: GitManagerService) ->
     Path(root, 'x.txt').write_text('x\n')
     await git_repo.commit_changes('side work')
 
-    assert await git_repo.merge_branch('side', target_branch='main') == 'main'
+    assert await git_repo.merge_branch('side', 'Add side work', target_branch='main') == 'main'
 
 
 async def test_create_branch_checks_out_existing_branch(git_repo: GitManagerService) -> None:
@@ -243,4 +243,28 @@ async def test_merge_conflict_is_raised(git_repo: GitManagerService) -> None:
     await git_repo.commit_changes('Main edit')
 
     with pytest.raises(GitCommandError):
-        await git_repo.merge_branch('ai-task-abc')
+        await git_repo.merge_branch('ai-task-abc', 'Apply branch edit')
+
+
+async def test_squash_merge_creates_one_commit_and_deletes_the_task_branch(
+    git_repo: GitManagerService,
+) -> None:
+    '''
+    A squash merge applies every task change in one target-branch commit.
+    '''
+    root: str = git_repo.repo_path
+    await git_repo.create_branch('ai-task-abc')
+    for index in range(3):
+        Path(root, f'file_{index}.py').write_text(f'value = {index}\n')
+        await git_repo.commit_changes(f'Add file {index}')
+
+    subjects: list[str] = await git_repo.get_commit_subjects()
+    assert subjects == ['Add file 0', 'Add file 1', 'Add file 2']
+
+    assert await git_repo.merge_branch('ai-task-abc', 'Add task files') == 'main'
+    assert git_repo.repo.head.commit.message.strip() == 'Add task files'
+    assert int(git_repo.repo.git.rev_list('--count', 'main').strip()) == 2
+    assert await git_repo.delete_branch('ai-task-abc')
+    assert 'ai-task-abc' not in git_repo.repo.heads
+    assert not git_repo.repo.is_dirty(untracked_files=True)
+    assert all(Path(root, f'file_{index}.py').exists() for index in range(3))

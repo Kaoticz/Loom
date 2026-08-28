@@ -233,6 +233,7 @@ class DoneEvent(BaseAgentEvent):
     summary: Annotated[str, Field()]
     branch_name: Annotated[str, Field()] = ''
     total_commits: Annotated[int, Field(ge=0)] = 0
+    merged: Annotated[bool, Field()] = False
 
 
 class ErrorEvent(BaseAgentEvent):

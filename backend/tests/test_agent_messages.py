@@ -191,6 +191,16 @@ def test_messages_round_trip_over_the_wire(event: BaseAgentEvent) -> None:
     assert type(ADAPTER.validate_python(payload)) is type(to_message(event))
 
 
+def test_done_message_preserves_merged_state() -> None:
+    '''
+    A merge confirmation is explicitly marked on the wire.
+    '''
+    message = to_message(DoneEvent(summary='merged', merged=True))
+
+    assert isinstance(message, DoneMessage)
+    assert message.merged is True
+
+
 def test_unknown_message_type_is_rejected() -> None:
     """
     A payload with an unrecognised type fails validation.

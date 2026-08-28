@@ -88,7 +88,6 @@ export type TaskStatus =
     | 'executing'
     | 'answering'
     | 'reviewing'
-    | 'waiting_review_approval'
     | 're_working'
     | 'completed'
     | 'answered'
@@ -108,7 +107,7 @@ export type ConnectionState = 'connecting' | 'connected' | 'disconnected';
  */
 export type BlockedReason = 'another_tab' | 'stale' | null;
 
-export type ActionType = 'approve_plan' | 'approve_review' | 'approve_merge' | null;
+export type ActionType = 'approve_plan' | 'approve_merge' | null;
 
 /** A question the agent is waiting on an answer to. */
 export interface PendingQuestion {
@@ -277,7 +276,8 @@ const defaultConfig: AgentConfig = {
     theme: 'system'
 };
 
-const savedConfig = browser ? localStorage.getItem('loom_config') : null;
+const savedConfig =
+    browser && typeof localStorage !== 'undefined' ? localStorage.getItem('loom_config') : null;
 const initialState: AgentState = {
     messages: [],
     status: 'idle',
@@ -806,10 +806,6 @@ function createAgentStore() {
                     if (data.approved) {
                         nextState.requiresAction = false;
                         nextState.actionType = null;
-                    } else {
-                        nextState.status = 'waiting_review_approval';
-                        nextState.requiresAction = true;
-                        nextState.actionType = 'approve_review';
                     }
                     break;
                 case 'done':
@@ -823,10 +819,7 @@ function createAgentStore() {
                         nextState.actionType = null;
                         break;
                     }
-                    // The backend sends 'done' twice: once when the reviewer has
-                    // approved and the merge decision is pending, and again once
-                    // the merge has happened.
-                    if (state.actionType === 'approve_merge') {
+                    if (data.merged) {
                         nextState.status = 'merged';
                         nextState.requiresAction = false;
                         nextState.actionType = null;
@@ -884,7 +877,7 @@ function createAgentStore() {
                     config.repoPath !== undefined && config.repoPath !== state.config.repoPath;
                 const nextConfig = { ...state.config, ...config };
 
-                if (browser) {
+                if (browser && typeof localStorage !== 'undefined') {
                     // Secrets are omitted rather than blanked. Omission is enforced
                     // at this single point; a blanking transform would have to be
                     // repeated correctly at every future write site.

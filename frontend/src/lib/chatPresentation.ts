@@ -72,11 +72,6 @@ export const actionLabels: Record<string, { title: string; approve: string; reje
         approve: 'Approve Plan',
         reject: 'Reject & Replan'
     },
-    approve_review: {
-        title: 'The reviewer asked for changes.',
-        approve: 'Accept Anyway',
-        reject: 'Send Back for Rework'
-    },
     approve_merge: {
         title: 'The work is complete.',
         approve: 'Merge into Main',
@@ -149,7 +144,7 @@ export function isWorking(status: TaskStatus): boolean {
  * @returns True when a typed prompt may be sent.
  */
 export function canSendPrompt(status: TaskStatus, pendingAction: string | null): boolean {
-    return !isWorking(status) && pendingAction === null;
+    return status !== 'merged' && !isWorking(status) && pendingAction === null;
 }
 
 /**
@@ -198,6 +193,9 @@ export function promptPlaceholder(
     }
     if (isWorking(status)) {
         return 'Write the next task while the agent works...';
+    }
+    if (status === 'merged') {
+        return 'Reload the page to start another task.';
     }
     return 'Describe a task for the agent...';
 }

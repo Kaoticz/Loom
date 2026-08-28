@@ -29,7 +29,7 @@ describe('ChatInput', () => {
         }
     );
 
-    it.each(['waiting_approval', 'waiting_review_approval', 'completed', 'failed'] as const)(
+    it.each(['waiting_approval', 'completed', 'failed'] as const)(
         'offers Send while %s, since the agent is not working',
         (status) => {
             renderInput(status);
@@ -192,10 +192,10 @@ describe('ChatInput enablement', () => {
         expect(screen.getByRole('button', { name: 'Send Message' })).toBeDisabled();
     });
 
-    it('withholds sending for a review decision too', () => {
-        renderPending('waiting_review_approval', 'approve_review');
+    it('disables the input after a merge', () => {
+        renderPending('merged', null);
 
-        expect(screen.getByRole('textbox')).toBeEnabled();
+        expect(screen.getByRole('textbox')).toBeDisabled();
         expect(screen.getByRole('button', { name: 'Send Message' })).toBeDisabled();
     });
 });

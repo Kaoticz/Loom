@@ -17,7 +17,6 @@ function renderPanel(actionType: string, reason: string = '') {
 function rejectButton(actionType: string): HTMLElement {
     const labels: Record<string, string> = {
         approve_plan: 'Reject & Replan',
-        approve_review: 'Send Back for Rework',
         approve_merge: 'Reject & Continue'
     };
     return screen.getByRole('button', { name: labels[actionType] });
@@ -106,7 +105,7 @@ describe('ApprovalPanel', () => {
         expect(onreject).not.toHaveBeenCalled();
     });
 
-    it.each(['approve_plan', 'approve_review', 'approve_merge'])(
+    it.each(['approve_plan', 'approve_merge'])(
         'marks reject unavailable for %s while nothing is composed',
         (actionType) => {
             // Requirement 3.4: all three decisions send the text as feedback,
@@ -117,7 +116,7 @@ describe('ApprovalPanel', () => {
         }
     );
 
-    it.each(['approve_plan', 'approve_review', 'approve_merge'])(
+    it.each(['approve_plan', 'approve_merge'])(
         'makes reject available for %s as soon as a reason is typed',
         (actionType) => {
             renderPanel(actionType, 'not good enough');

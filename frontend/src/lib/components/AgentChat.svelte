@@ -63,6 +63,7 @@
         messages={$agentStore.messages}
         blocked={$agentStore.blocked}
         actionType={pendingAction}
+        status={$agentStore.status}
         reason={promptText}
         onapprove={approve}
         onreject={reject}

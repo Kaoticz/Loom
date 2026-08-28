@@ -85,7 +85,8 @@ const doneMessageSchema = z.object({
     type: z.literal('done'),
     summary: z.string(),
     branch_name: z.string().default(''),
-    total_commits: z.number().int().nonnegative().default(0)
+    total_commits: z.number().int().nonnegative().default(0),
+    merged: z.boolean().default(false)
 });
 
 /**

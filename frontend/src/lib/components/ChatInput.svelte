@@ -60,6 +60,7 @@
             bind:value={prompt}
             onkeydown={handleKeydown}
             {placeholder}
+            disabled={status === 'merged'}
             aria-label="Task prompt"
             class="h-20 flex-1 resize-none bg-transparent p-2 text-sm outline-none dark:text-white"
         ></textarea>

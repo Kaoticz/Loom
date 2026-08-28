@@ -73,14 +73,14 @@ describe('chat presentation', () => {
 });
 
 describe('formatMessageTime', () => {
-    const at = new Date('2026-03-04T14:32:07Z');
+    const at = new Date(2026, 2, 4, 14, 32, 7);
 
     it('shows hours and minutes, not seconds', () => {
         expect(formatMessageTime(at, 'en-GB')).toBe('14:32');
     });
 
     it('pads a single digit hour', () => {
-        expect(formatMessageTime(new Date('2026-03-04T09:05:00Z'), 'en-GB')).toBe('09:05');
+        expect(formatMessageTime(new Date(2026, 2, 4, 9, 5), 'en-GB')).toBe('09:05');
     });
 
     it('follows the locale it is given', () => {
@@ -88,7 +88,7 @@ describe('formatMessageTime', () => {
     });
 
     it('crosses midnight without wrapping to 24', () => {
-        expect(formatMessageTime(new Date('2026-03-04T00:01:00Z'), 'en-GB')).toBe('00:01');
+        expect(formatMessageTime(new Date(2026, 2, 4, 0, 1), 'en-GB')).toBe('00:01');
     });
 });
 
@@ -131,7 +131,6 @@ describe('isWorking', () => {
     it.each([
         'idle',
         'waiting_approval',
-        'waiting_review_approval',
         'completed',
         // The answer has been given and the session is over, so a new task can
         // be typed straight away.
@@ -162,7 +161,6 @@ describe('canSendPrompt', () => {
 
     it('withholds sending while any decision is outstanding', () => {
         expect(canSendPrompt('waiting_approval', 'approve_plan')).toBe(false);
-        expect(canSendPrompt('waiting_review_approval', 'approve_review')).toBe(false);
         expect(canSendPrompt('completed', 'approve_merge')).toBe(false);
     });
 
@@ -174,6 +172,10 @@ describe('canSendPrompt', () => {
         expect(canSendPrompt('completed', null)).toBe(true);
         expect(canSendPrompt('failed', null)).toBe(true);
         expect(canSendPrompt('cancelled', null)).toBe(true);
+    });
+
+    it('withholds sending after a merge', () => {
+        expect(canSendPrompt('merged', null)).toBe(false);
     });
 });
 
@@ -196,6 +198,10 @@ describe('promptPlaceholder', () => {
             expect(promptPlaceholder(status, null).length).toBeGreaterThan(0);
         }
     });
+
+    it('tells the reader to reload after a merge', () => {
+        expect(promptPlaceholder('merged', null)).toMatch(/reload/i);
+    });
 });
 
 describe('isWorking after a stop', () => {
@@ -214,7 +220,7 @@ describe('canSendPrompt', () => {
         }
     );
 
-    it.each(['approve_plan', 'approve_review', 'approve_merge'] as const)(
+    it.each(['approve_plan', 'approve_merge'] as const)(
         'withholds sending while %s is outstanding',
         (action) => {
             // The session is waiting to be told approve or reject, not handed
@@ -251,7 +257,7 @@ describe('promptPlaceholder', () => {
     it('prefers the decision wording over the working wording', () => {
         // Both can be true at once; the outstanding decision is the more useful
         // thing to say.
-        expect(promptPlaceholder('reviewing', 'approve_review')).toMatch(/reason/i);
+        expect(promptPlaceholder('reviewing', 'approve_merge')).toMatch(/reason/i);
     });
 });
 

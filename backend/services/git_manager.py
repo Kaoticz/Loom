@@ -348,12 +348,33 @@ class GitManagerService:
             output: str = str(self.repo.git.rev_list('--count', f'{base}..HEAD'))
             return int(output.strip() or 0)
         return await asyncio.to_thread(_count)
-        
-    async def merge_branch(self, branch_name: str, target_branch: str | None = None) -> str:
+
+    async def get_commit_subjects(self, base_branch: str | None = None) -> list[str]:
+        '''
+        List the task branch's commit subjects.
+
+        :param base_branch: The branch to compare against. Defaults to the recorded base.
+        :returns: Commit subjects in chronological order.
+        '''
+        base: str = base_branch or self._base_branch or self.default_branch
+
+        def _subjects() -> list[str]:
+            output: str = str(self.repo.git.log('--format=%s', '--reverse', f'{base}..HEAD'))
+            return [subject for subject in output.splitlines() if subject.strip()]
+
+        return await asyncio.to_thread(_subjects)
+
+    async def merge_branch(
+        self,
+        branch_name: str,
+        commit_message: str,
+        target_branch: str | None = None,
+    ) -> str:
         """
-        Merge the given branch into the repository's default branch.
+        Squash the given branch into one commit on its target branch.
 
         :param branch_name: The name of the branch to merge.
+        :param commit_message: Subject for the resulting squash commit.
         :param target_branch: The branch to merge into. Defaults to the branch the task was cut from, then to the repository's default branch.
         :returns: The name of the branch that was merged into.
         :raises RuntimeError: If the repository has no branches to merge into.
@@ -362,6 +383,24 @@ class GitManagerService:
         def _merge() -> str:
             target: str = target_branch or self._base_branch or self.default_branch
             self.repo.heads[target].checkout()
-            self.repo.git.merge(branch_name)
+            self.repo.git.merge('--squash', branch_name)
+            self.repo.git.commit('-m', commit_message)
             return target
         return await asyncio.to_thread(_merge)
+
+    async def delete_branch(self, branch_name: str) -> bool:
+        '''
+        Delete a task branch after its changes have been squash-merged.
+
+        :param branch_name: The branch to delete.
+        :returns: True when the branch was deleted, otherwise False.
+        '''
+        def _delete() -> bool:
+            try:
+                self.repo.git.branch('-D', branch_name)
+            except GitCommandError as error:
+                logger.warning('Could not delete task branch %s after merge: %s', branch_name, error)
+                return False
+            return True
+
+        return await asyncio.to_thread(_delete)

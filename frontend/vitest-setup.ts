@@ -2,6 +2,34 @@ import '@testing-library/jest-dom/vitest';
 import { cleanup } from '@testing-library/svelte';
 import { afterEach } from 'vitest';
 
+// Node 26 exposes an unavailable storage global unless it is given a backing
+// file. Tests need ordinary browser storage semantics, not that process-level
+// opt-in, so provide the small in-memory implementation jsdom would normally.
+if (typeof localStorage === 'undefined') {
+    const values = new Map<string, string>();
+    const storage: Storage = {
+        get length(): number {
+            return values.size;
+        },
+        clear(): void {
+            values.clear();
+        },
+        getItem(key: string): string | null {
+            return values.get(key) ?? null;
+        },
+        key(index: number): string | null {
+            return [...values.keys()][index] ?? null;
+        },
+        removeItem(key: string): void {
+            values.delete(key);
+        },
+        setItem(key: string, value: string): void {
+            values.set(key, value);
+        }
+    };
+    Object.defineProperty(globalThis, 'localStorage', { configurable: true, value: storage });
+}
+
 // jsdom implements no scrolling methods, so a component that calls one throws
 // rather than quietly doing nothing. This gives every element the smallest
 // honest implementation: it moves the element, with no animation, which is as

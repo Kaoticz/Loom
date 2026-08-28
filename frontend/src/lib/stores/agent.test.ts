@@ -298,14 +298,14 @@ describe('message handling', () => {
         expect(get(store).messages).toHaveLength(0);
     });
 
-    it('requests rework when the reviewer rejects', async () => {
+    it('shows a rejected review without arming an approval action', async () => {
         const { store, socket } = await connected();
 
         socket.deliver({ type: 'review', approved: false, comments: 'Needs a guard clause.' });
 
         const state = get(store);
-        expect(state.status).toBe('waiting_review_approval');
-        expect(state.actionType).toBe('approve_review');
+        expect(state.requiresAction).toBe(false);
+        expect(state.actionType).toBeNull();
         expect(latest(store).content).toBe('Needs a guard clause.');
     });
 
@@ -325,7 +325,8 @@ describe('message handling', () => {
             type: 'done',
             summary: 'Merged ai-task-1 into main.',
             branch_name: 'ai-task-1',
-            total_commits: 2
+            total_commits: 1,
+            merged: true
         });
         expect(get(store).status).toBe('merged');
         expect(get(store).requiresAction).toBe(false);

@@ -204,7 +204,7 @@ async def test_run_test_command_refuses_an_empty_command(deps: AgentDeps, comman
         ran.append(value)
         return CommandResult(exit_code=0, output='')
 
-    deps.docker.run_test_command = record  # type: ignore[method-assign]
+    setattr(deps.docker, 'run_test_command', record)
 
     result: str = await invoke('run_test_command', deps, command=command)
 

@@ -9,6 +9,7 @@ from agents.classifier import (
     build_classification_prompt,
 )
 from agents.coder import CODER_SYSTEM_PROMPT, AgentDeps, answering_agent, coder_agent
+from agents.commit_message import commit_message_agent
 from agents.reviewer import ReviewResult, reviewer_agent
 from fastapi import WebSocket
 from pydantic_ai import Agent, RunContext, UsageLimits
@@ -236,6 +237,7 @@ class AgentSession:
     _context_window_probe_completed: bool
     _context_window_warning_emitted: bool
     _context_window_probe: Callable[[str], Awaitable[int | None]]
+    _commit_message_generator: Callable[[str], Awaitable[str]]
 
     def __init__(
         self,
@@ -250,6 +252,7 @@ class AgentSession:
         limits: IterationLimits,
         connection_lost: Event | None = None,
         context_window_probe: Callable[[str], Awaitable[int | None]] | None = None,
+        commit_message_generator: Callable[[str], Awaitable[str]] | None = None,
     ) -> None:
         """
         Create a session driver.
@@ -265,6 +268,7 @@ class AgentSession:
         :param limits: The iteration ceilings to enforce.
         :param connection_lost: Set when the client can no longer be reached.
         :param context_window_probe: Optional source for serving-model context limits.
+        :param commit_message_generator: Optional generator for a squash commit subject.
         """
         self._websocket = websocket
         self._inbox = SessionInbox(websocket.receive_text, on_stop=self._interrupt_work)
@@ -287,6 +291,11 @@ class AgentSession:
             context_window_probe
             if context_window_probe is not None
             else measure_ollama_context_window
+        )
+        self._commit_message_generator = (
+            commit_message_generator
+            if commit_message_generator is not None
+            else self._generate_commit_message
         )
 
         self._task = ''
@@ -2172,8 +2181,9 @@ class AgentSession:
         """
         await self._announce(f'Merging {self._branch_name}...', SessionStatus.merging)
 
+        commit_message: str = await self._squash_commit_message()
         try:
-            target: str = await self._services.git.merge_branch(self._branch_name)
+            target: str = await self._services.git.merge_branch(self._branch_name, commit_message)
         except Exception as error:
             await self._events.emit(
                 ErrorEvent(
@@ -2185,15 +2195,83 @@ class AgentSession:
             )
             return SessionState.failed
 
+        _ = await self._services.git.delete_branch(self._branch_name)
         await self._record_status(TaskStatus.merged)
         await self._events.emit(
             DoneEvent(
                 summary=f'Merged {self._branch_name} into {target}.',
                 branch_name=self._branch_name,
-                total_commits=await self._services.git.count_commits(target)
+                total_commits=1,
+                merged=True,
             )
         )
         return SessionState.merged
+
+    async def _squash_commit_message(self) -> str:
+        '''
+        Generate a squash commit subject, falling back to the task prompt.
+
+        :returns: A non-empty commit subject.
+        '''
+        try:
+            subjects: list[str] = await self._services.git.get_commit_subjects()
+            prompt: str = self._commit_message_prompt(subjects)
+            message: str = (await self._commit_message_generator(prompt)).strip()
+        except Exception as error:
+            logger.warning('Could not generate squash commit message: %s', error)
+            message = ''
+
+        if message:
+            subject: str = message.splitlines()[0].strip().strip('"`')
+            if len(subject) > 2 and subject[0].isdigit() and subject[1] in '.)':
+                subject = subject[2:].lstrip()
+            subject = subject.rstrip('.')
+            if subject:
+                return subject
+
+        fallback: str = self._task.splitlines()[0].strip()[:72]
+        await self._events.emit(
+            WarningEvent(
+                content=(
+                    'The commit message could not be generated; the squashed commit will use '
+                    'the task prompt instead.'
+                )
+            )
+        )
+        return fallback
+
+    def _commit_message_prompt(self, subjects: list[str]) -> str:
+        '''
+        Build the compact context for the commit-message agent.
+
+        :param subjects: Commit subjects written on the task branch.
+        :returns: The prompt supplied to the commit-message agent.
+        '''
+        feedback: list[str] = [
+            turn.content
+            for turn in self._history.turns
+            if turn.role is TurnRole.user and turn.content != self._task
+        ]
+        return (
+            f'Original task:\n{self._task}\n\n'
+            f'User feedback:\n{chr(10).join(feedback) or "(none)"}\n\n'
+            f'Task branch commit subjects:\n{chr(10).join(subjects) or "(none)"}'
+        )
+
+    async def _generate_commit_message(self, prompt: str) -> str:
+        '''
+        Ask the dedicated agent to write a squash commit subject.
+
+        :param prompt: The task and feedback context for the agent.
+        :returns: The agent's proposed commit subject.
+        '''
+        result: AgentRunResult[str] = await commit_message_agent.run(
+            prompt,
+            model=resolve_model(self._coder_model),
+            model_settings=self._model_settings_for(self._coder_context_window),
+            usage_limits=UsageLimits(request_limit=None),
+        )
+        return result.output
 
     async def _record_rejection(self, stage: str, reason: str) -> None:
         """

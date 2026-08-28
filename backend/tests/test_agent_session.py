@@ -88,6 +88,8 @@ class FakeGit:
     repo_path: str
     created_branches: list[str]
     merged: list[str]
+    merge_messages: list[str]
+    deleted_branches: list[str]
     changes: list[FileChange]
     merge_error: Exception | None
     dirty: bool
@@ -101,6 +103,8 @@ class FakeGit:
         self.repo_path = '/tmp/repo'
         self.created_branches = []
         self.merged = []
+        self.merge_messages = []
+        self.deleted_branches = []
         self.changes = changes if changes is not None else [
             FileChange(path='a.py', insertions=3, deletions=1)
         ]
@@ -160,11 +164,26 @@ class FakeGit:
         """
         return 3
 
-    async def merge_branch(self, branch_name: str, target_branch: str | None = None) -> str:
+    async def get_commit_subjects(self, base_branch: str | None = None) -> list[str]:
+        '''
+        Return the task branch's commit subjects.
+
+        :param base_branch: Ignored.
+        :returns: The fixed fake commit subjects.
+        '''
+        return ['Add a.py', 'Test a.py']
+
+    async def merge_branch(
+        self,
+        branch_name: str,
+        commit_message: str,
+        target_branch: str | None = None,
+    ) -> str:
         """
         Record a merge, or raise if the test configured a failure.
 
         :param branch_name: The branch to merge.
+        :param commit_message: The squash commit subject.
         :param target_branch: Ignored.
         :returns: The branch merged into.
         :raises Exception: If a merge error was configured.
@@ -172,7 +191,18 @@ class FakeGit:
         if self.merge_error is not None:
             raise self.merge_error
         self.merged.append(branch_name)
+        self.merge_messages.append(commit_message)
         return 'main'
+
+    async def delete_branch(self, branch_name: str) -> bool:
+        '''
+        Record task-branch deletion.
+
+        :param branch_name: The branch to delete.
+        :returns: Always True.
+        '''
+        self.deleted_branches.append(branch_name)
+        return True
 
 
 class FakeIndexing:
@@ -313,6 +343,15 @@ def build_session(
 
     events.subscribe(collect)
 
+    async def generated_commit_message(prompt: str) -> str:
+        '''
+        Supply a deterministic squash subject in session tests.
+
+        :param prompt: The task context supplied to the message agent.
+        :returns: The generated commit subject.
+        '''
+        return 'Add a timeout'
+
     context: SessionContext = SessionContext()
     deps: AgentDeps = AgentDeps(
         docker=DockerSandboxManager(repo_path='/tmp/repo'),
@@ -336,6 +375,7 @@ def build_session(
         machine=SessionStateMachine(),
         limits=limits or IterationLimits(),
         context_window_probe=no_context_window_measurement,
+        commit_message_generator=generated_commit_message,
     )
     return session, socket, captured, services
 
@@ -473,11 +513,45 @@ async def test_happy_path_reaches_merged(monkeypatch: pytest.MonkeyPatch) -> Non
     assert await session.run() is SessionState.merged
     assert services.git.created_branches == ['ai-task-testsess']
     assert services.git.merged == ['ai-task-testsess']
+    assert services.git.merge_messages == ['Add a timeout']
+    assert services.git.deleted_branches == ['ai-task-testsess']
 
     kinds: list[str] = types_of(events)
     assert MessageType.plan.value in kinds
     assert MessageType.review.value in kinds
     assert kinds.count(MessageType.done.value) == 2
+
+
+async def test_merge_falls_back_to_the_task_prompt_when_message_generation_fails(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    '''
+    A failed message agent does not prevent the reviewed work from merging.
+    '''
+    stub_agents(monkeypatch, ['1. Do the thing'], [(True, 'Looks correct.')])
+    session, _, events, services = build_session([
+        opening('Add a timeout\nwith retries'),
+        json.dumps({'approved': True}),
+        json.dumps({'approved': True}),
+    ])
+
+    async def fail_message_generation(prompt: str) -> str:
+        '''
+        Simulate an unavailable commit-message model.
+
+        :param prompt: The context the unavailable model would have received.
+        :returns: Never returns because generation fails.
+        :raises RuntimeError: Always, to exercise the fallback.
+        '''
+        raise RuntimeError('model unavailable')
+
+    session._commit_message_generator = fail_message_generation
+
+    assert await session.run() is SessionState.merged
+    assert services.git.merge_messages == ['Add a timeout']
+    warnings: list[WarningEvent] = [event for event in events if isinstance(event, WarningEvent)]
+    assert len(warnings) == 1
+    assert 'commit message could not be generated' in warnings[0].content
 
 
 async def test_rejected_plan_is_replanned_with_the_reason(

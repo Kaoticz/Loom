@@ -1,5 +1,5 @@
 import { describe, expect, it } from 'vitest';
-import { render } from '@testing-library/svelte';
+import { render, screen } from '@testing-library/svelte';
 import { tick } from 'svelte';
 import ChatFeed from './ChatFeed.svelte';
 import type { Message } from '$lib/stores/agent';
@@ -212,5 +212,25 @@ describe('ChatFeed scroll following', () => {
 
         expect(feed.rendered.getByText('message 0')).toBeInTheDocument();
         expect(feed.rendered.getByText('message 4')).toBeInTheDocument();
+    });
+});
+
+describe('ChatFeed terminal state', () => {
+    it('shows the no-button merged notice instead of an approval panel', () => {
+        render(ChatFeed, {
+            messages: [],
+            status: 'merged',
+            onapprove: () => {},
+            onreject: () => {},
+            onretry: () => {},
+            onanswer: () => {},
+            onfreereply: () => {}
+        });
+
+        expect(
+            screen.getByText('The task is done. Reload the page to start another task.')
+        ).toBeInTheDocument();
+        expect(screen.queryByText('The work is complete.')).not.toBeInTheDocument();
+        expect(screen.queryByRole('button')).not.toBeInTheDocument();
     });
 });

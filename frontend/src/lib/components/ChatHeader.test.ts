@@ -10,9 +10,9 @@ describe('ChatHeader', () => {
     });
 
     it('reports the session status in words rather than identifiers', () => {
-        render(ChatHeader, { connection: 'connected', status: 'waiting_review_approval' });
+        render(ChatHeader, { connection: 'connected', status: 'waiting_approval' });
 
-        expect(screen.getByText('waiting review approval')).toBeInTheDocument();
+        expect(screen.getByText('waiting approval')).toBeInTheDocument();
     });
 
     it('distinguishes the connection states visually', () => {
