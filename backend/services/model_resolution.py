@@ -8,7 +8,7 @@ from pydantic_ai.models.openai import OpenAIChatModel, OpenAIChatModelSettings
 
 from services.compaction import resolve_context_window
 from pydantic_ai.providers.openai import OpenAIProvider
-from services.ollama_model_metadata import context_length_from_model_info
+from services.ollama_model_metadata import context_length_from_model_info, num_ctx_from_parameters
 
 OLLAMA_BASE_URL: str = 'http://ollama:11434'
 MODEL_METADATA_TIMEOUT_SECONDS: float = 2.0
@@ -86,6 +86,10 @@ async def measure_ollama_context_window(
         return None
     if not isinstance(payload, dict):
         return None
+
+    override: int | None = num_ctx_from_parameters(payload.get('parameters'))
+    if override is not None:
+        return override
 
     model_info: Any = payload.get('model_info')
     if not isinstance(model_info, dict):

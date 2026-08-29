@@ -129,6 +129,48 @@ async def test_the_ollama_context_window_probe_preserves_the_model_tag() -> None
     await client.aclose()
 
 
+async def test_the_ollama_context_window_probe_prefers_a_modelfile_override() -> None:
+    """
+    An explicit Modelfile context limit takes precedence over architecture capacity.
+    """
+    client: AsyncClient = AsyncClient(transport=MockTransport(
+        lambda request: Response(
+            200,
+            json={
+                'parameters': 'temperature 0.7\nnum_ctx 8192',
+                'model_info': {
+                    'general.architecture': 'llama',
+                    'llama.context_length': 131_072,
+                },
+            },
+        )
+    ))
+
+    assert await measure_ollama_context_window('ollama:llama3', client=client) == 8192
+    await client.aclose()
+
+
+async def test_malformed_modelfile_context_limit_falls_back_to_architecture_metadata() -> None:
+    """
+    A bad override does not discard the existing architecture-based measurement.
+    """
+    client: AsyncClient = AsyncClient(transport=MockTransport(
+        lambda request: Response(
+            200,
+            json={
+                'parameters': 'num_ctx too-large',
+                'model_info': {
+                    'general.architecture': 'llama',
+                    'llama.context_length': 131_072,
+                },
+            },
+        )
+    ))
+
+    assert await measure_ollama_context_window('ollama:llama3', client=client) == 131_072
+    await client.aclose()
+
+
 async def test_a_non_ollama_model_is_never_probed() -> None:
     """
     Foreign providers keep their existing no-request behavior.
