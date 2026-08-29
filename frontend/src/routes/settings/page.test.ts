@@ -5,6 +5,7 @@ import Settings from './+page.svelte';
 import { agentStore } from '$lib/stores/agent';
 import { DEFAULT_CHUNK_LINES, MAX_CHUNK_LINES, MIN_CHUNK_LINES } from '$lib/chunkSize';
 import { DEFAULT_CONTEXT_WINDOW, MAX_CONTEXT_WINDOW, MIN_CONTEXT_WINDOW } from '$lib/contextWindow';
+import type { ContextWindowDetection } from '$lib/schemas';
 
 vi.mock('$app/environment', () => ({ browser: true }));
 vi.mock('$app/navigation', () => ({ goto: vi.fn() }));
@@ -19,11 +20,20 @@ vi.mock('$app/navigation', () => ({ goto: vi.fn() }));
  */
 
 /** Reply to the endpoints the settings page calls on mount. */
-function respondWith(description: unknown, models: string[] = ['nomic-embed-text']) {
+function respondWith(
+    description: unknown,
+    contextWindow: ContextWindowDetection = { context_window: 8192, status: 'detected' },
+    models: string[] = ['nomic-embed-text']
+) {
     vi.stubGlobal(
         'fetch',
         vi.fn(async (url: string) => {
-            const body = String(url).includes('/description') ? description : models;
+            const target = String(url);
+            const body = target.includes('/description')
+                ? description
+                : target.includes('/context-window')
+                  ? contextWindow
+                  : models;
             return { ok: true, json: async () => body } as unknown as Response;
         })
     );
@@ -32,7 +42,12 @@ function respondWith(description: unknown, models: string[] = ['nomic-embed-text
 beforeEach(() => {
     localStorage.clear();
     respondWith({ dimensions: 768, context_length: 2048 });
-    agentStore.updateConfig({ chunkLines: null });
+    agentStore.updateConfig({
+        chunkLines: null,
+        coderModel: 'ollama:nomic-embed-text',
+        coderContextWindow: null,
+        plannerContextWindow: null
+    });
 });
 
 /** Render the settings page and let its mount-time requests settle. */
@@ -169,6 +184,12 @@ describe('removing indexed data', () => {
                         json: async () => ({ dimensions: 768, context_length: 2048 })
                     } as unknown as Response;
                 }
+                if (target.includes('/context-window')) {
+                    return {
+                        ok: true,
+                        json: async () => ({ context_window: 8192, status: 'detected' })
+                    } as unknown as Response;
+                }
                 return { ok: true, json: async () => ['nomic-embed-text'] } as unknown as Response;
             })
         );
@@ -302,6 +323,12 @@ describe('removing indexed data', () => {
                         json: async () => ({ dimensions: 768, context_length: 2048 })
                     } as unknown as Response;
                 }
+                if (target.includes('/context-window')) {
+                    return {
+                        ok: true,
+                        json: async () => ({ context_window: 8192, status: 'detected' })
+                    } as unknown as Response;
+                }
                 return { ok: true, json: async () => ['nomic-embed-text'] } as unknown as Response;
             })
         );
@@ -355,7 +382,7 @@ describe('context window controls', () => {
         // meaning automatic.
         const box = screen.getByLabelText('Coder Context Window') as HTMLInputElement;
         expect(box).toBeEnabled();
-        expect(box.value).toBe(String(DEFAULT_CONTEXT_WINDOW));
+        expect(box.value).toBe('8192');
     });
 
     it('budgets the two agents independently', async () => {
@@ -391,5 +418,148 @@ describe('context window controls', () => {
         await fireEvent.click(auto);
 
         expect(screen.getByLabelText('Coder Context Window')).toBeDisabled();
+    });
+
+    it('displays the detected value for both Auto fields', async () => {
+        await renderSettings();
+
+        await waitFor(() => {
+            expect(screen.getByLabelText('Coder Context Window')).toHaveValue(8192);
+            expect(screen.getByLabelText('Planner Context Window')).toHaveValue(8192);
+        });
+    });
+
+    it('displays an architecture fallback without a detection warning', async () => {
+        respondWith(
+            { dimensions: 768, context_length: 2048 },
+            { context_window: 131072, status: 'detected' }
+        );
+
+        await renderSettings();
+
+        await waitFor(() =>
+            expect(screen.getByLabelText('Coder Context Window')).toHaveValue(131072)
+        );
+        expect(screen.queryByTestId('context-window-detection-error')).not.toBeInTheDocument();
+    });
+
+    it('shows a failure note and the default when detection fails', async () => {
+        respondWith(
+            { dimensions: 768, context_length: 2048 },
+            { context_window: null, status: 'failed' }
+        );
+
+        await renderSettings();
+
+        expect(await screen.findByTestId('context-window-detection-error')).toHaveTextContent(
+            /could not detect/i
+        );
+        expect(screen.getByLabelText('Coder Context Window')).toHaveValue(DEFAULT_CONTEXT_WINDOW);
+    });
+
+    it('does not probe or warn for a non-Ollama model', async () => {
+        const fetchMock = vi.fn(async (url: string) => {
+            const target = String(url);
+            if (target.includes('/context-window')) {
+                throw new Error('Context-window detection should not be requested');
+            }
+            if (target.includes('/description')) {
+                return {
+                    ok: true,
+                    json: async () => ({ dimensions: 768, context_length: 2048 })
+                } as unknown as Response;
+            }
+            return { ok: true, json: async () => ['nomic-embed-text'] } as unknown as Response;
+        });
+        vi.stubGlobal('fetch', fetchMock);
+        agentStore.updateConfig({ coderModel: 'openai:gpt-4o' });
+
+        await renderSettings();
+
+        expect(screen.getByLabelText('Coder Context Window')).toHaveValue(DEFAULT_CONTEXT_WINDOW);
+        expect(screen.queryByTestId('context-window-detection-error')).not.toBeInTheDocument();
+        expect(fetchMock.mock.calls.some(([url]) => String(url).includes('/context-window'))).toBe(
+            false
+        );
+    });
+
+    it('keeps the newest model detection when an earlier request resolves late', async () => {
+        const pending = new Map<string, (response: Response) => void>();
+        vi.stubGlobal(
+            'fetch',
+            vi.fn(async (url: string) => {
+                const target = String(url);
+                if (target.includes('/context-window')) {
+                    const model = new URL(target).searchParams.get('model');
+                    return new Promise<Response>((resolve) => {
+                        if (model) pending.set(model, resolve);
+                    });
+                }
+                if (target.includes('/description')) {
+                    return {
+                        ok: true,
+                        json: async () => ({ dimensions: 768, context_length: 2048 })
+                    } as unknown as Response;
+                }
+                if (target.includes('/index/status')) {
+                    return {
+                        ok: true,
+                        json: async () => ({
+                            project: '/repos/mine',
+                            indexed_files: 0,
+                            can_delete: false,
+                            blocked_reason: 'Nothing is indexed for this project yet.'
+                        })
+                    } as unknown as Response;
+                }
+                return { ok: true, json: async () => ['first', 'second'] } as unknown as Response;
+            })
+        );
+        agentStore.updateConfig({ coderModel: 'ollama:first' });
+
+        await renderSettings();
+        await waitFor(() => expect(pending.has('ollama:first')).toBe(true));
+        await fireEvent.change(screen.getByLabelText('Coder Model'), {
+            target: { value: 'ollama:second' }
+        });
+        await waitFor(() => expect(pending.has('ollama:second')).toBe(true));
+
+        pending.get('ollama:second')?.({
+            ok: true,
+            json: async () => ({ context_window: 131072, status: 'detected' })
+        } as unknown as Response);
+        await waitFor(() =>
+            expect(screen.getByLabelText('Coder Context Window')).toHaveValue(131072)
+        );
+        pending.get('ollama:first')?.({
+            ok: true,
+            json: async () => ({ context_window: 4096, status: 'detected' })
+        } as unknown as Response);
+        await tick();
+
+        expect(screen.getByLabelText('Coder Context Window')).toHaveValue(131072);
+    });
+
+    it('re-seeds each manual field from detection every time Auto is unchecked', async () => {
+        await renderSettings();
+        await waitFor(() =>
+            expect(screen.getByLabelText('Coder Context Window')).toHaveValue(8192)
+        );
+
+        for (const name of ['Automatic coder context window', 'Automatic planner context window']) {
+            const auto = screen.getByRole('checkbox', { name });
+            const label = name.includes('coder')
+                ? 'Coder Context Window'
+                : 'Planner Context Window';
+            const box = screen.getByLabelText(label) as HTMLInputElement;
+
+            await fireEvent.click(auto);
+            expect(box).toHaveValue(8192);
+            await fireEvent.input(box, { target: { value: '4096' } });
+            expect(box).toHaveValue(4096);
+            await fireEvent.click(auto);
+            await fireEvent.click(auto);
+            expect(box).toHaveValue(8192);
+        }
     });
 });

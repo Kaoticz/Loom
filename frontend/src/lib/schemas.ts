@@ -310,6 +310,17 @@ export const modelDescriptionSchema = z.object({
 
 export type ModelDescription = z.infer<typeof modelDescriptionSchema>;
 
+/** The result states returned by the context-window detection endpoint. */
+export const contextWindowDetectionStatusSchema = z.enum(['detected', 'failed', 'not_applicable']);
+
+/** The usable context-window value, if the selected model has one. */
+export const contextWindowDetectionSchema = z.object({
+    context_window: z.number().int().positive().nullable(),
+    status: contextWindowDetectionStatusSchema
+});
+
+export type ContextWindowDetection = z.infer<typeof contextWindowDetectionSchema>;
+
 /** The verdict on whether a path is a usable git repository. */
 export const repoValidationSchema = z.object({
     valid: z.boolean()

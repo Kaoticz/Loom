@@ -25,7 +25,8 @@
         repoValidationSchema,
         SchemaValidationError
     } from '$lib/schemas';
-    import type { IndexStatus, ModelDescription } from '$lib/schemas';
+    import type { ContextWindowDetection, IndexStatus, ModelDescription } from '$lib/schemas';
+    import { fetchContextWindowDetection } from '$lib/contextWindowDetection';
 
     const THEMES: Theme[] = ['light', 'dark', 'system'];
 
@@ -67,6 +68,45 @@
     let config = $state({ ...$agentStore.config });
 
     const apiBase = import.meta.env.VITE_API_BASE_URL || 'http://localhost:8000';
+    let contextWindowDetection: ContextWindowDetection | null = $state(null);
+    let contextWindowDetectionRequest = 0;
+
+    const automaticContextWindow = $derived.by(() => {
+        const detection = contextWindowDetection;
+        if (detection?.status !== 'detected' || detection.context_window === null) {
+            return DEFAULT_CONTEXT_WINDOW;
+        }
+        return detection.context_window;
+    });
+
+    /**
+     * Fetch the selected coder model's context-window setting.
+     *
+     * The request token makes a slower response for a previous selection unable
+     * to replace the value for the model currently displayed.
+     */
+    async function detectContextWindow(model: string): Promise<void> {
+        const request = ++contextWindowDetectionRequest;
+        if (!model.startsWith('ollama:')) {
+            contextWindowDetection = { context_window: null, status: 'not_applicable' };
+            return;
+        }
+
+        contextWindowDetection = null;
+        try {
+            const detection = await fetchContextWindowDetection(apiBase, { model });
+            if (request !== contextWindowDetectionRequest) return;
+            contextWindowDetection = detection;
+        } catch (error) {
+            if (request !== contextWindowDetectionRequest) return;
+            console.error('Failed to detect the context window', error);
+            contextWindowDetection = { context_window: null, status: 'failed' };
+        }
+    }
+
+    $effect(() => {
+        void detectContextWindow(config.coderModel);
+    });
 
     // --- Indexed data ----------------------------------------------------
 
@@ -355,7 +395,7 @@
                                     onchange={(event) => {
                                         config.coderContextWindow = event.currentTarget.checked
                                             ? null
-                                            : DEFAULT_CONTEXT_WINDOW;
+                                            : automaticContextWindow;
                                     }}
                                 />
                                 Auto
@@ -367,7 +407,7 @@
                                 max={MAX_CONTEXT_WINDOW}
                                 step="1024"
                                 disabled={config.coderContextWindow === null}
-                                value={config.coderContextWindow ?? DEFAULT_CONTEXT_WINDOW}
+                                value={config.coderContextWindow ?? automaticContextWindow}
                                 oninput={(event) => {
                                     config.coderContextWindow = readContextWindow(
                                         event.currentTarget.value
@@ -398,7 +438,7 @@
                                     onchange={(event) => {
                                         config.plannerContextWindow = event.currentTarget.checked
                                             ? null
-                                            : DEFAULT_CONTEXT_WINDOW;
+                                            : automaticContextWindow;
                                     }}
                                 />
                                 Auto
@@ -410,7 +450,7 @@
                                 max={MAX_CONTEXT_WINDOW}
                                 step="1024"
                                 disabled={config.plannerContextWindow === null}
-                                value={config.plannerContextWindow ?? DEFAULT_CONTEXT_WINDOW}
+                                value={config.plannerContextWindow ?? automaticContextWindow}
                                 oninput={(event) => {
                                     config.plannerContextWindow = readContextWindow(
                                         event.currentTarget.value
@@ -420,6 +460,24 @@
                             />
                             <span class="text-xs text-gray-500 dark:text-gray-400">tokens</span>
                         </div>
+                    </div>
+                    <div class="sm:col-span-2">
+                        {#if contextWindowDetection === null}
+                            <p
+                                data-testid="context-window-detection-loading"
+                                class="text-xs text-gray-500 dark:text-gray-400"
+                            >
+                                Detecting the selected model's context window...
+                            </p>
+                        {:else if contextWindowDetection.status === 'failed'}
+                            <p
+                                data-testid="context-window-detection-error"
+                                class="rounded border border-amber-200 bg-amber-50 px-3 py-2 text-xs text-amber-700 dark:border-amber-800 dark:bg-amber-900/20 dark:text-amber-300"
+                            >
+                                Could not detect the selected model's context window. Showing the
+                                default of {DEFAULT_CONTEXT_WINDOW} tokens.
+                            </p>
+                        {/if}
                     </div>
                     <div>
                         <label

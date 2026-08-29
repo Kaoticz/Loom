@@ -1,6 +1,7 @@
 import { describe, expect, it } from 'vitest';
 import {
     agentMessageSchema,
+    contextWindowDetectionSchema,
     directoryListingSchema,
     ollamaModelsSchema,
     parseResponse,
@@ -40,6 +41,29 @@ describe('parseResponse', () => {
         const list = parseResponse(taskListSchema, { total: 0, offset: 0, limit: 20 }, 'task list');
 
         expect(list.items).toEqual([]);
+    });
+});
+
+describe('context-window detection shape', () => {
+    it('accepts a successful model context-window measurement', () => {
+        const detection = parseResponse(
+            contextWindowDetectionSchema,
+            { context_window: 8192, status: 'detected' },
+            'context window detection'
+        );
+
+        expect(detection.context_window).toBe(8192);
+        expect(detection.status).toBe('detected');
+    });
+
+    it('rejects an unknown detection status', () => {
+        expect(() =>
+            parseResponse(
+                contextWindowDetectionSchema,
+                { context_window: null, status: 'unavailable' },
+                'context window detection'
+            )
+        ).toThrow(SchemaValidationError);
     });
 });
 
