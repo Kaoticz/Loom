@@ -2279,9 +2279,9 @@ async def test_auto_context_windows_use_a_larger_measurement() -> None:
     assert session._planner_context_window == 131_072
 
 
-async def test_compaction_capabilities_put_proactive_pruning_before_the_ladder() -> None:
+async def test_compaction_capabilities_include_only_the_ladder() -> None:
     """
-    Every long-running path evaluates the eager cap before reactive compaction.
+    Long-running paths have no eager, message-count-based pruning capability.
     """
     from pydantic_ai.capabilities import AbstractCapability
     from services.compaction import ObservedCompaction
@@ -2292,10 +2292,9 @@ async def test_compaction_capabilities_put_proactive_pruning_before_the_ladder()
         32_768, CompactionRunPath.coder_streaming
     )
 
-    assert len(capabilities) == 2
-    assert all(isinstance(capability, ObservedCompaction) for capability in capabilities)
-    assert type(getattr(capabilities[0], '_inner')).__name__ == 'ClearToolResults'
-    assert type(getattr(capabilities[1], '_inner')).__name__ == 'TieredCompaction'
+    assert len(capabilities) == 1
+    assert isinstance(capabilities[0], ObservedCompaction)
+    assert type(getattr(capabilities[0], '_inner')).__name__ == 'TieredCompaction'
 
 
 async def test_all_agents_keep_five_tool_retries() -> None:

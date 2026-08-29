@@ -1,14 +1,22 @@
 from __future__ import annotations
 
 from collections.abc import Awaitable, Callable
+from dataclasses import dataclass, replace
 from logging import Logger, getLogger
 from typing import TYPE_CHECKING, Any, overload, override
 
 from pydantic_ai.capabilities import AbstractCapability
-from pydantic_ai.messages import ModelMessage, ToolCallPart
+from pydantic_ai.messages import (
+    ModelMessage,
+    ModelRequest,
+    ModelRequestPart,
+    ModelResponse,
+    ModelResponsePart,
+    ToolCallPart,
+    ToolReturnPart,
+)
 from pydantic_ai_harness.compaction import (
     ClampOversizedMessages,
-    ClearToolResults,
     ContextUsage,
     DeduplicateFileReads,
     ReportContextUsage,
@@ -99,24 +107,6 @@ How many recent messages the summarizing and sliding tiers keep verbatim.
 The tail is where the agent is working. Summarising or discarding it would take
 away the step it is part way through, which is the one part of the history it
 cannot do without.
-"""
-
-EAGER_TOOL_RESULT_MAX_MESSAGES: int = 20
-"""
-The whole-message threshold for proactive tool-result clearing.
-
-`ClearToolResults` can count messages but not tool pairs. Twenty represents ten
-ideal call/result pairs, so the capability starts trimming as soon as activity
-has plausibly grown beyond the retained window. Non-tool messages can make it
-fire earlier; the precise result after it fires is still the latest ten pairs.
-"""
-
-EAGER_KEEP_RECENT_TOOL_PAIRS: int = 10
-"""
-How many recent tool call/result pairs proactive clearing leaves intact.
-
-Ten pairs preserve a generous working cycle of reads, edits, test runs and
-follow-up inspection on every request, independent of token estimation.
 """
 
 CLAMP_KEEP_HEAD_CHARS: int = 2_000
@@ -370,6 +360,75 @@ class RequestHistoryCapture(AbstractCapability[Any]):
         return request_context
 
 
+@dataclass
+class SummarizeAndStripToolMessages(AbstractCapability[Any]):
+    """
+    Summarize history and then remove replaceable tool messages in one tier.
+
+    The enclosing `TieredCompaction` calls this tier only after the history is
+    above its target. The tool-part strip lives inside `compact`, rather than as
+    a later tier, so it always follows a summary even when that summary alone
+    brings the history back below the target.
+
+    :param summarizer: The strategy that summarizes the older portion of history.
+    :param exclude_tools: Tool names whose call/result parts remain intact.
+    """
+
+    summarizer: SummarizingCompaction[Any]
+    exclude_tools: frozenset[str]
+
+    def with_focus(self, focus: str) -> SummarizeAndStripToolMessages:
+        """
+        Prioritize focus in the summary without changing stripping behavior.
+
+        :param focus: The topic the summary must preserve.
+        :returns: An equivalent combined tier whose summary receives the focus.
+        """
+        return replace(self, summarizer=self.summarizer.with_focus(focus))
+
+    async def compact(
+        self,
+        messages: list[ModelMessage],
+        ctx: RunContext[Any],
+    ) -> list[ModelMessage]:
+        """
+        Summarize history and unconditionally remove nonessential tool parts.
+
+        :param messages: The history that exceeded the enclosing ladder's target.
+        :param ctx: The running model context used by the summarizer.
+        :returns: The summarized history with replaceable tool parts removed.
+        """
+        summarized: list[ModelMessage] = await self.summarizer.compact(messages, ctx)
+        stripped: list[ModelMessage] = []
+        for message in summarized:
+            if isinstance(message, ModelRequest):
+                parts: list[ModelRequestPart] = [
+                    part for part in message.parts if not self._is_replaceable_tool_part(part)
+                ]
+                if parts:
+                    stripped.append(replace(message, parts=parts))
+                continue
+
+            response_parts: list[ModelResponsePart] = [
+                part for part in message.parts if not self._is_replaceable_tool_part(part)
+            ]
+            if response_parts:
+                stripped.append(replace(message, parts=response_parts))
+        return stripped
+
+    def _is_replaceable_tool_part(self, part: ModelRequestPart | ModelResponsePart) -> bool:
+        """
+        Identify a tool part that can be removed from the working history.
+
+        :param part: One request or response message part.
+        :returns: True when the part belongs to a nonessential tool.
+        """
+        return (
+            isinstance(part, (ToolCallPart, ToolReturnPart))
+            and part.tool_name not in self.exclude_tools
+        )
+
+
 def build_forced_summarization(
     context_window: int | None,
     *,
@@ -418,55 +477,6 @@ async def force_summarize_history(
 
 
 @overload
-def build_proactive_tool_pruning(
-    context_window: int | None,
-    *,
-    allow_subminimum: bool = False,
-    on_compaction: None = None,
-) -> ClearToolResults[Any]: ...
-
-
-@overload
-def build_proactive_tool_pruning(
-    context_window: int | None,
-    *,
-    allow_subminimum: bool = False,
-    on_compaction: Callable[[int, int], Awaitable[None]],
-) -> ObservedCompaction: ...
-
-
-def build_proactive_tool_pruning(
-    context_window: int | None,
-    *,
-    allow_subminimum: bool = False,
-    on_compaction: Callable[[int, int], Awaitable[None]] | None = None,
-) -> ClearToolResults[Any] | ObservedCompaction:
-    """
-    Build the estimate-independent tool-result cap for one agent run.
-
-    Registered outside the tiered ladder, where its own message-count trigger is
-    honoured on every request. `context_window` is accepted to share the same
-    builder shape as the other per-run capabilities; this trigger deliberately
-    does not use it, token counts, or fractions.
-
-    :param context_window: The configured or measured window, unused by this trigger.
-    :param allow_subminimum: Kept for the shared per-run builder interface.
-    :param on_compaction: Receives estimates whenever the cap shortens a request.
-    :returns: The proactive clearing capability, optionally wrapped for reporting.
-    """
-    _ = context_window
-    _ = allow_subminimum
-    pruning: ClearToolResults[Any] = ClearToolResults(
-        max_messages=EAGER_TOOL_RESULT_MAX_MESSAGES,
-        keep_pairs=EAGER_KEEP_RECENT_TOOL_PAIRS,
-        exclude_tools=IRRECOVERABLE_TOOLS,
-    )
-    if on_compaction is None:
-        return pruning
-    return ObservedCompaction(pruning, on_compaction)
-
-
-@overload
 def build_compaction(
     context_window: int | None,
     *,
@@ -499,12 +509,10 @@ def build_compaction(
        so dropping it costs nothing at all.
     2. `ClampOversizedMessages` — one runaway result can cause the overrun by
        itself, and trimming it alone may be enough.
-    3. `ClearToolResults` — tool output dominates an agent's history, and the
-       agent can re-run a tool if it needs the data again. This is the tier that
-       does the real work in a long ReAct loop.
-    4. `SummarizingCompaction` — compresses rather than discards, at the cost of
-       a real model call, so it sits behind the free tiers.
-    5. `SlidingWindowCompaction` — a hard floor. If summarizing still cannot
+    3. `SummarizeAndStripToolMessages` — compresses older history with a real
+       model call, then discards all replaceable tool calls and results in the
+       same tier.
+    4. `SlidingWindowCompaction` — a hard floor. If summarizing and stripping still cannot
        bring the history under target, the oldest turns go, with the first user
        message kept so the task itself is never lost.
 
@@ -528,19 +536,16 @@ def build_compaction(
                 keep_head_chars=CLAMP_KEEP_HEAD_CHARS,
                 keep_tail_chars=CLAMP_KEEP_TAIL_CHARS,
             ),
-            ClearToolResults(
-                max_fraction=TARGET_FRACTION,
-                context_window=window,
-                keep_pairs=0,
+            SummarizeAndStripToolMessages(
+                summarizer=SummarizingCompaction(
+                    max_fraction=TARGET_FRACTION,
+                    context_window=window,
+                    keep_messages=KEEP_RECENT_MESSAGES,
+                    # Inherits the running agent's model, so a summary is written by
+                    # whatever the user configured rather than by a second choice.
+                    model=None,
+                ),
                 exclude_tools=IRRECOVERABLE_TOOLS,
-            ),
-            SummarizingCompaction(
-                max_fraction=TARGET_FRACTION,
-                context_window=window,
-                keep_messages=KEEP_RECENT_MESSAGES,
-                # Inherits the running agent's model, so a summary is written by
-                # whatever the user configured rather than by a second choice.
-                model=None,
             ),
             SlidingWindowCompaction(
                 max_fraction=TARGET_FRACTION,

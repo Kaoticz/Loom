@@ -16,7 +16,6 @@ from pydantic_ai.models.function import AgentInfo, FunctionModel
 from pydantic_ai.usage import RunUsage
 from pydantic_ai_harness.compaction import (
     ClampOversizedMessages,
-    ClearToolResults,
     DeduplicateFileReads,
     SlidingWindowCompaction,
     SummarizingCompaction,
@@ -25,17 +24,16 @@ from pydantic_ai_harness.compaction import (
 )
 
 from services.compaction import (
-    EAGER_KEEP_RECENT_TOOL_PAIRS,
-    EAGER_TOOL_RESULT_MAX_MESSAGES,
-    IRRECOVERABLE_TOOLS,
     DEFAULT_CONTEXT_WINDOW,
+    IRRECOVERABLE_TOOLS,
+    KEEP_RECENT_MESSAGES,
     MINIMUM_CONTEXT_WINDOW,
     RequestHistoryCapture,
+    SummarizeAndStripToolMessages,
     TARGET_FRACTION,
     ObservedCompaction,
     build_compaction,
     build_forced_summarization,
-    build_proactive_tool_pruning,
     read_file_key,
     resolve_context_window,
 )
@@ -187,35 +185,35 @@ def test_the_tiers_run_cheapest_first() -> None:
     """
     Order is the point of the tiering: stop as soon as the history fits.
 
-    Dropping a superseded file read costs nothing, clamping one huge result
-    costs a little, and blanking old tool results costs the most, so they are
-    attempted in that order.
+    Deduplicating a superseded file read costs nothing, clamping one huge result
+    costs a little, and summary-plus-stripping runs only when both are insufficient.
     """
     compaction: TieredCompaction[Any] = build_compaction(None)
 
     assert [type(tier).__name__ for tier in compaction.tiers] == [
         DeduplicateFileReads.__name__,
         ClampOversizedMessages.__name__,
-        ClearToolResults.__name__,
-        SummarizingCompaction.__name__,
+        SummarizeAndStripToolMessages.__name__,
         SlidingWindowCompaction.__name__,
     ]
 
 
 def test_the_expensive_tiers_sit_behind_the_free_ones() -> None:
     """
-    Summarizing costs a real model call, so everything free is tried first.
+    Summarizing costs a real model call, so both free tiers are tried first.
 
     It is present rather than omitted: a long ReAct loop eventually exceeds what
-    blanking and deduplication can reclaim, and compressing old context beats
-    discarding it. The sliding window sits behind even that, as the floor which
-    guarantees the history comes under target however the earlier tiers fare.
+    deduplication can reclaim, and compressing old context beats discarding it.
+    The sliding window sits behind even that, as the floor which guarantees the
+    history comes under target however the earlier tiers fare.
     """
     tiers: list[str] = [type(tier).__name__ for tier in build_compaction(None).tiers]
 
-    assert tiers.index(SummarizingCompaction.__name__) > tiers.index(ClearToolResults.__name__)
+    assert tiers.index(SummarizeAndStripToolMessages.__name__) > tiers.index(
+        ClampOversizedMessages.__name__
+    )
     assert tiers.index(SlidingWindowCompaction.__name__) > tiers.index(
-        SummarizingCompaction.__name__
+        SummarizeAndStripToolMessages.__name__
     )
 
 
@@ -253,25 +251,17 @@ def test_clamping_keeps_both_ends_of_a_message() -> None:
     assert clamp.keep_tail_chars > 0
 
 
-def test_reactive_clearing_purges_every_tool_result() -> None:
+def test_the_combined_tier_uses_the_existing_summary_configuration() -> None:
     """
-    The ladder is the last resort after proactive pruning has retained its tail.
+    The combined tier retains ordinary summary behavior before stripping tools.
     """
-    clear: Any = build_compaction(None).tiers[2]
+    combined: Any = build_compaction(None).tiers[2]
 
-    assert clear.keep_pairs == 0
-
-
-def test_proactive_clearing_keeps_a_generous_recent_tool_window() -> None:
-    """
-    The standalone cap starts near ten pairs and retains exactly that many.
-    """
-    pruning: ClearToolResults[Any] = build_proactive_tool_pruning(None)
-
-    assert pruning.max_messages == EAGER_TOOL_RESULT_MAX_MESSAGES
-    assert pruning.keep_pairs == EAGER_KEEP_RECENT_TOOL_PAIRS
-    assert pruning.max_tokens is None
-    assert pruning.max_fraction is None
+    assert isinstance(combined, SummarizeAndStripToolMessages)
+    assert combined.summarizer.max_fraction == TARGET_FRACTION
+    assert combined.summarizer.keep_messages == KEEP_RECENT_MESSAGES
+    assert combined.summarizer.model is None
+    assert combined.exclude_tools == IRRECOVERABLE_TOOLS
 
 
 def history_with_file_reads(repeats: int, body: str) -> list[ModelMessage]:
@@ -288,6 +278,36 @@ def history_with_file_reads(repeats: int, body: str) -> list[ModelMessage]:
             ModelResponse(parts=[ToolCallPart(
                 tool_name='read_file',
                 args={'path': 'src/main.py'},
+                tool_call_id=f'call-{index}',
+            )])
+        )
+        messages.append(
+            ModelRequest(parts=[ToolReturnPart(
+                tool_name='read_file',
+                content=body,
+                tool_call_id=f'call-{index}',
+            )])
+        )
+    return messages
+
+
+def history_with_unique_file_reads(
+    repeats: int, body: str, *, start: int = 0
+) -> list[ModelMessage]:
+    """
+    Build a history of distinct file reads that deduplication cannot reclaim.
+
+    :param repeats: How many different files to read.
+    :param body: The contents each read returned.
+    :param start: The first file and tool-call index to use.
+    :returns: The synthetic message history.
+    """
+    messages: list[ModelMessage] = []
+    for index in range(start, start + repeats):
+        messages.append(
+            ModelResponse(parts=[ToolCallPart(
+                tool_name='read_file',
+                args={'path': f'src/file{index}.py'},
                 tool_call_id=f'call-{index}',
             )])
         )
@@ -319,6 +339,29 @@ def quiet_model() -> FunctionModel:
     """
 
     async def call(messages: list[ModelMessage], info: AgentInfo) -> ModelResponse:
+        return ModelResponse(parts=[TextPart('Done.')])
+
+    return FunctionModel(call)
+
+
+def recording_model(calls: list[list[ModelMessage]]) -> FunctionModel:
+    """
+    Build a model that records each summary request.
+
+    :param calls: The collection receiving every summary request history.
+    :returns: A model that records and answers summary requests.
+    """
+
+    async def call(messages: list[ModelMessage], info: AgentInfo) -> ModelResponse:
+        """
+        Record one summary request and return a short replacement summary.
+
+        :param messages: The summary request history.
+        :param info: The model invocation metadata, unused by this stand-in.
+        :returns: A minimal summary response.
+        """
+        _ = info
+        calls.append(list(messages))
         return ModelResponse(parts=[TextPart('Done.')])
 
     return FunctionModel(call)
@@ -464,115 +507,142 @@ async def test_a_history_under_budget_is_left_alone() -> None:
     """
     Compaction that fires when it is not needed is just data loss.
     """
-    messages: list[ModelMessage] = history_with_file_reads(2, 'x' * 100)
+    messages: list[ModelMessage] = history_with_unique_file_reads(12, 'x' * 100)
     compaction: TieredCompaction[Any] = build_compaction(1_000_000)
 
-    result: list[ModelMessage] = await compaction.compact(messages, run_context(quiet_model()))
+    first: list[ModelMessage] = await compaction.compact(messages, run_context(quiet_model()))
+    result: list[ModelMessage] = await compaction.compact(first, run_context(quiet_model()))
 
     assert result == messages
 
 
-async def test_proactive_pruning_runs_under_the_reactive_token_budget() -> None:
+async def test_summarizing_and_stripping_removes_tool_parts_from_the_verbatim_tail() -> None:
     """
-    More than ten pairs are trimmed even when the estimate is far under budget.
+    Tool parts are stripped after a summary even when that summary fits the target.
     """
-    body: str = 'file contents'
-    messages: list[ModelMessage] = history_with_file_reads(12, body)
-    pruning: ClearToolResults[Any] = build_proactive_tool_pruning(1_000_000)
-    context: ModelRequestContext = request_context(messages)
-
-    assert estimate_token_count(messages) < int(1_000_000 * TARGET_FRACTION)
-    result: ModelRequestContext = await pruning.before_model_request(
-        run_context(quiet_model()), context
+    window: int = 2_048
+    body: str = 'x' * 450
+    answer: str = 'Use exponential backoff with a 30s cap.'
+    messages: list[ModelMessage] = history_with_unique_file_reads(14, body)
+    messages.extend([
+        ModelResponse(parts=[ToolCallPart(
+            tool_name='ask_user',
+            args={'question': 'Which retry policy?'},
+            tool_call_id='ask-1',
+        )]),
+        ModelRequest(parts=[ToolReturnPart(
+            tool_name='ask_user',
+            content=answer,
+            tool_call_id='ask-1',
+        )]),
+    ])
+    summarizer: SummarizingCompaction[Any] = SummarizingCompaction(
+        max_fraction=TARGET_FRACTION,
+        context_window=window,
+        keep_messages=KEEP_RECENT_MESSAGES,
+        model=None,
     )
-    returns: list[str] = [
-        str(part.content)
-        for message in result.messages
+    summarized: list[ModelMessage] = await summarizer.compact(messages, run_context(quiet_model()))
+    calls: list[list[ModelMessage]] = []
+    result: list[ModelMessage] = await build_compaction(window).compact(
+        messages, run_context(recording_model(calls))
+    )
+    tool_parts: list[ToolCallPart | ToolReturnPart] = [
+        part
+        for message in result
         for part in message.parts
-        if isinstance(part, ToolReturnPart)
+        if isinstance(part, (ToolCallPart, ToolReturnPart))
     ]
 
-    assert returns[:2] == ['[tool result cleared]', '[tool result cleared]']
-    assert returns[2:] == [body] * EAGER_KEEP_RECENT_TOOL_PAIRS
-
-
-async def test_proactive_pruning_preserves_old_user_answers() -> None:
-    """
-    A protected `ask_user` result survives even outside the recent pair window.
-    """
-    answer: str = 'Use exponential backoff with a 30s cap.'
-    messages: list[ModelMessage] = history_with_an_answer(12, 'file contents', answer)
-    pruning: ClearToolResults[Any] = build_proactive_tool_pruning(None)
-
-    result: ModelRequestContext = await pruning.before_model_request(
-        run_context(quiet_model()), request_context(messages)
+    assert estimate_token_count(messages) > int(window * TARGET_FRACTION)
+    assert estimate_token_count(summarized) <= int(window * TARGET_FRACTION)
+    assert any(
+        isinstance(part, (ToolCallPart, ToolReturnPart)) and part.tool_name == 'read_file'
+        for message in summarized
+        for part in message.parts
     )
-    answers: list[str] = [
-        str(part.content)
-        for message in result.messages
+    assert len(calls) == 1
+    assert tool_parts
+    assert all(part.tool_name == 'ask_user' for part in tool_parts)
+    assert [
+        part.content
+        for message in result
         for part in message.parts
         if isinstance(part, ToolReturnPart) and part.tool_name == 'ask_user'
-    ]
-
-    assert answers == [answer]
+    ] == [answer]
 
 
-async def test_reactive_purge_follows_proactive_pruning_when_the_tail_is_too_large() -> None:
+async def test_deduplication_can_avoid_summary_and_tool_stripping() -> None:
     """
-    The ladder clears every remaining result when its target still is not met.
+    Deduplicating repeated reads below target skips the combined tier entirely.
     """
-    body: str = 'x' * 10_000
-    messages: list[ModelMessage] = history_with_file_reads(12, body)
-    reports: list[tuple[int, int]] = []
-
-    async def report(before: int, after: int) -> None:
-        """
-        Capture one observed compaction reduction.
-
-        :param before: Estimated tokens before compaction.
-        :param after: Estimated tokens after compaction.
-        """
-        reports.append((before, after))
-
-    proactive: ObservedCompaction = build_proactive_tool_pruning(2_048, on_compaction=report)
-    ladder: ObservedCompaction = build_compaction(2_048, on_compaction=report)
-    context: ModelRequestContext = request_context(messages)
-
-    context = await proactive.before_model_request(run_context(quiet_model()), context)
-    result: ModelRequestContext = await ladder.before_model_request(run_context(quiet_model()), context)
+    body: str = 'x' * 800
+    messages: list[ModelMessage] = history_with_file_reads(20, body)
+    calls: list[list[ModelMessage]] = []
+    result: list[ModelMessage] = await build_compaction(2_048).compact(
+        messages, run_context(recording_model(calls))
+    )
     returns: list[str] = [
         str(part.content)
-        for message in result.messages
+        for message in result
         for part in message.parts
         if isinstance(part, ToolReturnPart)
     ]
 
-    assert body not in returns
-    assert returns == ['[tool result cleared]'] * 12
-    assert len(reports) == 2
+    assert calls == []
+    assert returns.count(body) == 1
 
 
-async def test_deduplication_still_reclaims_superseded_reads_after_proactive_pruning() -> None:
+async def test_sliding_window_remains_the_fallback_after_summarizing_and_stripping() -> None:
     """
-    The reactive ladder can replace eager placeholders with cheaper deduplication.
+    A too-large non-tool tail reaches the sliding-window tier after summarizing.
     """
-    body: str = 'x' * 15_000
-    messages: list[ModelMessage] = history_with_file_reads(12, body)
-    proactive: ClearToolResults[Any] = build_proactive_tool_pruning(50_000)
-    ladder: TieredCompaction[Any] = build_compaction(50_000)
-    context: ModelRequestContext = request_context(messages)
+    messages: list[ModelMessage] = [
+        ModelResponse(parts=[TextPart('x' * 500)]) for _ in range(45)
+    ]
+    calls: list[list[ModelMessage]] = []
+    result: list[ModelMessage] = await build_compaction(2_048).compact(
+        messages, run_context(recording_model(calls))
+    )
 
-    context = await proactive.before_model_request(run_context(quiet_model()), context)
-    result: ModelRequestContext = await ladder.before_model_request(run_context(quiet_model()), context)
-    returns: list[str] = [
-        str(part.content)
-        for message in result.messages
+    assert len(calls) == 1
+    assert len(result) == KEEP_RECENT_MESSAGES
+
+
+async def test_a_later_overage_repeats_the_summarize_and_strip_cycle() -> None:
+    """
+    New tool traffic after compaction can trigger the combined tier again.
+    """
+    body: str = 'x' * 450
+    messages: list[ModelMessage] = history_with_unique_file_reads(14, body)
+    messages.extend([
+        ModelResponse(parts=[ToolCallPart(
+            tool_name='ask_user',
+            args={'question': 'Which retry policy?'},
+            tool_call_id='ask-1',
+        )]),
+        ModelRequest(parts=[ToolReturnPart(
+            tool_name='ask_user',
+            content='Use exponential backoff with a 30s cap.',
+            tool_call_id='ask-1',
+        )]),
+    ])
+    calls: list[list[ModelMessage]] = []
+    model: FunctionModel = recording_model(calls)
+    compaction: TieredCompaction[Any] = build_compaction(2_048)
+    first: list[ModelMessage] = await compaction.compact(messages, run_context(model))
+    second: list[ModelMessage] = await compaction.compact(
+        [*first, *history_with_unique_file_reads(14, body, start=14)], run_context(model)
+    )
+    tool_parts: list[ToolCallPart | ToolReturnPart] = [
+        part
+        for message in second
         for part in message.parts
-        if isinstance(part, ToolReturnPart)
+        if isinstance(part, (ToolCallPart, ToolReturnPart))
     ]
 
-    assert returns[:-1] == ['[superseded file read]'] * 11
-    assert returns[-1] == body
+    assert len(calls) == 2
+    assert all(part.tool_name == 'ask_user' for part in tool_parts)
 
 
 async def test_repeated_reads_of_one_file_are_deduplicated() -> None:
@@ -628,94 +698,6 @@ async def test_compaction_reduces_a_history_that_exceeds_its_budget() -> None:
     )
 
     assert after < before
-
-
-def history_with_an_answer(reads: int, body: str, answer: str) -> list[ModelMessage]:
-    """
-    Build a history where the user answered a question, then many files were read.
-
-    :param reads: How many file reads follow the answer.
-    :param body: The contents each read returned.
-    :param answer: What the user said.
-    :returns: The synthetic message history.
-    """
-    messages: list[ModelMessage] = [
-        ModelResponse(parts=[ToolCallPart(
-            tool_name='ask_user',
-            args={'question': 'Which retry policy?'},
-            tool_call_id='ask-1',
-        )]),
-        ModelRequest(parts=[ToolReturnPart(
-            tool_name='ask_user',
-            content=answer,
-            tool_call_id='ask-1',
-        )]),
-    ]
-    for index in range(reads):
-        messages.append(
-            ModelResponse(parts=[ToolCallPart(
-                tool_name='read_file',
-                args={'path': f'src/file{index}.py'},
-                tool_call_id=f'read-{index}',
-            )])
-        )
-        messages.append(
-            ModelRequest(parts=[ToolReturnPart(
-                tool_name='read_file',
-                content=body,
-                tool_call_id=f'read-{index}',
-            )])
-        )
-    return messages
-
-
-async def test_a_users_answer_survives_the_blanking_tiers() -> None:
-    """
-    Everything else compaction drops can be fetched again; an answer cannot.
-
-    `exclude_tools` protects it from `ClearToolResults`, which is the tier that
-    would otherwise reach it in an ordinary long run. It cannot protect it from
-    `SlidingWindowCompaction`, which discards whole messages by age and is the
-    last resort — so this asserts what the blanking tiers do, not an absolute
-    guarantee across the whole ladder.
-    """
-    answer: str = 'The user replied: use exponential backoff with a 30s cap.'
-    messages: list[ModelMessage] = history_with_an_answer(40, 'y' * 4_000, answer)
-    blanking: ClearToolResults[Any] = ClearToolResults(
-        max_tokens=1_000,
-        keep_pairs=EAGER_KEEP_RECENT_TOOL_PAIRS,
-        exclude_tools=IRRECOVERABLE_TOOLS,
-    )
-
-    result: list[ModelMessage] = await blanking.compact(messages, run_context(quiet_model()))
-
-    answers: list[str] = [
-        str(part.content)
-        for message in result
-        for part in message.parts
-        if isinstance(part, ToolReturnPart) and part.tool_name == 'ask_user'
-    ]
-
-    assert answers == [answer], 'the user answer was altered or dropped'
-
-
-async def test_old_file_reads_are_still_cleared_around_an_answer() -> None:
-    """
-    Protecting answers must not amount to protecting everything.
-    """
-    messages: list[ModelMessage] = history_with_an_answer(40, 'y' * 4_000, 'Backoff.')
-    compaction: TieredCompaction[Any] = build_compaction(2_048)
-
-    result: list[ModelMessage] = await compaction.compact(messages, run_context(quiet_model()))
-
-    reads: list[str] = [
-        str(part.content)
-        for message in result
-        for part in message.parts
-        if isinstance(part, ToolReturnPart) and part.tool_name == 'read_file'
-    ]
-
-    assert any('y' * 4_000 not in content for content in reads), 'nothing was reclaimed'
 
 
 def test_the_model_is_told_the_window_it_is_budgeted_against() -> None:
@@ -832,13 +814,13 @@ def test_usage_is_measured_against_the_configured_window() -> None:
 
 def test_every_requested_capability_is_present() -> None:
     """
-    All five, on the ladder, in the order that spends the least first.
+    The four requested tiers are present in their intended order.
     """
     tiers = {type(tier).__name__ for tier in build_compaction(None).tiers}
 
     assert {
         'DeduplicateFileReads',
-        'ClearToolResults',
-        'SummarizingCompaction',
+        'ClampOversizedMessages',
+        'SummarizeAndStripToolMessages',
         'SlidingWindowCompaction',
     } <= tiers
