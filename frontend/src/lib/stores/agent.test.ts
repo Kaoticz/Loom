@@ -298,14 +298,14 @@ describe('message handling', () => {
         expect(get(store).messages).toHaveLength(0);
     });
 
-    it('shows a rejected review without arming an approval action', async () => {
+    it('asks whether to rework or overrule a rejected review', async () => {
         const { store, socket } = await connected();
 
         socket.deliver({ type: 'review', approved: false, comments: 'Needs a guard clause.' });
 
         const state = get(store);
-        expect(state.requiresAction).toBe(false);
-        expect(state.actionType).toBeNull();
+        expect(state.requiresAction).toBe(true);
+        expect(state.actionType).toBe('review_rejected');
         expect(latest(store).content).toBe('Needs a guard clause.');
     });
 

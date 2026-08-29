@@ -2126,6 +2126,12 @@ class AgentSession:
         if review.approved:
             return SessionState.completed
 
+        command: SessionCommand = await self._receive_command()
+        if command.resolved_action is CommandAction.merge:
+            summary: str = self._session.completion_summary or 'The agent finished without providing a summary.'
+            await self._record_status(TaskStatus.completed, summary)
+            return SessionState.merging
+
         self._review_rejections += 1
         if self._review_rejections >= self._limits.max_review_retries:
             return await self._ask_how_to_proceed(

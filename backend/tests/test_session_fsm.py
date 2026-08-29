@@ -69,6 +69,14 @@ def test_review_rejection_routes_through_re_working() -> None:
     assert machine.transition_to(SessionState.planning) is SessionState.planning
 
 
+def test_user_can_merge_despite_a_rejected_review() -> None:
+    """
+    A deliberate override may take a rejected review straight to merging.
+    """
+    machine: SessionStateMachine = SessionStateMachine(SessionState.waiting_review_approval)
+    assert machine.transition_to(SessionState.merging) is SessionState.merging
+
+
 def test_user_can_reject_after_completion() -> None:
     """
     The user may send an approved task back for more work instead of merging.

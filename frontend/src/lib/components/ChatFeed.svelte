@@ -16,6 +16,8 @@
         question = null,
         onapprove,
         onreject,
+        onrework = () => {},
+        onoverride = () => {},
         onretry,
         onanswer,
         onfreereply
@@ -30,6 +32,8 @@
         reason?: string;
         onapprove: () => void;
         onreject: (reason: string) => void;
+        onrework?: () => void;
+        onoverride?: () => void;
         onretry: () => void;
         onanswer: (answer: string) => void;
         onfreereply: () => void;
@@ -91,7 +95,7 @@
     {/if}
 
     {#if actionType}
-        <ApprovalPanel {actionType} {reason} {onapprove} {onreject} />
+        <ApprovalPanel {actionType} {reason} {onapprove} {onreject} {onrework} {onoverride} />
     {/if}
 
     {#if status === 'merged' && !actionType}

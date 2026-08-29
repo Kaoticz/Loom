@@ -30,6 +30,40 @@ describe('ApprovalPanel', () => {
         expect(screen.getByRole('button', { name: 'Merge into Main' })).toBeInTheDocument();
     });
 
+    it('offers a reviewer override after a rejected review', () => {
+        renderPanel('review_rejected');
+
+        expect(screen.getByText('The reviewer rejected this work.')).toBeInTheDocument();
+        expect(screen.getByRole('button', { name: 'Rework Changes' })).toBeInTheDocument();
+        expect(
+            screen.getByRole('button', { name: 'Overrule reviewer and merge' })
+        ).toBeInTheDocument();
+    });
+
+    it('warns before overriding the reviewer and only merges after confirmation', async () => {
+        const onoverride = vi.fn();
+        render(ApprovalPanel, {
+            actionType: 'review_rejected',
+            onapprove: vi.fn(),
+            onreject: vi.fn(),
+            onrework: vi.fn(),
+            onoverride
+        });
+
+        await fireEvent.click(screen.getByRole('button', { name: 'Overrule reviewer and merge' }));
+
+        expect(
+            screen.getByText(
+                'The current changes will be merged into Main, and the task will be marked as complete.'
+            )
+        ).toBeInTheDocument();
+        expect(onoverride).not.toHaveBeenCalled();
+
+        await fireEvent.click(screen.getByRole('button', { name: 'Merge into Main' }));
+
+        expect(onoverride).toHaveBeenCalledOnce();
+    });
+
     it('offers both answers straight away', () => {
         renderPanel('approve_plan');
 

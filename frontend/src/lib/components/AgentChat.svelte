@@ -53,6 +53,18 @@
         agentStore.approve(false, reason);
         promptText = '';
     }
+
+    /** Send the rejected work back through planning. */
+    function rework(): void {
+        agentStore.approve(false);
+        promptText = '';
+    }
+
+    /** Merge despite the reviewer's rejected verdict. */
+    function overrideReviewer(): void {
+        agentStore.sendAction('merge');
+        promptText = '';
+    }
 </script>
 
 <div
@@ -67,6 +79,8 @@
         reason={promptText}
         onapprove={approve}
         onreject={reject}
+        onrework={rework}
+        onoverride={overrideReviewer}
         onretry={() => agentStore.retryConnection()}
         {question}
         onanswer={(answer) => agentStore.answerQuestion(answer)}

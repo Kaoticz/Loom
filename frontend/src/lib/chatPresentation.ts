@@ -76,6 +76,11 @@ export const actionLabels: Record<string, { title: string; approve: string; reje
         title: 'The work is complete.',
         approve: 'Merge into Main',
         reject: 'Reject & Continue'
+    },
+    review_rejected: {
+        title: 'The reviewer rejected this work.',
+        approve: 'Rework Changes',
+        reject: 'Overrule reviewer and merge'
     }
 };
 

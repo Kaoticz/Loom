@@ -107,7 +107,7 @@ export type ConnectionState = 'connecting' | 'connected' | 'disconnected';
  */
 export type BlockedReason = 'another_tab' | 'stale' | null;
 
-export type ActionType = 'approve_plan' | 'approve_merge' | null;
+export type ActionType = 'approve_plan' | 'approve_merge' | 'review_rejected' | null;
 
 /** A question the agent is waiting on an answer to. */
 export interface PendingQuestion {
@@ -806,6 +806,11 @@ function createAgentStore() {
                     if (data.approved) {
                         nextState.requiresAction = false;
                         nextState.actionType = null;
+                    } else {
+                        // A rejected verdict is a user decision: they can send the
+                        // work back or deliberately merge despite the review.
+                        nextState.requiresAction = true;
+                        nextState.actionType = 'review_rejected';
                     }
                     break;
                 case 'done':

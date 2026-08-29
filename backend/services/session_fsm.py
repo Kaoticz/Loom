@@ -90,6 +90,9 @@ TRANSITIONS: Mapping[SessionState, frozenset[SessionState]] = {
     SessionState.waiting_review_approval: frozenset(
         {
             SessionState.completed,
+            # The user can deliberately merge despite a rejected reviewer
+            # verdict, skipping the ordinary final merge confirmation.
+            SessionState.merging,
             SessionState.re_working,
             SessionState.failed,
             SessionState.cancelled,

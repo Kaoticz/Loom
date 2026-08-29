@@ -591,12 +591,30 @@ async def test_rejected_review_loops_back_through_planning(
         json.dumps({'approved': True}),
         json.dumps({'approved': True}),
         json.dumps({'approved': True}),
+        json.dumps({'approved': True}),
     ])
 
     assert await session.run() is SessionState.merged
     assert len(seen['reviewer']) == 2
     assert 'The empty case is unhandled.' in seen['coder'][1]
     assert types_of(events).count(MessageType.review.value) == 2
+
+
+async def test_user_can_overrule_a_rejected_review_and_merge(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """
+    A deliberate merge command bypasses a rejected review and finishes the task.
+    """
+    stub_agents(monkeypatch, ['1. First attempt'], [(False, 'The empty case is unhandled.')])
+    session, _, _, services = build_session([
+        opening(),
+        json.dumps({'approved': True}),
+        json.dumps({'action': 'merge'}),
+    ])
+
+    assert await session.run() is SessionState.merged
+    assert services.git.merged == ['ai-task-testsess']
 
 
 async def test_user_can_reject_the_finished_work(monkeypatch: pytest.MonkeyPatch) -> None:

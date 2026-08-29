@@ -129,6 +129,25 @@ describe('composing and deciding', () => {
         expect(socket.lastSent).toEqual({ approved: true, reason: '' });
     });
 
+    it('confirms before overriding a rejected review and merging', async () => {
+        const { socket } = renderChat();
+        socket.deliver({ type: 'review', approved: false, comments: 'Add an empty-case guard.' });
+        await tick();
+
+        await fireEvent.click(screen.getByRole('button', { name: 'Overrule reviewer and merge' }));
+
+        expect(
+            screen.getByText(
+                'The current changes will be merged into Main, and the task will be marked as complete.'
+            )
+        ).toBeInTheDocument();
+        expect(socket.sent).toHaveLength(0);
+
+        await fireEvent.click(screen.getByRole('button', { name: 'Merge into Main' }));
+
+        expect(socket.lastSent).toEqual({ action: 'merge', reason: '' });
+    });
+
     it('offers the prompt box as the place to type a reason', async () => {
         const { socket } = renderChat();
         await awaitPlan(socket);
