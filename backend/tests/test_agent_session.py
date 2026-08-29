@@ -717,6 +717,7 @@ async def test_no_changes_is_reported_as_a_rejection(
         [
             opening(),
             json.dumps({'approved': True}),
+            json.dumps({'approved': True}),
             json.dumps({'action': 'abort'}),
         ],
         git=FakeGit(changes=[]),
@@ -789,6 +790,7 @@ async def test_re_review_receives_the_previous_verdict(
     )
     session, _, _, _ = build_session([
         opening(),
+        json.dumps({'approved': True}),
         json.dumps({'approved': True}),
         json.dumps({'approved': True}),
         json.dumps({'approved': True}),
