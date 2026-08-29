@@ -1,11 +1,17 @@
-from fastapi import APIRouter, HTTPException
-from typing import Any
+from typing import Annotated, Any
+
+from fastapi import APIRouter, HTTPException, Query
 from httpx import AsyncClient, Response
 from git import Repo, InvalidGitRepositoryError
 import os
 
 from dishka.integrations.fastapi import FromDishka, inject
 
+from schemas.context_window import (
+    ContextWindowDetectionRequest,
+    ContextWindowDetectionResponse,
+    ContextWindowDetectionStatus,
+)
 from schemas.index_maintenance import IndexDeletionResponse, IndexStatusResponse
 from services.embedding import EmbeddingService, ModelDescription
 from services.index_deletion import (
@@ -14,6 +20,7 @@ from services.index_deletion import (
     delete_project_index,
 )
 from services.projects import normalise_project_path
+from services.model_resolution import measure_ollama_context_window
 from services.session_registry import SessionRegistry
 
 router: APIRouter = APIRouter()
@@ -58,6 +65,33 @@ async def describe_ollama_model(name: str) -> dict[str, int | None]:
         await service.aclose()
 
     return {'dimensions': described.dimensions, 'context_length': described.context_length}
+
+
+@router.get('/ollama/context-window', response_model=ContextWindowDetectionResponse)
+async def detect_ollama_context_window(
+    request: Annotated[ContextWindowDetectionRequest, Query()],
+) -> ContextWindowDetectionResponse:
+    """Detect the configured Ollama model's effective context window."""
+    if not request.model.startswith('ollama:'):
+        return ContextWindowDetectionResponse(
+            context_window=None,
+            status=ContextWindowDetectionStatus.not_applicable,
+        )
+
+    try:
+        context_window: int | None = await measure_ollama_context_window(request.model)
+    except Exception:
+        context_window = None
+
+    if context_window is None:
+        return ContextWindowDetectionResponse(
+            context_window=None,
+            status=ContextWindowDetectionStatus.failed,
+        )
+    return ContextWindowDetectionResponse(
+        context_window=context_window,
+        status=ContextWindowDetectionStatus.detected,
+    )
 
 
 @router.get('/repos/validate')
