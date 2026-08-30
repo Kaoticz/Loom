@@ -13,6 +13,7 @@ from services.code_search import CodeSearchService
 from services.docker_sandbox import DockerSandboxManager
 from services.file_editor import FileEditorService
 from services.git_manager import GitManagerService
+from services.indexing import IndexingService
 from services.session_registry import SessionRegistry
 from tests.conftest import TEST_REPO_PATH, stub_embedding_service
 
@@ -94,7 +95,7 @@ def build_controller(tmp_path: Path) -> tuple[AgentSocketController, list[str]]:
 
     docker.stop_sandbox = stop_sandbox  # type: ignore[method-assign]
 
-    indexing: Any = MagicMock()
+    indexing: Any = MagicMock(spec=IndexingService)
 
     async def index(progress_callback: Any = None) -> None:
         return None

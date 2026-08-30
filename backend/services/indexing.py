@@ -136,21 +136,93 @@ class IndexingService:
 
         tasks: list[Any] = []
         for file_path in all_files:
+            rel_path: str = os.path.relpath(file_path, abs_repo_path)
             tasks.append(
-                self._process_file(file_path, abs_repo_path, semaphore, embedding_model, reporter)
+                self.index_file(
+                    rel_path,
+                    embedding_model=embedding_model,
+                    reporter=reporter,
+                    semaphore=semaphore,
+                )
             )
 
         await asyncio.gather(*tasks)
         await reporter.finish(f'Indexing complete: {reporter.completed} files processed.')
 
-    async def _process_file(self, file_path: str, abs_repo_path: str, semaphore: Semaphore, embedding_model: EmbeddingModel, reporter: ProgressReporter) -> None:
+    async def index_file(
+        self,
+        rel_path: str,
+        *,
+        embedding_model: EmbeddingModel | None = None,
+        reporter: ProgressReporter | None = None,
+        semaphore: Semaphore | None = None,
+    ) -> None:
+        """
+        Update the index for one file in this repository.
+
+        A direct caller supplies only ``rel_path``. The optional arguments let a
+        full repository scan reuse one already-resolved model and reporter rather
+        than repeating that work for every file.
+
+        :param rel_path: Path to index, relative to the repository root.
+        :param embedding_model: An embedding model already resolved for this scan.
+        :param reporter: Progress reporter shared by a full scan, if any.
+        :param semaphore: Concurrency limiter shared by a full scan, if any.
+        :returns: None.
+        """
+        abs_repo_path: str = os.path.abspath(self.repo_path)
+        file_path: str = os.path.abspath(os.path.join(abs_repo_path, rel_path))
+        if not file_path.startswith(abs_repo_path + os.sep):
+            return
+        if not os.path.isfile(file_path):
+            if reporter is not None:
+                await reporter.file_completed(rel_path)
+            return
+
+        active_reporter: ProgressReporter = reporter or ProgressReporter(1, None)
+        active_semaphore: Semaphore = semaphore or Semaphore(1)
+        await self._process_file(
+            file_path,
+            abs_repo_path,
+            active_semaphore,
+            embedding_model,
+            active_reporter,
+        )
+
+    async def drop_file(self, rel_path: str) -> None:
+        """
+        Remove one repository file and its derived index rows.
+
+        The database foreign keys cascade from ``File`` to both symbols and
+        embeddings. Missing rows are intentionally harmless, because a newly
+        created file may be removed before it is ever indexed.
+
+        :param rel_path: Path to remove from the index, relative to the repository root.
+        :returns: None.
+        """
+        abs_repo_path: str = os.path.abspath(self.repo_path)
+        file_path: str = os.path.abspath(os.path.join(abs_repo_path, rel_path))
+        if not file_path.startswith(abs_repo_path + os.sep):
+            return
+
+        safe_rel_path: str = os.path.relpath(file_path, abs_repo_path)
+        await File.filter(project=self.project, file_path=safe_rel_path).delete()
+
+    async def _process_file(
+        self,
+        file_path: str,
+        abs_repo_path: str,
+        semaphore: Semaphore,
+        embedding_model: EmbeddingModel | None,
+        reporter: ProgressReporter,
+    ) -> None:
         """
         Index a single file, reporting progress as it goes.
 
         :param file_path: Absolute path to the file.
         :param abs_repo_path: Absolute path to the repository root.
         :param semaphore: Limits how many files are processed at once.
-        :param embedding_model: The registry entry for the embedding model in use.
+        :param embedding_model: The registry entry for the embedding model in use, if resolved.
         :param reporter: Where progress is reported.
         """
         async with semaphore:
@@ -169,12 +241,14 @@ class IndexingService:
                             f'Skipping {rel_path}: {size // 1024} KB exceeds the '
                             f'{limit // 1024} KB limit.'
                         )
+                        await self.drop_file(rel_path)
                         await reporter.file_completed(rel_path)
                         return
 
                 with open(file_path, 'rb') as f:
                     chunk: bytes = f.read(1024)
                     if b'\x00' in chunk:
+                        await self.drop_file(rel_path)
                         await reporter.file_completed(rel_path)
                         return # Skip binary files
 
@@ -188,10 +262,24 @@ class IndexingService:
             content = content.replace('\x00', '')
 
             if not content.strip():
+                await self.drop_file(rel_path)
                 await reporter.file_completed(rel_path)
                 return
 
             file_hash: str = hashlib.sha256(content.encode()).hexdigest()
+
+            existing: File | None = await File.get_or_none(
+                project=self.project, file_path=rel_path
+            )
+            if existing is not None and existing.hash == file_hash:
+                await reporter.file_completed(rel_path)
+                return
+
+            active_model: EmbeddingModel = (
+                embedding_model
+                if embedding_model is not None
+                else await self.resolve_embedding_model()
+            )
             
             file_obj: File
             created: bool
@@ -217,7 +305,7 @@ class IndexingService:
                 await self._index_symbols(file_obj, file_path)
 
                 await reporter.phase(f'Generating embeddings for {rel_path}...')
-                await self._index_embeddings(file_obj, embedding_model)
+                await self._index_embeddings(file_obj, active_model)
 
             await reporter.file_completed(rel_path)
 

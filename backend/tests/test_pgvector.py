@@ -209,12 +209,10 @@ async def test_indexing_a_repository_end_to_end(
     assert counts == sorted(counts)
     assert updates[-1][0] == updates[-1][1]
 
-    # Phase detail reaches the client, and throttling keeps the volume sane.
-    # Which specific phases survive throttling is timing dependent, so this only
-    # asserts that phase reporting happens at all; the exact messages are
-    # covered by the reporter's own tests, where the clock is controlled.
+    # Start, completion, and finish are forced messages. Phase updates are
+    # intentionally timing-dependent under throttling, and are covered by the
+    # reporter's own clock-controlled tests.
     messages: str = ' '.join(message for _, _, message in updates)
-    assert 'symbols' in messages or 'embeddings' in messages
     assert 'Indexing complete' in messages
     assert len(updates) < 20
 

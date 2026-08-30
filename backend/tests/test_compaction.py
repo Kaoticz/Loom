@@ -111,7 +111,7 @@ def test_a_full_read_is_not_confused_with_a_ranged_read() -> None:
 
 @pytest.mark.parametrize(
     'tool_name',
-    ['search_code', 'edit_file', 'create_file', 'run_test_command', 'commit_changes'],
+    ['search_code', 'edit_file', 'create_file', 'delete_file', 'run_test_command', 'commit_changes'],
 )
 def test_other_tools_are_never_deduplicated(tool_name: str) -> None:
     """

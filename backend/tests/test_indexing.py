@@ -417,6 +417,83 @@ async def test_unchanged_file_is_not_reindexed(
     assert calls == [], 'an unchanged file was indexed again'
 
 
+@pytest.mark.usefixtures('db')
+async def test_index_file_refreshes_one_changed_file_and_drops_empty_content(
+    repo: str, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """
+    A direct one-file refresh updates only that path and clears a later empty version.
+    """
+    async def index_symbol(
+        self: IndexingService, file_obj: File, file_path: str
+    ) -> None:
+        await Symbol.create(
+            file=file_obj,
+            symbol_name=file_obj.raw_content.strip(),
+            kind='function',
+            line_start=1,
+            line_end=1,
+        )
+
+    monkeypatch.setattr(IndexingService, '_index_symbols', index_symbol)
+    monkeypatch.setattr(IndexingService, '_index_embeddings', lambda self, f, m: _noop())
+
+    service: IndexingService = IndexingService(
+        repo_path=repo, embedding=stub_embedding_service([0.1, 0.2, 0.3])
+    )
+    path: Path = Path(repo, 'refresh.py')
+    path.write_text('first_symbol\n')
+
+    await service.index_file('refresh.py')
+    first: File = await File.get(project=service.project, file_path='refresh.py')
+    assert first.raw_content == 'first_symbol\n'
+    assert [row.symbol_name for row in await Symbol.filter(file=first)] == ['first_symbol']
+
+    path.write_text('second_symbol\n')
+    await service.index_file('refresh.py')
+    refreshed: File = await File.get(project=service.project, file_path='refresh.py')
+    assert refreshed.raw_content == 'second_symbol\n'
+    assert refreshed.hash != first.hash
+    assert [row.symbol_name for row in await Symbol.filter(file=refreshed)] == ['second_symbol']
+
+    path.write_text(' \n')
+    await service.index_file('refresh.py')
+    await service.index_file('missing.py')
+    assert await File.filter(project=service.project, file_path='refresh.py').count() == 0
+    assert await Symbol.all().count() == 0
+
+
+@pytest.mark.usefixtures('db')
+async def test_drop_file_removes_the_file_and_cascades_derived_rows(repo: str) -> None:
+    """
+    Dropping one indexed path removes its file, symbols, and embeddings.
+    """
+    service: IndexingService = IndexingService(
+        repo_path=repo, embedding=stub_embedding_service([0.1, 0.2, 0.3])
+    )
+    model: EmbeddingModel = await EmbeddingModel.create(model_name='drop-model', dimensions=3)
+    file_obj: File = await File.create(
+        project=service.project, file_path='removed.py', raw_content='def removed():\n    pass\n', hash='h'
+    )
+    await Symbol.create(
+        file=file_obj, symbol_name='removed', kind='function', line_start=1, line_end=2
+    )
+    await CodeEmbedding.create(
+        model=model,
+        file=file_obj,
+        chunk_text='def removed():\n    pass',
+        embedding=[0.1, 0.2, 0.3],
+        start_line=1,
+    )
+
+    await service.drop_file('removed.py')
+    await service.drop_file('removed.py')
+
+    assert await File.filter(project=service.project, file_path='removed.py').count() == 0
+    assert await Symbol.all().count() == 0
+    assert await CodeEmbedding.all().count() == 0
+
+
 async def _noop() -> None:
     """
     Stand in for an indexing step that should do nothing.

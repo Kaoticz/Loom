@@ -4,6 +4,7 @@ import pytest
 
 from services.conversation_history import (
     ConversationHistory,
+    FILE_WRITING_TOOLS,
     TurnRole,
     estimate_tokens,
     truncate_to_tokens,
@@ -134,3 +135,10 @@ def test_iteration_counter_advances() -> None:
     assert history.advance_iteration() == 1
     turn = history.add(TurnRole.agent, 'thinking')
     assert turn.iteration == 1
+
+
+def test_delete_file_is_summarised_as_a_file_modification() -> None:
+    """
+    A deletion stays in compacted context as a file change, not an unrelated tool call.
+    """
+    assert 'delete_file' in FILE_WRITING_TOOLS

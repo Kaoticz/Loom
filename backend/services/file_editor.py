@@ -163,3 +163,24 @@ class FileEditorService:
             os.makedirs(parent, exist_ok=True)
         async with aio_open(safe_path, 'w') as file:
             await file.write(content)
+
+    async def delete_file(self, path: str) -> str:
+        """
+        Permanently remove one file from the repository.
+
+        :param path: Relative path to the file.
+        :returns: The path that was deleted.
+        :raises ValueError: If the path escapes the root, names the root, or is not a file.
+        :raises FileNotFoundError: If the file does not exist.
+        """
+        safe_path: str = self._safe_path(path)
+        root: str = os.path.abspath(self.root_path)
+        if safe_path == root:
+            raise ValueError('Refusing to delete the repository root.')
+        if not os.path.exists(safe_path):
+            raise FileNotFoundError(f'File {path} does not exist.')
+        if not os.path.isfile(safe_path):
+            raise ValueError(f'Path {path} is not a file.')
+
+        os.remove(safe_path)
+        return path

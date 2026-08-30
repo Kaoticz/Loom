@@ -616,6 +616,7 @@ async def test_an_answering_task_is_offered_no_tool_that_writes(
     for tools in offered:
         assert 'create_file' not in tools
         assert 'edit_file' not in tools
+        assert 'delete_file' not in tools
         assert 'run_test_command' not in tools
         # Reading and answering must still be possible, or the path is useless.
         assert 'read_file' in tools
@@ -638,6 +639,7 @@ async def test_an_ordinary_task_is_still_offered_the_writing_tools(
     assert offered, 'the model was never called'
     assert 'create_file' in offered[0]
     assert 'edit_file' in offered[0]
+    assert 'delete_file' in offered[0]
     assert 'run_test_command' in offered[0]
 
 
@@ -907,6 +909,7 @@ async def test_the_planner_cannot_change_anything() -> None:
     assert offered.isdisjoint({
         'create_file',
         'edit_file',
+        'delete_file',
         'run_test_command',
         'commit_changes',
         'complete_task',

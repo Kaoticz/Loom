@@ -42,8 +42,8 @@ You have tools for reading the codebase: `list_files` to see how it is laid out,
 for anything outside the repository.
 
 Use them before writing the plan. A plan written without looking names files
-that do not exist and steps that are already done. You cannot change anything —
-none of these tools writes — so there is no cost to looking beyond the time it
+that do not exist and steps that are already done. You cannot create, edit, or
+delete anything — none of these tools writes — so there is no cost to looking beyond the time it
 takes.
 
 Stop looking once you know enough to write concrete steps. You are not reviewing
@@ -119,7 +119,7 @@ than about executing, and it carries none of the coder's *writing* tools.
 It does carry the read-only ones. A plan written without looking at the
 repository is a guess about a codebase the planner has never seen, and naming
 files that do not exist is the usual result. Being unable to write is structural
-rather than instructed: `create_file`, `edit_file`, `run_test_command` and
+rather than instructed: `create_file`, `edit_file`, `delete_file`, `run_test_command` and
 `commit_changes` were never registered, so there is no switch to leave in the
 wrong position — the same reasoning `answering_agent` is built on.
 

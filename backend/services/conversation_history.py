@@ -11,7 +11,7 @@ CHARS_PER_CODE_TOKEN: int = 2
 DEFAULT_MAX_TOKENS: int = 4096
 DEFAULT_RECENT_TURNS_KEPT: int = 3
 
-FILE_WRITING_TOOLS: frozenset[str] = frozenset({'edit_file', 'create_file'})
+FILE_WRITING_TOOLS: frozenset[str] = frozenset({'edit_file', 'create_file', 'delete_file'})
 TEST_RUNNING_TOOLS: frozenset[str] = frozenset({'run_test', 'run_test_command'})
 
 

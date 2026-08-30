@@ -99,6 +99,37 @@ async def test_create_file_blocks_traversal(editor: FileEditorService) -> None:
         await editor.create_file('../evil.py', 'x')
 
 
+async def test_delete_file_removes_an_existing_file(editor: FileEditorService, repo: str) -> None:
+    """
+    Deleting a file removes it and reports the relative path.
+    """
+    target: Path = Path(repo, 'nested', 'obsolete.py')
+    target.parent.mkdir()
+    target.write_text('obsolete\n')
+
+    assert await editor.delete_file('nested/obsolete.py') == 'nested/obsolete.py'
+    assert not target.exists()
+
+
+@pytest.mark.parametrize('attempt', ['../escape.py', '../../etc/passwd'])
+async def test_delete_file_blocks_traversal(editor: FileEditorService, attempt: str) -> None:
+    """
+    Deletion cannot reach outside the repository root.
+    """
+    with pytest.raises(ValueError):
+        await editor.delete_file(attempt)
+
+
+async def test_delete_file_refuses_the_root_and_missing_files(editor: FileEditorService) -> None:
+    """
+    The repository root and nonexistent paths cannot be deleted.
+    """
+    with pytest.raises(ValueError, match='repository root'):
+        await editor.delete_file('.')
+    with pytest.raises(FileNotFoundError, match='does not exist'):
+        await editor.delete_file('missing.py')
+
+
 async def test_read_file_returns_full_content_unnumbered(editor: FileEditorService, repo: str) -> None:
     """
     Reading without a range returns the file exactly as stored.

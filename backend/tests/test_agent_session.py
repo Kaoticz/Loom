@@ -30,6 +30,7 @@ from services.event_bus import (
     WarningEvent,
 )
 from services.indexing_progress import ProgressReporter
+from services.indexing import IndexingService
 from services.file_editor import FileEditorService
 from services.git_manager import CommitResult, FileChange, GitManagerService
 from services.session_context import SessionContext
@@ -358,6 +359,7 @@ def build_session(
         search=CodeSearchService(repo_path=TEST_REPO_PATH),
         editor=FileEditorService(root_path='/tmp/repo'),
         git=GitManagerService(repo_path='/tmp/repo'),
+        indexing=MagicMock(spec=IndexingService),
         embedding=stub_embedding_service(),
         events=events,
         session=context,
@@ -2376,8 +2378,8 @@ async def test_the_text_fallback_cannot_write_code(monkeypatch: pytest.MonkeyPat
     """
     The fallback runs the planner, which carries no writing tools.
 
-    It used to run the coder, whose tools include `edit_file`, `create_file`
-    and `commit_changes`. That let a plan-shaped request start writing and
+    It used to run the coder, whose tools include `edit_file`, `create_file`,
+    `delete_file`, and `commit_changes`. That let a plan-shaped request start writing and
     committing before the user had approved anything. The planner does get
     deps, because its read-only tools need something to act through — being
     unable to write comes from those tools never having been registered.
@@ -2417,7 +2419,7 @@ async def test_the_text_fallback_cannot_write_code(monkeypatch: pytest.MonkeyPat
     # Deps are passed, so the read-only tools can reach the repository.
     assert seen and seen[0] is not None
     registered: set[str] = {tool.name for tool in planner_agent._function_toolset.tools.values()}
-    assert registered.isdisjoint({'create_file', 'edit_file', 'run_test_command'})
+    assert registered.isdisjoint({'create_file', 'edit_file', 'delete_file', 'run_test_command'})
 
 
 async def test_the_text_fallback_uses_the_planner_budget(

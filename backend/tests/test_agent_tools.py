@@ -5,7 +5,7 @@ import os
 from collections.abc import Sequence
 
 from pathlib import Path
-from typing import Any
+from typing import Any, cast
 from unittest.mock import MagicMock
 
 import pytest
@@ -28,6 +28,7 @@ from services.event_bus import (
 )
 from services.file_editor import FileEditorService
 from services.git_manager import GitManagerService
+from services.indexing import IndexingService
 from services.session_context import SessionContext
 from services.user_questions import UserQuestioner
 from tests.conftest import TEST_PROJECT, TEST_REPO_PATH, git_log, stub_embedding_service
@@ -46,6 +47,7 @@ EXPECTED_TOOLS: set[str] = {
     'list_files',
     'create_file',
     'edit_file',
+    'delete_file',
     'run_test_command',
     'web_search',
     'complete_task',
@@ -80,6 +82,7 @@ def deps(git_repo: GitManagerService, session: SessionContext, events: EventBus)
         search=CodeSearchService(repo_path=TEST_REPO_PATH),
         editor=FileEditorService(root_path=root),
         git=git_repo,
+        indexing=MagicMock(spec=IndexingService),
         embedding=stub_embedding_service(),
         events=events,
         session=session,
@@ -114,6 +117,8 @@ async def test_create_file_writes_and_emits(deps: AgentDeps, events: EventBus) -
     assert Path(root, 'pkg/mod.py').read_text().startswith('def added():')
     assert 'pkg/mod.py' in deps.session.modified_files
     assert 'Create pkg/mod.py' not in git_log(root), 'the write should not have committed'
+    indexing: MagicMock = cast(MagicMock, deps.indexing)
+    indexing.index_file.assert_awaited_once_with('pkg/mod.py')
     # Kept for the step's eventual commit message.
     assert 'Create pkg/mod.py' in deps.session.pending_change_summaries
     assert any(isinstance(event, ToolActionEvent) for event in seen)
@@ -172,6 +177,98 @@ async def test_edit_file_records_the_modification(deps: AgentDeps) -> None:
 
     assert len(deps.session.modified_files) == before + 1
     assert 'return 2' in Path(deps.git.repo_path, 'm.py').read_text()
+
+
+async def test_indexing_failure_is_reported_after_a_write(deps: AgentDeps) -> None:
+    """
+    A disk write remains accounted for, but never looks fully successful when its index fails.
+    """
+    indexing: MagicMock = cast(MagicMock, deps.indexing)
+    indexing.index_file.side_effect = RuntimeError('embedding backend unavailable')
+
+    result: str = await invoke('create_file', deps, path='indexed.py', content='value = 1\n')
+
+    assert 'could not refresh its index' in result
+    assert Path(deps.git.repo_path, 'indexed.py').exists()
+    assert 'indexed.py' in deps.session.modified_files
+
+
+@pytest.mark.usefixtures('db')
+async def test_create_and_edit_are_immediately_visible_to_indexed_searches(
+    deps: AgentDeps,
+) -> None:
+    """
+    Create and edit refresh lexical and symbol searches before their tools return.
+    """
+    root: str = deps.git.repo_path
+    deps.search.repo_path = root
+    deps.indexing = IndexingService(repo_path=root, embedding=deps.embedding)
+
+    await invoke(
+        'create_file',
+        deps,
+        path='fresh.py',
+        content='def stale_marker():\n    return 1\n',
+    )
+    assert 'stale_marker' in await invoke('search_code_lexical', deps, keywords=['stale_marker'])
+    assert 'stale_marker' in await invoke('get_symbol', deps, symbol='stale_marker')
+
+    await invoke(
+        'edit_file',
+        deps,
+        path='fresh.py',
+        search='stale_marker',
+        replace='fresh_marker',
+    )
+    assert 'No occurrences' in await invoke('search_code_lexical', deps, keywords=['stale_marker'])
+    assert 'fresh_marker' in await invoke('search_code_lexical', deps, keywords=['fresh_marker'])
+    assert 'No definition' in await invoke('get_symbol', deps, symbol='stale_marker')
+    assert 'fresh_marker' in await invoke('get_symbol', deps, symbol='fresh_marker')
+
+
+@pytest.mark.usefixtures('db')
+async def test_delete_file_removes_disk_index_and_records_a_deletion_diff(
+    deps: AgentDeps, events: EventBus
+) -> None:
+    """
+    A deletion removes its indexed rows, counts as a modification, and emits an empty new side.
+    """
+    root: str = deps.git.repo_path
+    Path(root, 'obsolete.py').write_text('def obsolete_marker():\n    return 1\n')
+    await deps.git.commit_changes('Add obsolete.py')
+    deps.search.repo_path = root
+    deps.indexing = IndexingService(repo_path=root, embedding=deps.embedding)
+    await deps.indexing.index_file('obsolete.py')
+    seen: list[AgentEvent] = collect(events)
+
+    result: str = await invoke('delete_file', deps, path='obsolete.py', summary='remove obsolete marker')
+
+    assert 'Deleted obsolete.py' in result
+    assert not Path(root, 'obsolete.py').exists()
+    assert 'obsolete.py' in deps.session.modified_files
+    assert 'Delete obsolete.py: remove obsolete marker' in deps.session.pending_change_summaries
+    assert 'No occurrences' in await invoke(
+        'search_code_lexical', deps, keywords=['obsolete_marker']
+    )
+    assert 'No definition' in await invoke('get_symbol', deps, symbol='obsolete_marker')
+    diffs: list[DiffEvent] = [event for event in seen if isinstance(event, DiffEvent)]
+    assert len(diffs) == 1
+    assert diffs[0].original == 'def obsolete_marker():\n    return 1'
+    assert diffs[0].modified == ''
+
+
+async def test_delete_file_refuses_empty_traversal_and_missing_paths(deps: AgentDeps) -> None:
+    """
+    Unsafe or nonexistent deletion requests are rejected without changing the session.
+    """
+    empty: str = await invoke('delete_file', deps, path='   ')
+    traversal: str = await invoke('delete_file', deps, path='../escape.py')
+    missing: str = await invoke('delete_file', deps, path='missing.py')
+
+    assert 'no path was given' in empty
+    assert 'outside of root' in traversal
+    assert 'does not exist' in missing
+    assert deps.session.modified_files == ()
 
 
 async def test_run_test_command_reports_the_verdict(deps: AgentDeps) -> None:
@@ -1479,7 +1576,7 @@ async def test_the_file_tools_agree_on_what_a_path_is() -> None:
     """
     from agents.coder import coder_agent
 
-    for name in ('read_file', 'create_file', 'edit_file', 'list_files'):
+    for name in ('read_file', 'create_file', 'edit_file', 'delete_file', 'list_files'):
         schema: dict[str, Any] = (
             coder_agent._function_toolset.tools[name].tool_def.parameters_json_schema
         )

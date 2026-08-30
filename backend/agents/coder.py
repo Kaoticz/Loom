@@ -28,6 +28,7 @@ from services.docker_sandbox import CommandResult, DockerSandboxManager
 from services.embedding import EmbeddingService
 from services.event_bus import CommitEvent, DiffEvent, EventBus, WarningEvent
 from services.git_manager import CommitResult, GitManagerService
+from services.indexing import IndexingService
 from services.tool_reporting import (
     ToolReport,
     ToolReport,
@@ -47,6 +48,7 @@ WEB_SEARCH_SNIPPET_LENGTH: int = 200
 
 CODER_SYSTEM_PROMPT: str = """You are Loom, an expert AI software engineer working inside a real Git repository.
 You operate in a strict ReAct loop: Plan, Action, Observation. Follow the rules below exactly.
+You can create, edit, and permanently delete repository files when the task calls for it.
 
 # 1. Plan format
 
@@ -86,7 +88,7 @@ will not match.
 
 # 3. Verify every change (hard rule)
 
-After every single call to `edit_file` or `create_file`, you MUST immediately call
+After every single call to `edit_file`, `create_file`, or `delete_file`, you MUST immediately call
 `run_test_command` with a relevant test, build, or lint command before moving on to the
 next step. This is a hard rule, not a suggestion. Never make two file modifications in a
 row without a verification step between them.
@@ -238,6 +240,7 @@ class AgentDeps(BaseModel):
     search: CodeSearchService
     editor: FileEditorService
     git: GitManagerService
+    indexing: IndexingService
     embedding: EmbeddingService
     events: EventBus
     session: SessionContext
@@ -522,6 +525,13 @@ async def create_file(
         ctx.deps.session.record_modification(path)
         await _report_diff(ctx, path, original)
         ctx.deps.session.note_pending_change(_commit_message('Create', path, summary))
+        try:
+            await ctx.deps.indexing.index_file(path)
+        except Exception as error:
+            return report.fail(
+                f'Created {path}, but could not refresh its index: {error}. The file was written, '
+                'but indexed searches may still show stale results.'
+            )
         return report.succeed(f'Created {path}.' + _note_ignored(extra))
 
 
@@ -565,7 +575,56 @@ async def edit_file(
         ctx.deps.session.record_modification(path)
         await _report_diff(ctx, path, original)
         ctx.deps.session.note_pending_change(_commit_message('Edit', path, summary))
+        try:
+            await ctx.deps.indexing.index_file(path)
+        except Exception as error:
+            return report.fail(
+                f'{result.message} The file was changed, but its index could not be refreshed: '
+                f'{error}. Indexed searches may still show stale results.'
+            )
         return report.succeed(result.message + _note_ignored(extra))
+
+
+@coder_agent.tool
+async def delete_file(
+    ctx: RunContext[AgentDeps],
+    /,
+    path: str,
+    summary: str = '',
+    **extra: object,
+) -> str:
+    """
+    Permanently delete a file from the repository.
+
+    This removes the file from disk and its indexed search records. It counts as
+    a file change, so run a relevant verification command immediately afterwards.
+    :param path: Path to delete, relative to the repository root. An absolute path inside the repository is accepted and converted.
+    :param summary: A few words on why the file is being deleted, used in the commit message.
+    """
+    async with report_tool(ctx.deps.events, 'delete_file', {'path': path}) as report:
+        path = _repository_path(ctx, path)
+        if not path:
+            return report.fail('Could not delete a file: no path was given. Pass a '
+                               'repository-relative file path, for example "src/unused.py".')
+        original: str | None = await _read_base_version(ctx, path)
+        try:
+            _ = await ctx.deps.editor.delete_file(path)
+        except FileNotFoundError:
+            return report.fail(f'Could not delete {path}: the file does not exist.')
+        except (ValueError, OSError) as error:
+            return report.fail(f'Could not delete {path}: {error}')
+
+        ctx.deps.session.record_modification(path)
+        await _report_diff(ctx, path, original)
+        ctx.deps.session.note_pending_change(_commit_message('Delete', path, summary))
+        try:
+            await ctx.deps.indexing.drop_file(path)
+        except Exception as error:
+            return report.fail(
+                f'Deleted {path}, but could not remove it from the index: {error}. The file is '
+                'gone, but indexed searches may still show stale results.'
+            )
+        return report.succeed(f'Deleted {path}.' + _note_ignored(extra))
 
 
 def _repository_path(ctx: RunContext[AgentDeps], path: str) -> str:
@@ -674,12 +733,12 @@ async def _report_diff(
     original: str | None,
 ) -> None:
     """
-    Announce the diff a single edit produced.
+    Announce the diff a single file modification produced.
 
     No longer commits. A commit per write turned one step into a string of
     commits nobody chose the boundaries of, and a plan into a history that could
     not be read back a step at a time. The commit now happens once, when the
-    step finishes. The diff still goes out per edit, because the live diff viewer
+    step finishes. The diff still goes out per modification, because the live diff viewer
     shows the edit as it lands and has nothing to do with commit cadence.
 
     :param ctx: The agent run context.
@@ -693,7 +752,10 @@ async def _report_diff(
     modified: str
     try:
         modified = await ctx.deps.editor.read_file(path)
-    except (FileNotFoundError, ValueError) as error:
+    except FileNotFoundError:
+        await ctx.deps.events.emit(DiffEvent(file_path=path, original=original, modified=''))
+        return
+    except ValueError as error:
         # A file that cannot be read back as text, such as a binary blob, has no
         # diff to show. The edit itself already succeeded.
         logger.warning('Skipping diff for %s: %s', path, error)
@@ -1250,8 +1312,8 @@ Asking the user a question is included: it changes nothing, and a task that can
 only be answered once an ambiguity is settled is better off asking than
 guessing.
 
-Everything absent from this list can alter the working tree: `create_file` and
-`edit_file` write and then commit, and `run_test_command` executes an arbitrary
+Everything absent from this list can alter the working tree: `create_file`,
+`edit_file`, and `delete_file` write or remove files, and `run_test_command` executes an arbitrary
 command inside a sandbox with the repository mounted. A task classified as
 needing no changes has nothing to write and nothing to verify, so none of them
 has a use it could put them to.

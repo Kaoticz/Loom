@@ -120,6 +120,7 @@ class AgentSocketController:
             search=self.search,
             editor=self.editor,
             git=self.git,
+            indexing=self.indexing,
             embedding=self.embedding,
             events=events,
             session=session
