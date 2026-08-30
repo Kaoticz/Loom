@@ -22,6 +22,15 @@ Each step has two parts:
 Write steps that can be acted on. "Improve error handling" is not a step;
 "Catch the timeout in run_test_command and report it as a failed run" is.
 
+Each step is given to a coder with no memory of earlier steps. Make every step
+self-contained: include the files, symbols, current behavior, decisions, and
+acceptance checks it needs. Do not create a discovery-only step whose findings
+the next step needs, such as "Find the toolbar". Investigate before producing
+the plan, then either combine the discovery with the change it enables or put
+the discovered location and relevant facts in that change step's description.
+The coder may verify those facts, but must not need to rediscover an earlier
+step's outcome to carry out its own work.
+
 Cover the whole task, and stop there. Do not invent work that was not asked for,
 and do not include steps for reviewing or committing: that happens anyway.
 

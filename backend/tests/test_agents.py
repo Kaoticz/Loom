@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from agents.coder import CODER_SYSTEM_PROMPT, coder_agent
 from agents.classifier import CLASSIFIER_SYSTEM_PROMPT, classifier_agent
+from agents.planner import PLANNER_SYSTEM_PROMPT
 from agents.reviewer import REVIEWER_SYSTEM_PROMPT, ReviewResult, reviewer_agent
 
 
@@ -36,6 +37,18 @@ def test_coder_prompt_describes_multi_keyword_lexical_search() -> None:
 
     # That `all` disappoints often, so the agent is not left assuming it failed.
     assert 'different lines' in understanding
+
+
+def test_planner_prompt_requires_context_safe_steps() -> None:
+    """
+    Each coder step must retain the findings it needs after its context resets.
+    """
+    prompt: str = unwrapped(PLANNER_SYSTEM_PROMPT)
+
+    assert 'no memory of earlier steps' in prompt
+    assert 'Do not create a discovery-only step' in prompt
+    assert 'combine the discovery with the change it enables' in prompt
+    assert 'must not need to rediscover an earlier step' in prompt
 
 
 def test_coder_lexical_tool_description_matches_the_prompt() -> None:
