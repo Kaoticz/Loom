@@ -12,6 +12,7 @@ from pydantic_ai.messages import (
     ModelRequestPart,
     ModelResponse,
     ModelResponsePart,
+    SystemPromptPart,
     ToolCallPart,
     ToolReturnPart,
 )
@@ -159,6 +160,35 @@ def read_file_key(call: ToolCallPart) -> str | None:
         return None
 
     return f'{path}:{arguments.get("start_line")}-{arguments.get("end_line")}'
+
+
+def _strip_redundant_system_prompts(messages: list[ModelMessage]) -> list[ModelMessage]:
+    """
+    Remove system prompts from non-leading request messages.
+
+    Compaction creates a leading summary request that already contains the
+    original system prompts. A preserved user request can retain another copy,
+    which strict chat templates reject after the leading system message. Leave
+    system-only requests unchanged because removing their sole part would create
+    an empty message that disappears during provider mapping.
+
+    :param messages: The compacted history to normalize.
+    :returns: A copied history with redundant non-leading system prompts removed.
+    """
+    normalized: list[ModelMessage] = []
+    for index, message in enumerate(messages):
+        if index == 0 or not isinstance(message, ModelRequest):
+            normalized.append(message)
+            continue
+
+        parts: list[ModelRequestPart] = [
+            part for part in message.parts if not isinstance(part, SystemPromptPart)
+        ]
+        if not parts:
+            normalized.append(message)
+            continue
+        normalized.append(replace(message, parts=parts))
+    return normalized
 
 
 def compaction_target(window: int) -> int:
@@ -414,7 +444,7 @@ class SummarizeAndStripToolMessages(AbstractCapability[Any]):
             ]
             if response_parts:
                 stripped.append(replace(message, parts=response_parts))
-        return stripped
+        return _strip_redundant_system_prompts(stripped)
 
     def _is_replaceable_tool_part(self, part: ModelRequestPart | ModelResponsePart) -> bool:
         """
@@ -473,7 +503,8 @@ async def force_summarize_history(
     strategy: SummarizingCompaction[Any] = build_forced_summarization(
         context_window, allow_subminimum=allow_subminimum
     )
-    return await compact_now(strategy, messages, model=model)
+    summarized: list[ModelMessage] = await compact_now(strategy, messages, model=model)
+    return _strip_redundant_system_prompts(summarized)
 
 
 @overload
