@@ -15,6 +15,7 @@ from pydantic_ai.messages import (
     SystemPromptPart,
     ToolCallPart,
     ToolReturnPart,
+    UserPromptPart,
 )
 from pydantic_ai_harness.compaction import (
     ClampOversizedMessages,
@@ -101,6 +102,15 @@ received an answer, and then forgotten it — so it either asks again, stopping 
 task a second time, or guesses at something it was explicitly told.
 """
 
+EMPTY_TERMINAL_REQUEST_FALLBACK: str = 'Continue with the current task.'
+"""
+The user-mappable continuation used when a compacted history has no user prompt.
+
+An empty `ModelRequest` disappears during OpenAI-compatible message mapping. This
+fixed, task-neutral prompt keeps the request on the wire without exposing tool
+output or internal failures.
+"""
+
 KEEP_RECENT_MESSAGES: int = 20
 """
 How many recent messages the summarizing and sliding tiers keep verbatim.
@@ -160,6 +170,22 @@ def read_file_key(call: ToolCallPart) -> str | None:
         return None
 
     return f'{path}:{arguments.get("start_line")}-{arguments.get("end_line")}'
+
+
+def _latest_user_prompt(messages: list[ModelMessage]) -> UserPromptPart | None:
+    """
+    Find the most recent user prompt in a history.
+
+    :param messages: The pre-compaction conversation history.
+    :returns: The latest user prompt, or None when the history contains none.
+    """
+    for message in reversed(messages):
+        if not isinstance(message, ModelRequest):
+            continue
+        for part in reversed(message.parts):
+            if isinstance(part, UserPromptPart):
+                return part
+    return None
 
 
 def _strip_redundant_system_prompts(messages: list[ModelMessage]) -> list[ModelMessage]:
@@ -422,7 +448,12 @@ class SummarizeAndStripToolMessages(AbstractCapability[Any]):
         ctx: RunContext[Any],
     ) -> list[ModelMessage]:
         """
-        Summarize history and unconditionally remove nonessential tool parts.
+        Summarize history and remove nonessential tool parts.
+
+        Retain the final request intact when stripping its parts would otherwise
+        remove the current step from the history. An already-empty final request
+        is backfilled with the latest original user prompt so it remains a
+        wire-mappable user message.
 
         :param messages: The history that exceeded the enclosing ladder's target.
         :param ctx: The running model context used by the summarizer.
@@ -430,13 +461,16 @@ class SummarizeAndStripToolMessages(AbstractCapability[Any]):
         """
         summarized: list[ModelMessage] = await self.summarizer.compact(messages, ctx)
         stripped: list[ModelMessage] = []
-        for message in summarized:
+        final_message_index: int = len(summarized) - 1
+        for index, message in enumerate(summarized):
             if isinstance(message, ModelRequest):
                 parts: list[ModelRequestPart] = [
                     part for part in message.parts if not self._is_replaceable_tool_part(part)
                 ]
                 if parts:
                     stripped.append(replace(message, parts=parts))
+                elif index == final_message_index:
+                    stripped.append(message)
                 continue
 
             response_parts: list[ModelResponsePart] = [
@@ -444,6 +478,11 @@ class SummarizeAndStripToolMessages(AbstractCapability[Any]):
             ]
             if response_parts:
                 stripped.append(replace(message, parts=response_parts))
+
+        if stripped and isinstance(stripped[-1], ModelRequest) and not stripped[-1].parts:
+            prompt: UserPromptPart | None = _latest_user_prompt(messages)
+            terminal_part: UserPromptPart = prompt or UserPromptPart(EMPTY_TERMINAL_REQUEST_FALLBACK)
+            stripped[-1] = replace(stripped[-1], parts=[terminal_part])
         return _strip_redundant_system_prompts(stripped)
 
     def _is_replaceable_tool_part(self, part: ModelRequestPart | ModelResponsePart) -> bool:

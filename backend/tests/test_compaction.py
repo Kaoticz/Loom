@@ -11,6 +11,7 @@ from pydantic_ai.messages import (
     TextPart,
     ToolCallPart,
     ToolReturnPart,
+    UserPromptPart,
 )
 from pydantic_ai.models import ModelRequestContext, ModelRequestParameters
 from pydantic_ai.models.function import AgentInfo, FunctionModel
@@ -627,6 +628,103 @@ def test_system_only_nonleading_request_is_not_emptied() -> None:
     assert normalized is not messages
 
 
+async def test_summarizing_and_stripping_preserves_an_all_tool_terminal_request() -> None:
+    """
+    The current tool result remains when stripping it would empty the final request.
+    """
+    window: int = 2_048
+    body: str = 'x' * 450
+    current_step: ToolReturnPart = ToolReturnPart(
+        tool_name='read_file',
+        content='The final file contents.',
+        tool_call_id='current-step',
+    )
+    messages: list[ModelMessage] = history_with_unique_file_reads(14, body)
+    messages.extend([
+        ModelResponse(parts=[TextPart('I will inspect the final file now.')]),
+        ModelRequest(parts=[current_step]),
+    ])
+    calls: list[list[ModelMessage]] = []
+
+    result: list[ModelMessage] = await build_compaction(window).compact(
+        messages, run_context(recording_model(calls))
+    )
+
+    assert len(calls) == 1
+    assert isinstance(result[0], ModelRequest)
+    assert isinstance(result[-1], ModelRequest)
+    assert result[-1].parts == [current_step]
+
+
+async def test_summarizing_and_stripping_backfills_an_empty_terminal_request() -> None:
+    """
+    An empty continuation request becomes the latest user prompt after stripping.
+    """
+    window: int = 2_048
+    body: str = 'x' * 450
+    latest_prompt: str = 'Update the retry policy without changing the database schema.'
+    messages: list[ModelMessage] = [
+        ModelRequest(parts=[UserPromptPart('Initial task.')]),
+        *history_with_unique_file_reads(14, body),
+        ModelRequest(parts=[UserPromptPart(latest_prompt)]),
+        ModelResponse(parts=[TextPart('I am checking the relevant code.')]),
+        ModelResponse(parts=[TextPart('The change is ready to apply.')]),
+        ModelRequest(parts=[]),
+    ]
+    calls: list[list[ModelMessage]] = []
+
+    result: list[ModelMessage] = await build_compaction(window).compact(
+        messages, run_context(recording_model(calls))
+    )
+    assert isinstance(result[-1], ModelRequest)
+    terminal_request: ModelRequest = result[-1]
+    non_terminal_tool_parts: list[ToolCallPart | ToolReturnPart] = [
+        part
+        for message in result[:-1]
+        for part in message.parts
+        if isinstance(part, (ToolCallPart, ToolReturnPart))
+    ]
+    surviving_response_texts: list[str] = [
+        part.content
+        for message in result[:-1]
+        for part in message.parts
+        if isinstance(part, TextPart)
+    ]
+
+    assert len(calls) == 1
+    assert isinstance(terminal_request.parts[0], UserPromptPart)
+    assert terminal_request.parts[0].content == latest_prompt
+    assert all(part.tool_name == 'ask_user' for part in non_terminal_tool_parts)
+    assert surviving_response_texts[-2:] == [
+        'I am checking the relevant code.',
+        'The change is ready to apply.',
+    ]
+
+
+async def test_summarizing_and_stripping_uses_a_fallback_for_an_empty_terminal_request() -> None:
+    """
+    An empty continuation request remains wire-mappable without a user prompt.
+    """
+    window: int = 2_048
+    body: str = 'x' * 450
+    messages: list[ModelMessage] = [
+        *history_with_unique_file_reads(14, body),
+        ModelResponse(parts=[TextPart('I am ready to continue.')]),
+        ModelRequest(parts=[]),
+    ]
+    calls: list[list[ModelMessage]] = []
+
+    result: list[ModelMessage] = await build_compaction(window).compact(
+        messages, run_context(recording_model(calls))
+    )
+    assert isinstance(result[-1], ModelRequest)
+    terminal_request: ModelRequest = result[-1]
+
+    assert len(calls) == 1
+    assert isinstance(terminal_request.parts[0], UserPromptPart)
+    assert terminal_request.parts[0].content == 'Continue with the current task.'
+
+
 async def test_deduplication_can_avoid_summary_and_tool_stripping() -> None:
     """
     Deduplicating repeated reads below target skips the combined tier entirely.
@@ -689,15 +787,20 @@ async def test_a_later_overage_repeats_the_summarize_and_strip_cycle() -> None:
     second: list[ModelMessage] = await compaction.compact(
         [*first, *history_with_unique_file_reads(14, body, start=14)], run_context(model)
     )
-    tool_parts: list[ToolCallPart | ToolReturnPart] = [
+    non_terminal_tool_parts: list[ToolCallPart | ToolReturnPart] = [
         part
-        for message in second
+        for message in second[:-1]
         for part in message.parts
         if isinstance(part, (ToolCallPart, ToolReturnPart))
     ]
 
     assert len(calls) == 2
-    assert all(part.tool_name == 'ask_user' for part in tool_parts)
+    assert all(part.tool_name == 'ask_user' for part in non_terminal_tool_parts)
+    assert isinstance(second[-1], ModelRequest)
+    assert len(second[-1].parts) == 1
+    assert isinstance(second[-1].parts[0], ToolReturnPart)
+    assert second[-1].parts[0].tool_name == 'read_file'
+    assert second[-1].parts[0].content == body
 
 
 async def test_repeated_reads_of_one_file_are_deduplicated() -> None:

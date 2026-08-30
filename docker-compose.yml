@@ -18,6 +18,7 @@ services:
 
   ollama:
     container_name: loom-ollama
+    network_mode: "host"
     environment:
       - OLLAMA_CONTEXT_LENGTH=131072 # Default: 8192 - Maximum amount of tokens models can use for their context window
     image: ollama/ollama:latest
@@ -86,7 +87,7 @@ services:
         required: false
     environment:
       - DATABASE_URL=postgres://loom:loom_password@postgres:5432/loom_db
-      - OLLAMA_BASE_URL=http://ollama:11434
+      - OLLAMA_BASE_URL=http://host.docker.internal:11434
       - SEARXNG_URL=http://searxng:8080
     ports:
       - '8000:8000'
