@@ -7,6 +7,7 @@ from pydantic_ai.messages import (
     ModelMessage,
     ModelRequest,
     ModelResponse,
+    SystemPromptPart,
     TextPart,
     ToolCallPart,
     ToolReturnPart,
@@ -34,8 +35,10 @@ from services.compaction import (
     ObservedCompaction,
     build_compaction,
     build_forced_summarization,
+    force_summarize_history,
     read_file_key,
     resolve_context_window,
+    _strip_redundant_system_prompts,
 )
 
 
@@ -570,6 +573,58 @@ async def test_summarizing_and_stripping_removes_tool_parts_from_the_verbatim_ta
         for part in message.parts
         if isinstance(part, ToolReturnPart) and part.tool_name == 'ask_user'
     ] == [answer]
+
+
+async def test_compaction_paths_keep_system_prompts_on_the_leading_request() -> None:
+    """
+    Summary compaction removes a preserved first request's duplicate system prompt.
+    """
+    from pydantic_ai.messages import UserPromptPart
+
+    window: int = 2_048
+    system_prompt: SystemPromptPart = SystemPromptPart('Follow the repository instructions.')
+    task: str = 'Repair the compaction retry without changing dependencies.'
+    initial_request: ModelRequest = ModelRequest(parts=[system_prompt, UserPromptPart(task)])
+    messages: list[ModelMessage] = [
+        initial_request,
+        *history_with_unique_file_reads(14, 'x' * 450),
+    ]
+    model: FunctionModel = quiet_model()
+    in_session: list[ModelMessage] = await build_compaction(window).compact(
+        messages, run_context(model)
+    )
+    forced: list[ModelMessage] = await force_summarize_history(messages, window, model)
+
+    for compacted in (in_session, forced):
+        assert isinstance(compacted[0], ModelRequest)
+        assert any(isinstance(part, SystemPromptPart) for part in compacted[0].parts)
+        assert all(
+            not isinstance(part, SystemPromptPart)
+            for message in compacted[1:]
+            if isinstance(message, ModelRequest)
+            for part in message.parts
+        )
+        assert any(
+            isinstance(part, UserPromptPart) and part.content == task
+            for message in compacted
+            if isinstance(message, ModelRequest)
+            for part in message.parts
+        )
+
+
+def test_system_only_nonleading_request_is_not_emptied() -> None:
+    """
+    Normalization keeps a system-only request rather than emit an empty request.
+    """
+    messages: list[ModelMessage] = [
+        ModelRequest(parts=[SystemPromptPart('Leading summary.')]),
+        ModelRequest(parts=[SystemPromptPart('System-only continuation.')]),
+    ]
+
+    normalized: list[ModelMessage] = _strip_redundant_system_prompts(messages)
+
+    assert normalized == messages
+    assert normalized is not messages
 
 
 async def test_deduplication_can_avoid_summary_and_tool_stripping() -> None:
