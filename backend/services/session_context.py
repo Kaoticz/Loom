@@ -641,7 +641,6 @@ class SessionContext:
             )
 
         self._completion_summary = cleaned
-        self._terminal_success_count += 1
         return self._completion_summary
 
     def request_completion(self, summary: str) -> str:
@@ -706,4 +705,5 @@ class SessionContext:
             )
 
         self._completion_summary = cleaned
+        self._terminal_success_count += 1
         return self._completion_summary

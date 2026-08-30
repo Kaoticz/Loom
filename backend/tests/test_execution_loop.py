@@ -25,6 +25,7 @@ from services.event_bus import (
     ToolActionEvent,
 )
 from services.git_manager import GitManagerService
+from services.docker_sandbox import CommandResult
 from services.session_fsm import SessionState
 from tests.test_agent_session import FakeGit, build_session, opening
 from services.plan_parser import ParsedPlan, PlanStep
@@ -250,6 +251,148 @@ async def test_completion_signal_is_recorded(
 
     assert session._session.has_modified_files is True
     assert 'a.py' in session._session.modified_files
+
+
+@pytest.mark.parametrize(
+    ('tool_name', 'summary'),
+    [
+        ('complete_step', 'Created the marker file.'),
+        ('accept_step_without_changes', 'No change was needed.'),
+    ],
+)
+async def test_a_successful_step_terminal_tool_ends_the_run(
+    monkeypatch: pytest.MonkeyPatch,
+    git_repo: GitManagerService,
+    tool_name: str,
+    summary: str,
+) -> None:
+    """
+    A successful step terminal tool prevents any later scripted tool call.
+
+    :param monkeypatch: Fixture used to swap the model resolver and sandbox command.
+    :param git_repo: A real initialised repository for the tools to work in.
+    :param tool_name: The terminal tool the scripted model calls.
+    :param summary: The completion summary passed to the terminal tool.
+    """
+    responses: list[ModelResponse]
+    expected_actions: list[str]
+    if tool_name == 'complete_step':
+        responses = [
+            ModelResponse(parts=[ToolCallPart(
+                tool_name='create_file',
+                args={'path': 'marker.txt', 'content': 'created\n', 'summary': 'add marker'},
+            )]),
+            ModelResponse(parts=[ToolCallPart(
+                tool_name='run_test_command', args={'command': 'test marker'},
+            )]),
+            ModelResponse(parts=[ToolCallPart(tool_name=tool_name, args={'summary': summary})]),
+            ModelResponse(parts=[ToolCallPart(tool_name='read_file', args={'path': 'marker.txt'})]),
+        ]
+        expected_actions = ['create_file', 'run_test_command', 'complete_step']
+    else:
+        responses = [
+            ModelResponse(parts=[ToolCallPart(tool_name=tool_name, args={'summary': summary})]),
+            ModelResponse(parts=[ToolCallPart(tool_name='read_file', args={'path': 'marker.txt'})]),
+        ]
+        expected_actions = ['accept_step_without_changes']
+
+    async def pass_test(command: str) -> CommandResult:
+        """
+        Return a passing command result for the scripted model.
+
+        :param command: The command the model asked the sandbox to run.
+        :returns: A successful command result.
+        """
+        return CommandResult(exit_code=0, output='passed')
+
+    session, events = prepare(monkeypatch, responses, git_repo)
+    monkeypatch.setattr(session._deps.docker, 'run_test_command', pass_test)
+
+    assert await session._handle_executing() is SessionState.reviewing
+
+    actions: list[str] = [
+        event.tool_name for event in events if isinstance(event, ToolActionEvent)
+    ]
+    assert actions == expected_actions
+    assert session._session.terminal_success_count == 1
+
+
+async def test_a_refused_completion_keeps_running_until_a_later_success(
+    monkeypatch: pytest.MonkeyPatch, git_repo: GitManagerService
+) -> None:
+    """
+    A refused completion does not end the run, but its later success does.
+
+    :param monkeypatch: Fixture used to swap the model resolver and sandbox command.
+    :param git_repo: A real initialised repository for the tools to work in.
+    """
+    from tests.test_agent_tools import invoke
+
+    responses: list[ModelResponse] = [
+        ModelResponse(parts=[ToolCallPart(
+            tool_name='complete_task', args={'summary': 'Added the marker file.'},
+        )]),
+        ModelResponse(parts=[ToolCallPart(
+            tool_name='run_test_command', args={'command': 'test marker'},
+        )]),
+        ModelResponse(parts=[ToolCallPart(
+            tool_name='complete_task', args={'summary': 'Added the marker file.'},
+        )]),
+        ModelResponse(parts=[ToolCallPart(
+            tool_name='complete_task', args={'summary': 'This call must not run.'},
+        )]),
+    ]
+
+    async def pass_test(command: str) -> CommandResult:
+        """
+        Return a passing command result for the scripted model.
+
+        :param command: The command the model asked the sandbox to run.
+        :returns: A successful command result.
+        """
+        return CommandResult(exit_code=0, output='passed')
+
+    session, events = prepare(monkeypatch, responses, git_repo)
+    await invoke('create_file', session._deps, path='marker.txt', content='created\n')
+    events.clear()
+    monkeypatch.setattr(session._deps.docker, 'run_test_command', pass_test)
+
+    assert await session._handle_executing() is SessionState.reviewing
+
+    actions: list[str] = [
+        event.tool_name for event in events if isinstance(event, ToolActionEvent)
+    ]
+    assert actions == ['complete_task', 'run_test_command', 'complete_task']
+
+
+async def test_an_answering_agent_stops_after_its_first_completion(
+    monkeypatch: pytest.MonkeyPatch, git_repo: GitManagerService
+) -> None:
+    """
+    The read-only answering path stops at its first accepted completion.
+
+    :param monkeypatch: Fixture used to swap the model resolver.
+    :param git_repo: A real initialised repository for the tools to work in.
+    """
+    responses: list[ModelResponse] = [
+        ModelResponse(parts=[ToolCallPart(
+            tool_name='complete_task', args={'summary': 'The retry policy tries three times.'},
+        )]),
+        ModelResponse(parts=[ToolCallPart(
+            tool_name='complete_task', args={'summary': 'This call must not run.'},
+        )]),
+    ]
+    session, events = prepare(monkeypatch, responses, git_repo)
+    session._session.record_classification(False)
+
+    assert await session._handle_answering() is SessionState.answered
+
+    actions: list[str] = [
+        event.tool_name for event in events if isinstance(event, ToolActionEvent)
+    ]
+    assert actions == ['complete_task']
+    done: list[DoneEvent] = [event for event in events if isinstance(event, DoneEvent)]
+    assert done[0].summary == 'The retry policy tries three times.'
 
 
 async def test_agent_that_never_completes_is_still_reviewed(
