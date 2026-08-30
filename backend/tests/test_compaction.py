@@ -1,6 +1,7 @@
 from typing import Any, override
 
 import pytest
+from pydantic_ai._agent_graph import _clean_message_history
 from pydantic_ai import RunContext
 from pydantic_ai.capabilities import AbstractCapability
 from pydantic_ai.messages import (
@@ -628,32 +629,53 @@ def test_system_only_nonleading_request_is_not_emptied() -> None:
     assert normalized is not messages
 
 
-async def test_summarizing_and_stripping_preserves_an_all_tool_terminal_request() -> None:
+async def test_summarizing_and_stripping_backfills_an_all_tool_terminal_request() -> None:
     """
-    The current tool result remains when stripping it would empty the final request.
+    A tool-only continuation becomes a user request before cleanup removes its orphaned result.
     """
     window: int = 2_048
     body: str = 'x' * 450
+    latest_prompt: str = 'Implement the retry policy without changing the database schema.'
     current_step: ToolReturnPart = ToolReturnPart(
         tool_name='read_file',
         content='The final file contents.',
         tool_call_id='current-step',
     )
-    messages: list[ModelMessage] = history_with_unique_file_reads(14, body)
-    messages.extend([
-        ModelResponse(parts=[TextPart('I will inspect the final file now.')]),
+    messages: list[ModelMessage] = [
+        ModelRequest(parts=[UserPromptPart(latest_prompt)]),
+        *history_with_unique_file_reads(14, body),
+        ModelResponse(
+            parts=[TextPart('I will inspect the final file now.')],
+            provider_name='ollama',
+            model_name='deepseek',
+        ),
+        ModelResponse(
+            parts=[
+                ToolCallPart(tool_name='read_file', args={'path': 'src/final.py'}, tool_call_id='current-step'),
+                TextPart('The final file needs one more review.'),
+            ],
+            provider_name='ollama',
+            model_name='deepseek',
+        ),
         ModelRequest(parts=[current_step]),
-    ])
+    ]
     calls: list[list[ModelMessage]] = []
 
     result: list[ModelMessage] = await build_compaction(window).compact(
         messages, run_context(recording_model(calls))
     )
+    cleaned: list[ModelMessage] = _clean_message_history(result, repair_last_response=True)
 
     assert len(calls) == 1
     assert isinstance(result[0], ModelRequest)
     assert isinstance(result[-1], ModelRequest)
-    assert result[-1].parts == [current_step]
+    assert isinstance(result[-1].parts[0], UserPromptPart)
+    assert result[-1].parts[0].content == latest_prompt
+    assert isinstance(cleaned[-3], ModelResponse)
+    assert isinstance(cleaned[-2], ModelResponse)
+    assert isinstance(cleaned[-1], ModelRequest)
+    assert isinstance(cleaned[-1].parts[0], UserPromptPart)
+    assert cleaned[-1].parts[0].content == latest_prompt
 
 
 async def test_summarizing_and_stripping_backfills_an_empty_terminal_request() -> None:
@@ -764,7 +786,7 @@ async def test_sliding_window_remains_the_fallback_after_summarizing_and_strippi
 
 async def test_a_later_overage_repeats_the_summarize_and_strip_cycle() -> None:
     """
-    New tool traffic after compaction can trigger the combined tier again.
+    New tool traffic after compaction can trigger the combined tier again safely.
     """
     body: str = 'x' * 450
     messages: list[ModelMessage] = history_with_unique_file_reads(14, body)
@@ -798,9 +820,8 @@ async def test_a_later_overage_repeats_the_summarize_and_strip_cycle() -> None:
     assert all(part.tool_name == 'ask_user' for part in non_terminal_tool_parts)
     assert isinstance(second[-1], ModelRequest)
     assert len(second[-1].parts) == 1
-    assert isinstance(second[-1].parts[0], ToolReturnPart)
-    assert second[-1].parts[0].tool_name == 'read_file'
-    assert second[-1].parts[0].content == body
+    assert isinstance(second[-1].parts[0], UserPromptPart)
+    assert second[-1].parts[0].content == 'Continue with the current task.'
 
 
 async def test_repeated_reads_of_one_file_are_deduplicated() -> None:

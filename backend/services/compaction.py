@@ -451,9 +451,10 @@ class SummarizeAndStripToolMessages(AbstractCapability[Any]):
         Summarize history and remove nonessential tool parts.
 
         Retain the final request intact when stripping its parts would otherwise
-        remove the current step from the history. An already-empty final request
-        is backfilled with the latest original user prompt so it remains a
-        wire-mappable user message.
+        remove the current step from the history. A final request that is empty
+        or contains only replaceable tool parts is backfilled with the latest
+        original user prompt so it remains a wire-mappable user message after
+        tool-pair cleanup.
 
         :param messages: The history that exceeded the enclosing ladder's target.
         :param ctx: The running model context used by the summarizer.
@@ -479,7 +480,11 @@ class SummarizeAndStripToolMessages(AbstractCapability[Any]):
             if response_parts:
                 stripped.append(replace(message, parts=response_parts))
 
-        if stripped and isinstance(stripped[-1], ModelRequest) and not stripped[-1].parts:
+        if (
+            stripped
+            and isinstance(stripped[-1], ModelRequest)
+            and all(self._is_replaceable_tool_part(part) for part in stripped[-1].parts)
+        ):
             prompt: UserPromptPart | None = _latest_user_prompt(messages)
             terminal_part: UserPromptPart = prompt or UserPromptPart(EMPTY_TERMINAL_REQUEST_FALLBACK)
             stripped[-1] = replace(stripped[-1], parts=[terminal_part])
