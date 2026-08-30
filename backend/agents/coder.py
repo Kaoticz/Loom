@@ -1,7 +1,8 @@
 from __future__ import annotations
 
 import os
-from collections.abc import Sequence
+from collections.abc import Awaitable, Callable, Sequence
+from functools import partial
 from logging import Logger, getLogger
 from typing import Any, ClassVar
 
@@ -511,28 +512,22 @@ async def create_file(
     :param content: The complete contents of the new file.
     :param summary: A few words on what this file is for, used in the commit message.
     """
-    async with report_tool(ctx.deps.events, 'create_file', {'path': path}) as report:
-        path = _repository_path(ctx, path)
-        if not path:
-            return report.fail('Could not create a file: no path was given. Pass a '
-                               'repository-relative path, for example "src/app.py".')
-        original: str | None = await _read_base_version(ctx, path)
-        try:
-            await ctx.deps.editor.create_file(path, content)
-        except (ValueError, OSError) as error:
-            return report.fail(f'Could not create {path}: {error}')
-
-        ctx.deps.session.record_modification(path)
-        await _report_diff(ctx, path, original)
-        ctx.deps.session.note_pending_change(_commit_message('Create', path, summary))
-        try:
-            await ctx.deps.indexing.index_file(path)
-        except Exception as error:
-            return report.fail(
-                f'Created {path}, but could not refresh its index: {error}. The file was written, '
-                'but indexed searches may still show stale results.'
-            )
-        return report.succeed(f'Created {path}.' + _note_ignored(extra))
+    return await _mutate_file(
+        ctx,
+        tool_name='create_file',
+        path=path,
+        summary=summary,
+        extra=extra,
+        mutation=partial(ctx.deps.editor.create_file, content=content),
+        reindex=ctx.deps.indexing.index_file,
+        commit_verb='Create',
+        completed_verb='Created',
+        path_error='Could not create a file: no path was given. Pass a '
+                   'repository-relative path, for example "src/app.py".',
+        mutation_error_prefix='Could not create',
+        index_failure_suffix='but could not refresh its index: {error}. The file was written, '
+                             'but indexed searches may still show stale results.',
+    )
 
 
 @coder_agent.tool
@@ -555,34 +550,32 @@ async def edit_file(
     :param replace: The exact text to put in its place. Pass an empty string to delete the text found.
     :param summary: A few words on what the edit accomplishes, used in the commit message.
     """
-    async with report_tool(ctx.deps.events, 'edit_file', {'path': path}) as report:
-        path = _repository_path(ctx, path)
-        if not path:
-            return report.fail('Could not edit a file: no path was given. Pass a '
-                               'repository-relative path, for example "src/app.py".')
-        if not search.strip():
-            return report.fail('Could not edit: a search block is required. Copy the exact '
-                               'text to replace from the file, character for character.')
-        original: str | None = await _read_base_version(ctx, path)
-        try:
-            result: EditResult = await ctx.deps.editor.edit_file(path, search, replace)
-        except (ValueError, OSError) as error:
-            return report.fail(f'Could not edit {path}: {error}')
+    search_error: str | None = None
+    if not search.strip():
+        search_error = ('Could not edit: a search block is required. Copy the exact '
+                        'text to replace from the file, character for character.')
 
-        if not result.success:
-            return report.fail(result.message)
-
-        ctx.deps.session.record_modification(path)
-        await _report_diff(ctx, path, original)
-        ctx.deps.session.note_pending_change(_commit_message('Edit', path, summary))
-        try:
-            await ctx.deps.indexing.index_file(path)
-        except Exception as error:
-            return report.fail(
-                f'{result.message} The file was changed, but its index could not be refreshed: '
-                f'{error}. Indexed searches may still show stale results.'
-            )
-        return report.succeed(result.message + _note_ignored(extra))
+    return await _mutate_file(
+        ctx,
+        tool_name='edit_file',
+        path=path,
+        summary=summary,
+        extra=extra,
+        mutation=partial(
+            ctx.deps.editor.edit_file,
+            search_block=search,
+            replace_block=replace,
+        ),
+        reindex=ctx.deps.indexing.index_file,
+        commit_verb='Edit',
+        completed_verb='Edited',
+        path_error='Could not edit a file: no path was given. Pass a '
+                   'repository-relative path, for example "src/app.py".',
+        mutation_error_prefix='Could not edit',
+        index_failure_suffix='The file was changed, but its index could not be refreshed: {error}. '
+                             'Indexed searches may still show stale results.',
+        validation_error=search_error,
+    )
 
 
 @coder_agent.tool
@@ -601,30 +594,89 @@ async def delete_file(
     :param path: Path to delete, relative to the repository root. An absolute path inside the repository is accepted and converted.
     :param summary: A few words on why the file is being deleted, used in the commit message.
     """
-    async with report_tool(ctx.deps.events, 'delete_file', {'path': path}) as report:
+    return await _mutate_file(
+        ctx,
+        tool_name='delete_file',
+        path=path,
+        summary=summary,
+        extra=extra,
+        mutation=ctx.deps.editor.delete_file,
+        reindex=ctx.deps.indexing.drop_file,
+        commit_verb='Delete',
+        completed_verb='Deleted',
+        path_error='Could not delete a file: no path was given. Pass a '
+                   'repository-relative file path, for example "src/unused.py".',
+        mutation_error_prefix='Could not delete',
+        index_failure_suffix='but could not remove it from the index: {error}. The file is '
+                             'gone, but indexed searches may still show stale results.',
+        missing_file_error='Could not delete {path}: the file does not exist.',
+    )
+
+
+async def _mutate_file(
+    ctx: RunContext[AgentDeps],
+    tool_name: str,
+    path: str,
+    summary: str,
+    extra: dict[str, object],
+    mutation: Callable[[str], Awaitable[object]],
+    reindex: Callable[[str], Awaitable[object]],
+    commit_verb: str,
+    completed_verb: str,
+    path_error: str,
+    mutation_error_prefix: str,
+    index_failure_suffix: str,
+    validation_error: str | None = None,
+    missing_file_error: str | None = None,
+) -> str:
+    """
+    Apply a file mutation and report its modification lifecycle.
+
+    :param ctx: The agent run context.
+    :param tool_name: The name reported for the tool invocation.
+    :param path: The model-supplied path to mutate.
+    :param summary: The commit-summary fragment supplied by the model.
+    :param extra: Unrecognised arguments to report back to the model.
+    :param mutation: The editor operation to apply to the resolved path.
+    :param reindex: The index operation to apply after the mutation.
+    :param commit_verb: The verb to use in the pending commit summary.
+    :param completed_verb: The past-tense verb to use in successful responses.
+    :param path_error: The response to use when no path was supplied.
+    :param mutation_error_prefix: The response prefix for editor errors.
+    :param index_failure_suffix: The formatted response suffix for index failures.
+    :param validation_error: An operation-specific validation response, if invalid.
+    :param missing_file_error: The formatted response for a missing file, if applicable.
+    :returns: The reported result of the mutation.
+    """
+    async with report_tool(ctx.deps.events, tool_name, {'path': path}) as report:
         path = _repository_path(ctx, path)
         if not path:
-            return report.fail('Could not delete a file: no path was given. Pass a '
-                               'repository-relative file path, for example "src/unused.py".')
+            return report.fail(path_error)
+        if validation_error is not None:
+            return report.fail(validation_error)
+
         original: str | None = await _read_base_version(ctx, path)
         try:
-            _ = await ctx.deps.editor.delete_file(path)
-        except FileNotFoundError:
-            return report.fail(f'Could not delete {path}: the file does not exist.')
+            result: object = await mutation(path)
+        except FileNotFoundError as error:
+            if missing_file_error is not None:
+                return report.fail(missing_file_error.format(path=path))
+            return report.fail(f'{mutation_error_prefix} {path}: {error}')
         except (ValueError, OSError) as error:
-            return report.fail(f'Could not delete {path}: {error}')
+            return report.fail(f'{mutation_error_prefix} {path}: {error}')
 
+        if isinstance(result, EditResult) and not result.success:
+            return report.fail(result.message)
+
+        message: str = result.message if isinstance(result, EditResult) else f'{completed_verb} {path}.'
         ctx.deps.session.record_modification(path)
         await _report_diff(ctx, path, original)
-        ctx.deps.session.note_pending_change(_commit_message('Delete', path, summary))
+        ctx.deps.session.note_pending_change(_commit_message(commit_verb, path, summary))
         try:
-            await ctx.deps.indexing.drop_file(path)
+            await reindex(path)
         except Exception as error:
-            return report.fail(
-                f'Deleted {path}, but could not remove it from the index: {error}. The file is '
-                'gone, but indexed searches may still show stale results.'
-            )
-        return report.succeed(f'Deleted {path}.' + _note_ignored(extra))
+            return report.fail(f'{message} {index_failure_suffix.format(error=error)}')
+        return report.succeed(message + _note_ignored(extra))
 
 
 def _repository_path(ctx: RunContext[AgentDeps], path: str) -> str:
