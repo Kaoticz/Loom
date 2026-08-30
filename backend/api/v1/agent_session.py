@@ -19,6 +19,7 @@ from pydantic_ai_harness.compaction import ContextUsage, ReportContextUsage, est
 from pydantic_ai.agent import AgentRunResult
 from pydantic_ai.messages import (
     AgentStreamEvent,
+    FunctionToolResultEvent,
     PartDeltaEvent,
     PartStartEvent,
     TextPart,
@@ -112,6 +113,21 @@ import os
 logger = logging.getLogger(__name__)
 
 _RunResult = TypeVar('_RunResult')
+
+TERMINAL_TOOL_NAMES: frozenset[str] = frozenset({
+    'complete_task',
+    'complete_step',
+    'accept_step_without_changes',
+})
+
+
+class TerminalToolCompleted(Exception):
+    """
+    End a coder run after a terminal tool completed successfully.
+
+    The tool name is carried as the exception message so the run wrapper can
+    preserve the summary recorded by the matching completion path.
+    """
 
 
 def _read_secrets(raw: Any) -> dict[str, str]:
@@ -1145,6 +1161,7 @@ class AgentSession:
         :raises ClientGone: If the client disconnected while the agent was running.
         """
         buffer: ThoughtBuffer = ThoughtBuffer()
+        terminal_successes_before_run: int = self._session.terminal_success_count
 
         async def stream_thoughts(
             context: RunContext[AgentDeps],
@@ -1158,6 +1175,9 @@ class AgentSession:
 
             :param context: The run context, unused.
             :param stream: The events produced while the agent runs.
+            :raises StopRequested: If the user asked for the session to stop.
+            :raises ClientGone: If the client disconnected while the agent was running.
+            :raises TerminalToolCompleted: If a terminal tool succeeds during this run.
             """
             async for event in stream:
                 if self._inbox.stop_requested:
@@ -1177,6 +1197,12 @@ class AgentSession:
                 elif isinstance(event, PartDeltaEvent) and isinstance(event.delta, TextPartDelta):
                     for thought in buffer.add(event.delta.content_delta, monotonic()):
                         await self._say(thought)
+                elif (
+                    isinstance(event, FunctionToolResultEvent)
+                    and event.part.tool_name in TERMINAL_TOOL_NAMES
+                    and self._session.terminal_success_count > terminal_successes_before_run
+                ):
+                    raise TerminalToolCompleted(event.part.tool_name)
 
         history: RequestHistoryCapture = (
             request_history if request_history is not None else RequestHistoryCapture()
@@ -1219,13 +1245,25 @@ class AgentSession:
 
         # Anything half-streamed belongs to an abandoned attempt, and emitting it
         # alongside the retry's output would read as the model repeating itself.
-        result: AgentRunResult[str] = await self._run_with_overflow_recovery(
-            run_coder,
-            lambda: self._coder_context_window,
-            history,
-            CompactionRunPath.coder_streaming,
-            buffer.flush,
-        )
+        try:
+            result: AgentRunResult[str] = await self._run_with_overflow_recovery(
+                run_coder,
+                lambda: self._coder_context_window,
+                history,
+                CompactionRunPath.coder_streaming,
+                buffer.flush,
+            )
+        except TerminalToolCompleted as completion:
+            buffered_thought: str | None = buffer.flush()
+            if buffered_thought is not None:
+                await self._say(buffered_thought)
+
+            if str(completion) == 'complete_task':
+                completion_output: str = self._session.completion_summary or ''
+            else:
+                completion_output = self._session.step_summaries[-1]
+            self._history.add(TurnRole.agent, completion_output)
+            return completion_output
 
         remaining: str | None = buffer.flush()
         if remaining is not None:

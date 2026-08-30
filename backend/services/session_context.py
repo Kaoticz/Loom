@@ -34,6 +34,7 @@ class SessionContext:
     _step_modified_files: list[str]
     _step_summaries: list[str]
     _current_step: str | None
+    _terminal_success_count: int
 
     def __init__(self, max_failed_verifications: int = DEFAULT_MAX_FAILED_VERIFICATIONS) -> None:
         """
@@ -61,6 +62,7 @@ class SessionContext:
         self._step_modified_files = []
         self._step_summaries = []
         self._current_step = None
+        self._terminal_success_count = 0
         # Review and merge both read only commits, so a step whose commit failed
         # has done work that neither will see. Remembering which ones is what
         # lets the final summary say so instead of implying it all landed.
@@ -140,6 +142,20 @@ class SessionContext:
         :returns: True if `complete_task` has been accepted.
         """
         return self._completion_summary is not None
+
+    @property
+    def terminal_success_count(self) -> int:
+        """
+        Count terminal tool calls that completed successfully in this session.
+
+        The streaming execution loop snapshots this value before each coder run,
+        then stops that run only when a terminal tool grows the count. Refused
+        terminal-tool calls never reach the recording methods and therefore do
+        not affect it.
+
+        :returns: The monotonically increasing terminal-success count.
+        """
+        return self._terminal_success_count
 
     @property
     def completion_summary(self) -> str | None:
@@ -230,6 +246,7 @@ class SessionContext:
             raise ValueError('A completion summary is required.')
         self._completion_summary = cleaned
         self._completed_without_changes = True
+        self._terminal_success_count += 1
         return cleaned
 
     @property
@@ -481,6 +498,7 @@ class SessionContext:
         if not cleaned:
             raise ValueError('The step summary cannot be empty.')
         self._step_summaries.append(cleaned)
+        self._terminal_success_count += 1
         return cleaned
 
     def request_step_completion(self, summary: str) -> str:
@@ -623,6 +641,7 @@ class SessionContext:
             )
 
         self._completion_summary = cleaned
+        self._terminal_success_count += 1
         return self._completion_summary
 
     def request_completion(self, summary: str) -> str:
