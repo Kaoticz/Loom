@@ -153,22 +153,23 @@ At the end of this plan:
 - **Testing Notes:** This is the highest-risk phase in the plan — run the full backend suite, not just session-related tests, since `AgentSession` is central to the whole request lifecycle.
 - **Completion verification (2026-08-30):** Targeted `tests/test_agent_session.py tests/test_execution_loop.py` → **160 passed**; full backend `pytest` → **972 passed, 4 skipped**; `mypy .` → no issues in 126 source files; `basedpyright .` → 0 errors, 0 warnings, 0 notes. `PlanningCoordinator` was required and extracted; `backend/api/v1/agent_session/agent_session.py` is **1,777 lines** after the Phase 2 extractions.
 
-### Phase 3: Split `createAgentStore()` — Status: Not Started
+### Phase 3: Split `createAgentStore()` — Status: Done
 - **Goal:** Break the ~700-line `createAgentStore()` closure (`frontend/src/lib/stores/agent.ts`, lines ~300-1013) into separate modules for cross-tab presence, WebSocket lifecycle, and the event reducer, with identical runtime behavior.
 - **Requirements:**
-  - [ ] Extract `createSessionPresence()` — the `BroadcastChannel`-based cross-tab protocol (`who_has_session`/`i_have_session`, `announcePresence`/`siblingHoldsSession`/`stopAnnouncing`) — into its own module.
-  - [ ] Extract a socket-connection module handling WebSocket open/teardown/reconnect logic into its own module, keeping `WebSocket` instantiation encapsulated per `frontend/AGENTS.md`'s "WebSocket Stores" standard.
-  - [ ] `createAgentStore()` keeps only state and the event reducer, consuming both extracted pieces as collaborators.
-  - [ ] Every exported function/store from the new modules gets a JSDoc comment per `frontend/AGENTS.md`.
+  - [x] Extract `createSessionPresence()` — the `BroadcastChannel`-based cross-tab protocol (`who_has_session`/`i_have_session`, `announcePresence`/`siblingHoldsSession`/`stopAnnouncing`) — into its own module. — verified by: `frontend/src/lib/stores/session-presence.ts` owns the Zod protocol, per-instance identity, announcement lifecycle, and 300ms sibling query.
+  - [x] Extract a socket-connection module handling WebSocket open/teardown/reconnect logic into its own module, keeping `WebSocket` instantiation encapsulated per `frontend/AGENTS.md`'s "WebSocket Stores" standard. — verified by: `frontend/src/lib/stores/session-socket.ts` is the only production store module that constructs `WebSocket`, and retains identity guards, idempotent connection, teardown, and fixed 3000ms retry.
+  - [x] `createAgentStore()` keeps only state and the event reducer, consuming both extracted pieces as collaborators. — verified by: `frontend/src/lib/stores/agent-events.ts` owns validation, invalid-message coalescing/capping, IDs, and inbound transitions; `agent.ts` composes collaborators with configuration and action facade state only.
+  - [x] Every exported function/store from the new modules gets a JSDoc comment per `frontend/AGENTS.md`. — verified by: review of the documented `createSessionPresence`, `createSessionSocket`, and `createAgentEventReducer` exports.
 - **Edge Cases & Error Handling:**
   - Reconnection timing/backoff behavior must be identical before and after.
   - Cross-tab presence handoff (a sibling tab already holding the session) must behave identically, including message ordering on the `BroadcastChannel`.
 - **Affected Areas:** `frontend/src/lib/stores/agent.ts` and any test file exercising it directly (`frontend/src/lib/stores/agent.test.ts`) — tests should need no behavioral changes, only updated imports if they reach into internals.
 - **Acceptance Criteria:**
-  - [ ] `createAgentStore()` no longer directly contains presence-protocol or socket-lifecycle code.
-  - [ ] Frontend test suite passes with the same results as the Phase 0 baseline.
-  - [ ] `npm run check` and `npm run lint` clean.
+  - [x] `createAgentStore()` no longer directly contains presence-protocol or socket-lifecycle code. — verified by: `agent.ts` has no `BroadcastChannel` or `WebSocket` construction; the collaborators own those concerns.
+  - [x] Frontend test suite passes with the same results as the Phase 0 baseline. — verified by: targeted `cd frontend && npm run test -- src/lib/stores/agent.test.ts` → **102 passed**; full `cd frontend && npm run test` → **536 passed, 6 skipped** across 33 files.
+  - [x] `npm run check` and `npm run lint` clean. — verified by: `cd frontend && npm run check` → 0 errors, 0 warnings; `cd frontend && npm run lint` → "All matched files use Prettier code style!" and ESLint completed cleanly. `git diff --check` also completed with no output.
 - **Testing Notes:** Run `frontend/src/lib/stores/agent.test.ts` specifically, then the full frontend suite.
+- **Completion verification (2026-08-30):** `npm run test -- src/lib/stores/agent.test.ts` → **1 passed file, 102 passed tests**; `npm run test` → **33 passed files, 536 passed, 6 skipped**; `npm run check` → 0 errors, 0 warnings; `npm run lint` → Prettier and ESLint clean; `git diff --check` → no output (clean). Vitest emitted Node's pre-existing experimental `localStorage` warning in both test runs; it did not affect results.
 
 ### Phase 4: Opportunistic fixes — dedup and typed classification — Status: Not Started
 - **Goal:** Fix two small, independent issues the audit flagged as cheap and low-risk: a duplicated helper and a fragile string-matching boundary.
