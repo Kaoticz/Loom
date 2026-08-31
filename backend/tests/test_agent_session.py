@@ -1796,7 +1796,7 @@ async def test_the_classifier_is_asked_before_any_planning(
     ])
 
     original_classify = session._handle_classifying
-    original_plan = session._handle_planning
+    original_plan = session._planning_coordinator.handle_planning
 
     async def note_classify() -> SessionState:
         order.append('classify')
@@ -1807,7 +1807,7 @@ async def test_the_classifier_is_asked_before_any_planning(
         return await original_plan()
 
     monkeypatch.setattr(session, '_handle_classifying', note_classify)
-    monkeypatch.setattr(session, '_handle_planning', note_plan)
+    monkeypatch.setattr(session._planning_coordinator, 'handle_planning', note_plan)
 
     await session.run()
 
@@ -1999,12 +1999,12 @@ async def test_planning_falls_back_to_text_when_structure_fails(
 
     session, _, _, _ = build_session([json.dumps({'prompt': 'do something'})])
 
-    async def planner_text(_self: object, _prompt: str) -> str:
+    async def planner_text(_prompt: str) -> str:
         return '1. Read the file.\n2. Edit it.\nPLAN_COMPLETE'
 
-    monkeypatch.setattr(type(session), '_plan_as_text', planner_text)
+    monkeypatch.setattr(session._planning_coordinator, 'plan_as_text', planner_text)
 
-    plan = await session._plan_structured('irrelevant')
+    plan = await session._planning_coordinator.plan_structured('irrelevant')
 
     assert plan.titles == ['Read the file.', 'Edit it.']
     # Marked as text, so the reader is shown text rather than empty accordions.
@@ -2043,7 +2043,7 @@ async def test_a_structured_planning_overflow_retries_structure(
 
     monkeypatch.setattr(planner_module.planner_agent, 'run', overflow_once)
 
-    plan = await session._plan_structured('irrelevant')
+    plan = await session._planning_coordinator.plan_structured('irrelevant')
 
     assert attempts == [128_048, 64_024]
     assert plan.titles == ['Read the file.']
@@ -2078,7 +2078,7 @@ async def test_a_text_planning_overflow_is_narrowed_and_retried(
 
     monkeypatch.setattr(planner_module.planner_agent, 'run', overflow_once)
 
-    assert await session._plan_as_text('irrelevant') == '1. Read the file.'
+    assert await session._planning_coordinator.plan_as_text('irrelevant') == '1. Read the file.'
     assert attempts == [128_048, 64_024]
 
 
@@ -2100,7 +2100,7 @@ async def test_stop_requested_during_text_planning_is_not_retried(
     monkeypatch.setattr(planner_module.planner_agent, 'run', stop)
 
     with pytest.raises(StopRequested):
-        await session._plan_as_text('irrelevant')
+        await session._planning_coordinator.plan_as_text('irrelevant')
 
     assert attempts == [1]
 
@@ -2128,12 +2128,12 @@ async def test_structure_that_says_nothing_falls_back_too(
 
     session, _, _, _ = build_session([json.dumps({'prompt': 'do something'})])
 
-    async def planner_text(_self: object, _prompt: str) -> str:
+    async def planner_text(_prompt: str) -> str:
         return '1. Recovered step.'
 
-    monkeypatch.setattr(type(session), '_plan_as_text', planner_text)
+    monkeypatch.setattr(session._planning_coordinator, 'plan_as_text', planner_text)
 
-    plan = await session._plan_structured('irrelevant')
+    plan = await session._planning_coordinator.plan_structured('irrelevant')
 
     assert plan.titles == ['Recovered step.']
     assert plan.format is PlanFormat.text
@@ -2413,7 +2413,7 @@ async def test_the_text_fallback_cannot_write_code(monkeypatch: pytest.MonkeyPat
     monkeypatch.setattr(planner_module.planner_agent, 'run', dispatch)
 
     session, _, _, _ = build_session([json.dumps({'prompt': 'do something'})])
-    plan = await session._plan_structured('irrelevant')
+    plan = await session._planning_coordinator.plan_structured('irrelevant')
 
     assert plan.titles == ['Recovered step.']
     # Deps are passed, so the read-only tools can reach the repository.
@@ -2429,7 +2429,7 @@ async def test_the_text_fallback_uses_the_planner_budget(
     The budget follows the agent whose history is compacted, which is now the planner.
     """
     import agents.planner as planner_module
-    import api.v1.agent_session as session_module
+    import api.v1.agent_session.agent_session as session_module
     from services.compaction import build_compaction
 
     windows: list[int | None] = []
@@ -2454,7 +2454,7 @@ async def test_the_text_fallback_uses_the_planner_budget(
 
     monkeypatch.setattr(planner_module.planner_agent, 'run', answer)
 
-    await session._plan_as_text('irrelevant')
+    await session._planning_coordinator.plan_as_text('irrelevant')
 
     assert windows == [8_192]
     assert original(8_192).target_tokens == build_compaction(8_192).target_tokens

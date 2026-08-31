@@ -1,7 +1,6 @@
-from time import monotonic
 from asyncio import Event
-from collections.abc import AsyncIterable, Sequence
-from typing import Any, Awaitable, Callable, Protocol, TypeVar
+from collections.abc import Awaitable, Callable, Sequence
+from typing import Any
 
 from agents.classifier import (
     ClassificationResult,
@@ -9,23 +8,16 @@ from agents.classifier import (
     build_classification_prompt,
 )
 from agents.coder import CODER_SYSTEM_PROMPT, AgentDeps, answering_agent, coder_agent
+from agents.planner import PLANNER_SYSTEM_PROMPT, StructuredPlan, planner_agent
 from agents.commit_message import commit_message_agent
 from agents.reviewer import ReviewResult, reviewer_agent
 from fastapi import WebSocket
-from pydantic_ai import Agent, RunContext, UsageLimits
+from pydantic_ai import Agent, UsageLimits
 from pydantic_ai.capabilities import AbstractCapability
 from pydantic_ai.exceptions import UnexpectedModelBehavior
 from pydantic_ai_harness.compaction import ContextUsage, ReportContextUsage, estimate_token_count
 from pydantic_ai.agent import AgentRunResult
-from pydantic_ai.messages import (
-    AgentStreamEvent,
-    FunctionToolResultEvent,
-    PartDeltaEvent,
-    PartStartEvent,
-    TextPart,
-    TextPartDelta,
-    ModelMessage,
-)
+from pydantic_ai.messages import ModelMessage
 from pydantic_ai.models.openai import OpenAIChatModel, OpenAIChatModelSettings
 from pydantic_ai.providers.openai import OpenAIProvider
 from schemas.agent_commands import CommandAction, SessionCommand, parse_command
@@ -57,9 +49,8 @@ from services.code_search import CodeSearchService
 from services.compaction import (
     build_compaction,
     force_summarize_history,
-    build_usage_monitor,
     looks_like_context_overflow,
-    narrowed_window,
+    build_usage_monitor,
     RequestHistoryCapture,
     resolve_context_window,
 )
@@ -74,7 +65,6 @@ from services.context_budget import (
 from services.browser_tooling import BROWSER_GUIDANCE
 from services.frontend_detection import repository_has_frontend
 from services.indexing import IndexingService, clamp_chunk_lines
-from agents.planner import PLANNER_SYSTEM_PROMPT, StructuredPlan, planner_agent
 from services.plan_parser import (
     NO_STEPS_CORRECTION,
     ParsedPlan,
@@ -105,30 +95,22 @@ from database.enums import TaskStatus
 from database.models.file import File
 from database.models.task import Task
 from uuid import UUID, uuid4
-from services.thought_buffer import ThoughtBuffer
+from .agent_run_helper import AgentRunHelper
+from .commit_sweeper import CommitSweeper
+from .commit_sweeper import (
+    COMMIT_FAILURE_COMMITTED,
+    COMMIT_FAILURE_OPTIONS,
+    COMMIT_FAILURE_STOP,
+    MAX_CONSECUTIVE_COMMIT_FAILURES,
+)
+from .context_overflow_recovery import ContextOverflowRecovery
+from .planning_coordinator import PlanningCoordinator
+from .session_services import SessionServices
 import json
 import logging
 import os
 
 logger = logging.getLogger(__name__)
-
-_RunResult = TypeVar('_RunResult')
-
-TERMINAL_TOOL_NAMES: frozenset[str] = frozenset({
-    'complete_task',
-    'complete_step',
-    'accept_step_without_changes',
-})
-
-
-class TerminalToolCompleted(Exception):
-    """
-    End a coder run after a terminal tool completed successfully.
-
-    The tool name is carried as the exception message so the run wrapper can
-    preserve the summary recorded by the matching completion path.
-    """
-
 
 def _read_secrets(raw: Any) -> dict[str, str]:
     """
@@ -153,54 +135,8 @@ def _read_secrets(raw: Any) -> dict[str, str]:
     return secrets
 
 
-class SessionServices(Protocol):
-    """
-    The services a session needs from its controller.
-
-    Declared structurally so the session can be typed against the controller
-    without importing it, which would be circular. Typing this as `Any` would
-    silence the checkers on every service access.
-    """
-
-    docker: DockerSandboxManager
-    editor: FileEditorService
-    git: GitManagerService
-    indexing: IndexingService
-    embedding: EmbeddingService
-    search: CodeSearchService
-    registry: SessionRegistry
-
 CONTEXT_TOKEN_BUDGET: int = 4096
 DEFAULT_MODEL: str = 'ollama:llama3'
-
-
-MAX_CONSECUTIVE_COMMIT_FAILURES: int = 3
-"""
-How many commits may fail in a row before the user is asked what to do.
-
-Three rather than one: a single failure is often an index lock held for a moment
-and clears by itself, and the retry inside the commit already covers that. Three
-in a row is a configuration problem, and every further step past it adds work
-that neither the review nor the merge can see.
-"""
-
-COMMIT_FAILURE_COMMITTED: str = 'I have committed the changes myself'
-COMMIT_FAILURE_CONTINUE: str = 'Carry on without committing'
-COMMIT_FAILURE_STOP: str = 'Stop the session'
-
-COMMIT_FAILURE_OPTIONS: tuple[str, ...] = (
-    COMMIT_FAILURE_COMMITTED,
-    COMMIT_FAILURE_CONTINUE,
-    COMMIT_FAILURE_STOP,
-)
-"""
-What the user may do about commits that keep failing.
-
-Committing by hand is offered first because it is usually the quickest fix and
-Loom has no business guessing at someone's git configuration. The claim is
-verified rather than trusted, so choosing it wrongly costs another question
-rather than a lost step.
-"""
 
 
 class AgentSession:
@@ -253,6 +189,10 @@ class AgentSession:
     _context_window_warning_emitted: bool
     _context_window_probe: Callable[[str], Awaitable[int | None]]
     _commit_message_generator: Callable[[str], Awaitable[str]]
+    _overflow_recovery: ContextOverflowRecovery
+    _commit_sweeper: CommitSweeper
+    _agent_run_helper: AgentRunHelper
+    _planning_coordinator: PlanningCoordinator
 
     def __init__(
         self,
@@ -343,6 +283,10 @@ class AgentSession:
         self._context_window_warning_emitted = False
         self._task_id = ''
         self._recorder = None
+        self._overflow_recovery = ContextOverflowRecovery(self)
+        self._commit_sweeper = CommitSweeper(self)
+        self._agent_run_helper = AgentRunHelper(self)
+        self._planning_coordinator = PlanningCoordinator(self)
 
     async def _interrupt_work(self) -> None:
         """
@@ -470,7 +414,7 @@ class AgentSession:
         handlers: dict[SessionState, Callable[[], Awaitable[SessionState]]] = {
             SessionState.initializing: self._handle_initializing,
             SessionState.classifying: self._handle_classifying,
-            SessionState.planning: self._handle_planning,
+            SessionState.planning: self._planning_coordinator.handle_planning,
             SessionState.waiting_plan_approval: self._handle_waiting_plan_approval,
             SessionState.executing: self._handle_executing,
             SessionState.reviewing: self._handle_reviewing,
@@ -795,7 +739,7 @@ class AgentSession:
             if self._provider_truncation_recovery_observation == self._provider_usage_observation:
                 return
             self._provider_truncation_recovery_observation = self._provider_usage_observation
-            _ = await self._narrow_after_input_truncation(
+            _ = await self._overflow_recovery.narrow_after_input_truncation(
                 resolve_context_window(self._coder_context_window),
                 estimated_input_tokens,
                 provider_input_tokens,
@@ -820,6 +764,29 @@ class AgentSession:
                     'for later requests so its compaction budget reflects the provider\'s accounting.'
                 )
             )
+        )
+
+    async def _run_with_overflow_recovery(
+        self,
+        run: Callable[[list[ModelMessage] | None], Awaitable[Any]],
+        context_window: Callable[[], int],
+        history: RequestHistoryCapture,
+        run_path: CompactionRunPath,
+        on_retry: Callable[[], object] | None = None,
+    ) -> Any:
+        """
+        Delegate legacy private callers to context-overflow recovery.
+
+        :param run: Starts a model-run attempt with optional recovered history.
+        :param context_window: Reads the budget that owns each attempt.
+        :param history: Captures the final compacted request before a failed call.
+        :param run_path: Identifies recovery compaction in the event feed.
+        :param on_retry: Clears state belonging to an abandoned attempt.
+        :returns: The successful model-run result.
+        :raises Exception: If the failure is unrelated or cannot be recovered.
+        """
+        return await self._overflow_recovery.run_with_overflow_recovery(
+            run, context_window, history, run_path, on_retry
         )
 
     async def _report_compaction(
@@ -944,335 +911,6 @@ class AgentSession:
             context_window, allow_subminimum=self._measured_context_window is not None
         )
 
-    async def _narrow_context_window(
-        self,
-        budget: int,
-        warning_content: Callable[[int, int], str],
-    ) -> bool:
-        """
-        Halve both working windows unless their fixed overhead makes that useless.
-
-        :param budget: The window demonstrated to be too optimistic.
-        :param warning_content: Builds the cause-specific warning after narrowing.
-        :returns: True if the window was narrowed and another run is worthwhile.
-        """
-        narrower: int = narrowed_window(budget)
-        configured: int = resolve_context_window(budget)
-        if narrower >= configured:
-            return False
-
-        overhead: int = estimate_fixed_overhead(CODER_SYSTEM_PROMPT, coder_agent)
-        complaint: str = context_window_complaint(narrower, overhead)
-        if complaint:
-            # Narrowing further would be theatre. Every request carries the
-            # instructions and tool schemas whatever the window is, and below
-            # this the model has nowhere to put the work — so halving again
-            # would fail identically while looking like progress. The run stops
-            # with the one message that names what to change.
-            await self._events.emit(WarningEvent(content=complaint))
-            return False
-
-        self._coder_context_window = narrower
-        self._planner_context_window = min(
-            narrower, resolve_context_window(self._planner_context_window)
-        )
-        await self._events.emit(WarningEvent(content=warning_content(configured, narrower)))
-        return True
-
-    async def _narrow_after_overflow(self, budget: int) -> bool:
-        """
-        React to a run that had no room to answer in.
-
-        The configured window has been shown to be larger than the model's real
-        one, which Loom has no way to ask for. Narrowing what it budgets against
-        makes the next attempt smaller, and repeating that closes the gap without
-        anybody having to know the true figure.
-
-        :param budget: The window the failed run was budgeted against.
-        :returns: True if the window was narrowed and the run is worth retrying.
-        """
-        return await self._narrow_context_window(
-            budget,
-            lambda configured, narrower: (
-                f'The model had no room to reply, so its context window is smaller than the '
-                f'{configured:,} tokens configured. Retrying with {narrower:,}. Set the context '
-                'window to what the model actually supports to avoid this.'
-            ),
-        )
-
-    async def _narrow_after_input_truncation(
-        self,
-        budget: int,
-        estimated_input_tokens: int,
-        provider_input_tokens: int,
-    ) -> bool:
-        """
-        Reduce the working window after a provider reports truncated input.
-
-        :param budget: The active coder window before the correction.
-        :param estimated_input_tokens: Loom's estimate for the truncated request.
-        :param provider_input_tokens: Tokens the provider reports processing.
-        :returns: True if a smaller working window was applied.
-        """
-        return await self._narrow_context_window(
-            budget,
-            lambda configured, narrower: (
-                f'The model/server processed {provider_input_tokens:,} prompt tokens, but Loom '
-                f'estimated {estimated_input_tokens:,}. It appears to be truncating input to fit '
-                f'its context limit, so Loom reduced its context window from {configured:,} to '
-                f'{narrower:,}. Set the context window to what the model actually supports to '
-                'avoid this.'
-            ),
-        )
-
-    async def _summarize_after_overflow(
-        self,
-        history: RequestHistoryCapture,
-        budget: int,
-        run_path: CompactionRunPath,
-    ) -> list[ModelMessage] | None:
-        """
-        Force one summary of a failed request before reducing its window.
-
-        :param history: The last compacted request history from the failed run.
-        :param budget: The unchanged window against which that request ran.
-        :param run_path: The agent path whose request is being recovered.
-        :returns: A smaller history worth retrying, or None when narrowing is needed.
-        """
-        messages: list[ModelMessage] = history.messages
-        if not messages:
-            return None
-
-        before: int = estimate_token_count(messages)
-        try:
-            compacted: list[ModelMessage] = await force_summarize_history(
-                messages,
-                budget,
-                resolve_model(self._coder_model),
-                allow_subminimum=self._measured_context_window is not None,
-            )
-        except Exception:
-            logger.exception('Could not summarize the request history after a context overflow.')
-            await self._events.emit(
-                WarningEvent(
-                    content=(
-                        'The model had no room to reply. Loom tried summarizing the preceding request, '
-                        'but the summary could not be created before reducing the context window.'
-                    )
-                )
-            )
-            return None
-
-        after: int = estimate_token_count(compacted)
-        if after >= before:
-            await self._events.emit(
-                WarningEvent(
-                    content=(
-                        'The model had no room to reply. Loom tried summarizing the preceding request, '
-                        'but it did not free enough context to retry before reducing the context window.'
-                    )
-                )
-            )
-            return None
-
-        await self._report_compaction(run_path, before, after)
-        await self._events.emit(
-            WarningEvent(
-                content=(
-                    'The model had no room to reply. Loom summarized the preceding request and will '
-                    'retry before reducing the context window.'
-                )
-            )
-        )
-        return compacted
-
-    async def _run_with_overflow_recovery(
-        self,
-        run: Callable[[list[ModelMessage] | None], Awaitable[_RunResult]],
-        context_window: Callable[[], int],
-        history: RequestHistoryCapture,
-        run_path: CompactionRunPath,
-        on_retry: Callable[[], object] | None = None,
-    ) -> _RunResult:
-        """
-        Retry a long-running model call after a recoverable context overflow.
-
-        The supplied window reader identifies whether this attempt belongs to
-        the coder or planner budget. Narrowing still updates both budgets because
-        they use the same serving model.
-
-        :param run: Starts one model-run attempt with optional recovered history.
-        :param context_window: Reads the budget that owns each attempt.
-        :param history: Captures the final compacted request before a failed call.
-        :param run_path: Identifies recovery compaction in the event feed.
-        :param on_retry: Clears state belonging to an abandoned attempt.
-        :returns: The successful model-run result.
-        :raises Exception: If the failure is unrelated or cannot be recovered.
-        """
-        message_history: list[ModelMessage] | None = None
-        summary_attempted_window: int | None = None
-        while True:
-            try:
-                return await run(message_history)
-            except Exception as error:
-                if not looks_like_context_overflow(error):
-                    raise
-                budget: int = context_window()
-                if summary_attempted_window != budget:
-                    summary_attempted_window = budget
-                    message_history = await self._summarize_after_overflow(history, budget, run_path)
-                    if message_history is not None:
-                        if on_retry is not None:
-                            _ = on_retry()
-                        continue
-                if not await self._narrow_after_overflow(budget):
-                    raise
-                if on_retry is not None:
-                    _ = on_retry()
-
-    async def _run_coder_streaming(
-        self,
-        prompt: str,
-        agent: Agent[AgentDeps, str],
-        request_history: RequestHistoryCapture | None = None,
-        message_history: list[ModelMessage] | None = None,
-    ) -> str:
-        """
-        Run a coder agent, streaming its reasoning to the client as it goes.
-
-        Distinct from `_plan_as_text`, which planning uses: a plan is a single
-        artifact the client is shown once it exists, while executing and
-        answering are long runs whose reasoning is worth watching arrive.
-
-        The graph is run with `run()` and an event stream handler rather than
-        `run_stream()`. `run_stream()` stops the graph once it has an output
-        matching the output type, which for a text-output agent means it
-        executes only the first round of tool calls and abandons the rest. A
-        ReAct sequence such as read, edit, test, complete would be cut off after
-        its first step, so the agent could never finish the work.
-
-        :param prompt: The instruction to give the agent.
-        :param agent: The agent to run. The answering path uses a read-only one,
-            so a task judged to need no changes cannot make any.
-        :param request_history: Captures requests for caller-managed recovery.
-        :param message_history: Prior history to resume after caller-managed recovery.
-        :returns: The agent's final text output.
-        :raises StopRequested: If the user asked for the session to stop.
-        :raises ClientGone: If the client disconnected while the agent was running.
-        """
-        buffer: ThoughtBuffer = ThoughtBuffer()
-        terminal_successes_before_run: int = self._session.terminal_success_count
-
-        async def stream_thoughts(
-            context: RunContext[AgentDeps],
-            stream: AsyncIterable[AgentStreamEvent],
-        ) -> None:
-            """
-            Turn the model's text deltas into thoughts as the run proceeds.
-
-            Tool activity is not reported here: the tools already announce
-            themselves through the event bus.
-
-            :param context: The run context, unused.
-            :param stream: The events produced while the agent runs.
-            :raises StopRequested: If the user asked for the session to stop.
-            :raises ClientGone: If the client disconnected while the agent was running.
-            :raises TerminalToolCompleted: If a terminal tool succeeds during this run.
-            """
-            async for event in stream:
-                if self._inbox.stop_requested:
-                    # Checked per streamed event, which is what makes stopping
-                    # feel immediate rather than waiting out the current step.
-                    raise StopRequested()
-
-                if self._connection_lost.is_set():
-                    # Checked here as well as between states: running the agent is
-                    # the expensive phase, and waiting for it to finish would keep
-                    # calling the model for a client that has gone.
-                    raise ClientGone()
-
-                if isinstance(event, PartStartEvent) and isinstance(event.part, TextPart):
-                    for thought in buffer.add(event.part.content, monotonic()):
-                        await self._say(thought)
-                elif isinstance(event, PartDeltaEvent) and isinstance(event.delta, TextPartDelta):
-                    for thought in buffer.add(event.delta.content_delta, monotonic()):
-                        await self._say(thought)
-                elif (
-                    isinstance(event, FunctionToolResultEvent)
-                    and event.part.tool_name in TERMINAL_TOOL_NAMES
-                    and self._session.terminal_success_count > terminal_successes_before_run
-                ):
-                    raise TerminalToolCompleted(event.part.tool_name)
-
-        history: RequestHistoryCapture = (
-            request_history if request_history is not None else RequestHistoryCapture()
-        )
-
-        async def run_coder(
-            overflow_history: list[ModelMessage] | None,
-        ) -> AgentRunResult[str]:
-            """
-            Run one streaming coder attempt.
-
-            :returns: The coder's completed result.
-            """
-            return await agent.run(
-                prompt,
-                message_history=(
-                    overflow_history if overflow_history is not None else message_history
-                ),
-                deps=self._deps,
-                model=resolve_model(self._coder_model),
-                model_settings=self._model_settings_for(self._coder_context_window),
-                event_stream_handler=stream_thoughts,
-                usage_limits=UsageLimits(request_limit=None),
-                # Built per run rather than fixed on the agent: the budget is
-                # a user setting, and a capability attached at import time
-                # could not see it.
-                capabilities=[
-                    *self._compaction_capabilities_for(
-                        self._coder_context_window, CompactionRunPath.coder_streaming
-                    ),
-                    history,
-                    # After the ladder, so the reading describes the history
-                    # actually being sent rather than what triggered it.
-                    self._usage_monitor_for(
-                        self._coder_context_window, CODER_SYSTEM_PROMPT, agent
-                    ),
-                    self._provider_usage_monitor(),
-                ],
-            )
-
-        # Anything half-streamed belongs to an abandoned attempt, and emitting it
-        # alongside the retry's output would read as the model repeating itself.
-        try:
-            result: AgentRunResult[str] = await self._run_with_overflow_recovery(
-                run_coder,
-                lambda: self._coder_context_window,
-                history,
-                CompactionRunPath.coder_streaming,
-                buffer.flush,
-            )
-        except TerminalToolCompleted as completion:
-            buffered_thought: str | None = buffer.flush()
-            if buffered_thought is not None:
-                await self._say(buffered_thought)
-
-            if str(completion) == 'complete_task':
-                completion_output: str = self._session.completion_summary or ''
-            else:
-                completion_output = self._session.step_summaries[-1]
-            self._history.add(TurnRole.agent, completion_output)
-            return completion_output
-
-        remaining: str | None = buffer.flush()
-        if remaining is not None:
-            await self._say(remaining)
-
-        output: str = result.output
-        self._history.add(TurnRole.agent, output)
-        return output
-
     async def _handle_classifying(self) -> SessionState:
         """
         Decide whether the task requires changing any file, before planning it.
@@ -1366,7 +1004,7 @@ class AgentSession:
             'file, say so in your summary and stop; it will be replanned as ordinary work.'
         )
 
-        await self._run_coder_streaming(prompt, answering_agent)
+        await self._agent_run_helper.run_coder_streaming(prompt, answering_agent)
 
         # Nothing is checked about the working tree here, because the answering
         # agent has no tool that could have changed it: `create_file`,
@@ -1420,180 +1058,34 @@ class AgentSession:
         return SessionState.answered
 
     async def _handle_planning(self) -> SessionState:
-        """
-        Ask the coder agent for a plan and parse it.
+        """Delegate planning to the session planning coordinator.
 
         :returns: The next state.
         """
-        self._total_iterations += 1
-        if self._total_iterations > self._limits.max_total_iterations:
-            await self._events.emit(
-                ErrorEvent(
-                    content=(
-                        f'Reached the ceiling of {self._limits.max_total_iterations} '
-                        'iterations without completing the task. Stopping.'
-                    )
-                )
-            )
-            return SessionState.failed
-
-        await self._announce('Generating plan...', SessionStatus.planning)
-        self._history.advance_iteration()
-
-        prompt: str = self._build_planning_prompt()
-        plan: ParsedPlan = await self._plan_structured(prompt)
-
-        if plan.is_empty:
-            # One corrective attempt before giving up on this round, asking for
-            # prose rather than for structure: if the shape did not come back the
-            # first time, requesting it the same way again is unlikely to help,
-            # and the parser exists precisely for models that will not comply.
-            plan = parse_plan(await self._plan_as_text(f'{prompt}\n\n{NO_STEPS_CORRECTION}'))
-
-        if plan.is_empty:
-            await self._events.emit(
-                ErrorEvent(content='The agent produced no actionable plan steps.')
-            )
-            return SessionState.failed
-
-        self._plan = plan
-        self._history.add(TurnRole.agent, render_plan(plan))
-        return SessionState.waiting_plan_approval
+        return await self._planning_coordinator.handle_planning()
 
     async def _plan_structured(self, prompt: str) -> ParsedPlan:
-        """
-        Ask the planner for a structured plan, falling back to free text.
-
-        The fallback is not a formality. Small models frequently ignore a
-        requested output shape, and a plan that fails to arrive as structure is
-        still worth having as text — which is why the parser exists at all. A
-        failure here is logged rather than raised, because the caller has a
-        second attempt to make and an unusable plan is not an unusable session.
+        """Delegate structured planning to the session planning coordinator.
 
         :param prompt: The planning prompt.
-        :returns: The plan, structured if it could be, parsed from text if not.
+        :returns: The parsed structured plan.
         """
-        history: RequestHistoryCapture = RequestHistoryCapture()
-
-        async def run_structured(
-            message_history: list[ModelMessage] | None,
-        ) -> AgentRunResult[StructuredPlan]:
-            """
-            Run one structured-planning attempt.
-
-            :returns: The planner's structured result.
-            """
-            return await planner_agent.run(
-                prompt,
-                message_history=message_history,
-                deps=self._deps,
-                model=resolve_model(self._coder_model),
-                model_settings=self._model_settings_for(self._planner_context_window),
-                usage_limits=UsageLimits(request_limit=None),
-                capabilities=[
-                    *self._compaction_capabilities_for(
-                        self._planner_context_window, CompactionRunPath.structured_planning
-                    ),
-                    history,
-                    self._usage_monitor_for(
-                        self._planner_context_window, PLANNER_SYSTEM_PROMPT, planner_agent
-                    ),
-                    self._provider_usage_monitor(),
-                ],
-            )
-
-        try:
-            result: AgentRunResult[StructuredPlan] = await self._run_with_overflow_recovery(
-                run_structured,
-                lambda: self._planner_context_window,
-                history,
-                CompactionRunPath.structured_planning,
-            )
-        except Exception as error:
-            if looks_like_context_overflow(error):
-                raise
-            logger.warning('Structured planning failed, falling back to text: %s', error)
-            return parse_plan(await self._plan_as_text(prompt))
-
-        steps: list[PlanStep] = [
-            PlanStep(title=step.title.strip(), description=step.description.strip())
-            for step in result.output.steps
-            if step.title.strip()
-        ]
-
-        if not steps:
-            # Structure arrived but said nothing, which the text path may still
-            # recover something from.
-            return parse_plan(await self._plan_as_text(prompt))
-
-        return ParsedPlan(steps=steps, used_fallback=False, format=PlanFormat.structured)
+        return await self._planning_coordinator.plan_structured(prompt)
 
     async def _plan_as_text(self, prompt: str) -> str:
+        """Delegate text planning to the session planning coordinator.
+
+        :param prompt: The planning prompt.
+        :returns: The planner output.
         """
-        Ask the planner for a plan as prose, for `parse_plan` to read.
-
-        The planner rather than the coder, despite the coder being the agent
-        that returns text by default. The coder carries `edit_file`,
-        `create_file` and `commit_changes`, so asking it to plan let it start
-        writing and committing code before the user had approved anything. The
-        planner carries the read-only tools but none of those, and `output_type`
-        is overridden per run rather than on the agent, so the structured path it
-        exists for is untouched.
-
-        :param prompt: The prompt to send.
-        :returns: The planner's output, as text.
-        """
-        history: RequestHistoryCapture = RequestHistoryCapture()
-
-        async def run_text(message_history: list[ModelMessage] | None) -> AgentRunResult[str]:
-            """
-            Run one text-planning attempt.
-
-            :returns: The planner's text result.
-            """
-            return await planner_agent.run(
-                prompt,
-                message_history=message_history,
-                output_type=str,
-                deps=self._deps,
-                model=resolve_model(self._coder_model),
-                model_settings=self._model_settings_for(self._planner_context_window),
-                usage_limits=UsageLimits(request_limit=None),
-                capabilities=[
-                    *self._compaction_capabilities_for(
-                        self._planner_context_window, CompactionRunPath.text_planning
-                    ),
-                    history,
-                    self._usage_monitor_for(
-                        self._planner_context_window, PLANNER_SYSTEM_PROMPT, planner_agent
-                    ),
-                    self._provider_usage_monitor(),
-                ],
-            )
-
-        result: AgentRunResult[str] = await self._run_with_overflow_recovery(
-            run_text,
-            lambda: self._planner_context_window,
-            history,
-            CompactionRunPath.text_planning,
-        )
-        return result.output
+        return await self._planning_coordinator.plan_as_text(prompt)
 
     def _build_planning_prompt(self) -> str:
-        """
-        Build the planning prompt, including everything learned so far.
+        """Delegate planning-prompt construction to the planning coordinator.
 
-        Feeding the accumulated history back in is what lets a rejected plan or a
-        reviewer's criticism actually change the next attempt.
-
-        :returns: The prompt to send to the coder agent.
+        :returns: The planning prompt.
         """
-        context: str = self._history.build_context(CONTEXT_TOKEN_BUDGET)
-        sections: list[str] = [f'Task: {self._task}']
-        if context:
-            sections.append(f'What has happened so far:\n{context}')
-        sections.append('Produce a step-by-step plan for this task.')
-        return '\n\n'.join(sections)
+        return self._planning_coordinator.build_planning_prompt()
 
     async def _handle_waiting_plan_approval(self) -> SessionState:
         """
@@ -1682,7 +1174,7 @@ class AgentSession:
                 f'Step {position} of {len(steps)}: {step.title}', SessionStatus.executing
             )
             await self._execute_step(step, position, len(steps))
-            await self._resolve_commit_failures()
+            await self._commit_sweeper.resolve_commit_failures()
 
         return await self._finish_execution()
 
@@ -1710,7 +1202,9 @@ class AgentSession:
         prompt: str = self._build_step_prompt(step, position, total)
         history: RequestHistoryCapture = RequestHistoryCapture()
         try:
-            await self._run_coder_streaming(prompt, coder_agent, request_history=history)
+            await self._agent_run_helper.run_coder_streaming(
+                prompt, coder_agent, request_history=history
+            )
         except UnexpectedModelBehavior as error:
             if not _looks_like_tool_retry_exhaustion(error):
                 raise
@@ -1719,7 +1213,7 @@ class AgentSession:
                 history
             )
             try:
-                await self._run_coder_streaming(
+                await self._agent_run_helper.run_coder_streaming(
                     prompt,
                     coder_agent,
                     request_history=history,
@@ -1829,144 +1323,19 @@ class AgentSession:
             self._context_window_warning_emitted = True
 
     async def _sweep_uncommitted(self) -> None:
+        """Delegate the final working-tree sweep to the commit sweeper.
+
+        :returns: None.
         """
-        Commit anything left in the working tree once every step has run.
-
-        Steps commit their own work, but a step that ended without reporting
-        completion does not, and neither does one whose commit failed. Left
-        alone, that work would reach neither the reviewer nor the merge, both of
-        which read only commits — the exact loss this phase exists to prevent.
-
-        Announced as a warning rather than done quietly: a commit nobody asked
-        for, covering work nobody described, is worth knowing about.
-        """
-        if not self._branch_created:
-            return
-        if not await self._services.git.has_uncommitted_changes():
-            return
-
-        result: CommitResult = await self._services.git.commit_changes_with_retry(
-            'Remaining changes not committed by any step'
-        )
-
-        if result.failed:
-            await self._events.emit(
-                WarningEvent(
-                    content=(
-                        f'Changes are left uncommitted and could not be swept up: {result.error}. '
-                        'They will not appear in the review or the merge.'
-                    )
-                )
-            )
-            self._session.record_commit_failure(self._session.current_step or 'Remaining changes')
-            return
-
-        if result.commit is None:
-            return
-
-        await self._events.emit(
-            CommitEvent(
-                commit_hash=result.commit.commit_hash,
-                message=result.commit.message,
-                files_changed=result.commit.files_changed,
-            )
-        )
-        await self._events.emit(
-            WarningEvent(
-                content=(
-                    'Some changes were not committed by the step that made them, so they have '
-                    'been committed together to keep them visible to the review.'
-                )
-            )
-        )
+        await self._commit_sweeper.sweep_uncommitted()
 
     async def _resolve_commit_failures(self) -> None:
-        """
-        Stop and ask once commits have failed repeatedly.
+        """Delegate repeated commit-failure resolution to the commit sweeper.
 
-        A run of failures usually means something that will not clear on its own
-        — an unconfigured identity, a full disk, a read-only repository. Carrying
-        on would accumulate work that neither the reviewer nor the merge can see,
-        since both read only commits, so the user is asked while the work is
-        still recoverable rather than told about it at the end.
-
-        The user is offered the chance to commit by hand, because that is often
-        the fastest fix and Loom has no business guessing at someone's git
-        configuration. Their claim is checked rather than believed: if the tree
-        is still dirty afterwards, they are asked again.
-
+        :returns: None.
         :raises StopRequested: If the user chooses to stop.
         """
-        while self._session.consecutive_commit_failures >= MAX_CONSECUTIVE_COMMIT_FAILURES:
-            failures: int = self._session.consecutive_commit_failures
-            stranded: str = ', '.join(self._session.uncommitted_steps) or 'the current step'
-            questioner: UserQuestioner | None = self._deps.questioner
-
-            if questioner is None:
-                # No one to ask. Warning and continuing is the lesser evil: the
-                # changes are on disk, and stopping a session nobody is watching
-                # would discard them for no one's benefit.
-                await self._events.emit(
-                    WarningEvent(
-                        content=(
-                            f'{failures} commits in a row have failed and there is no one to ask '
-                            f'how to proceed. Work for {stranded} is uncommitted and will not be '
-                            'reviewed or merged.'
-                        )
-                    )
-                )
-                return
-
-            reply, _ = await questioner.ask(
-                f'{failures} commits in a row have failed. Work for {stranded} is sitting '
-                'uncommitted, and neither the review nor the merge can see it. How should '
-                'Loom proceed?',
-                list(COMMIT_FAILURE_OPTIONS),
-            )
-            answer: str = reply.strip().lower()
-
-            # Matched exactly against the offered options first. Every option
-            # mentions committing, so a substring test reads "carry on without
-            # committing" as a claim that a commit was made and clears the very
-            # warning the user asked to keep.
-            if answer == COMMIT_FAILURE_STOP.lower() or answer == 'stop':
-                raise StopRequested()
-
-            claimed_commit: bool = answer == COMMIT_FAILURE_COMMITTED.lower() or (
-                # A reply typed by hand rather than chosen. "Committed" means a
-                # claim; "without committing" is the opposite of one.
-                'commit' in answer and 'without' not in answer and 'not ' not in answer
-            )
-
-            if claimed_commit:
-                if await self._services.git.has_uncommitted_changes():
-                    await self._events.emit(
-                        WarningEvent(
-                            content=(
-                                'The working tree still has uncommitted changes, so nothing was '
-                                'committed. Asking again.'
-                            )
-                        )
-                    )
-                    continue
-                self._session.record_commit_success()
-                self._session.clear_pending_changes()
-                await self._announce('The changes were committed. Continuing with the plan.')
-                return
-
-            # Carrying on knowingly. The run of failures is cleared so the
-            # question is not repeated at every remaining step, but the stranded
-            # steps stay recorded so the final summary still says so.
-            self._session.forgive_commit_failures()
-            await self._events.emit(
-                WarningEvent(
-                    content=(
-                        'Continuing without committing, at your request. Uncommitted work will '
-                        'not appear in the review or the merge.'
-                    )
-                )
-            )
-            return
+        await self._commit_sweeper.resolve_commit_failures()
 
     def _build_step_prompt(self, step: PlanStep | None, position: int, total: int) -> str:
         """
@@ -2049,7 +1418,7 @@ class AgentSession:
 
         :returns: The next state.
         """
-        await self._sweep_uncommitted()
+        await self._commit_sweeper.sweep_uncommitted()
 
         summaries: Sequence[str] = self._session.step_summaries
         if summaries:

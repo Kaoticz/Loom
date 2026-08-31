@@ -12,7 +12,9 @@ from collections.abc import AsyncIterator, Callable
 from pydantic_ai.messages import ModelMessage, ModelResponse, TextPart, ToolCallPart
 from pydantic_ai.models.function import AgentInfo, DeltaToolCall, FunctionModel
 
-import api.v1.agent_session as agent_session_module
+import api.v1.agent_session.agent_run_helper as agent_run_helper_module
+import api.v1.agent_session.agent_session as agent_session_module
+import api.v1.agent_session.context_overflow_recovery as context_overflow_recovery_module
 from api.v1.agent_session import AgentSession
 from services.event_bus import (
     AgentEvent,
@@ -87,7 +89,7 @@ def install_model(
     model: FunctionModel = scripted_model(responses)
     # The resolver is a module level function now, so it is patched where the
     # session looks it up rather than on the class.
-    monkeypatch.setattr(agent_session_module, 'resolve_model', lambda name: model)
+    monkeypatch.setattr(agent_run_helper_module, 'resolve_model', lambda name: model)
 
 
 def prepare(
@@ -607,7 +609,7 @@ async def test_an_answering_task_is_offered_no_tool_that_writes(
     """
     offered: list[list[str]] = []
     session, _ = prepare(monkeypatch, [], git_repo)
-    monkeypatch.setattr(agent_session_module, 'resolve_model', lambda name: recording_model(offered))
+    monkeypatch.setattr(agent_run_helper_module, 'resolve_model', lambda name: recording_model(offered))
     session._session.record_classification(False)
 
     await session._handle_answering()
@@ -631,7 +633,7 @@ async def test_an_ordinary_task_is_still_offered_the_writing_tools(
     """
     offered: list[list[str]] = []
     session, _ = prepare(monkeypatch, [], git_repo)
-    monkeypatch.setattr(agent_session_module, 'resolve_model', lambda name: recording_model(offered))
+    monkeypatch.setattr(agent_run_helper_module, 'resolve_model', lambda name: recording_model(offered))
     session._session.record_classification(True)
 
     await session._handle_executing()
@@ -684,7 +686,7 @@ async def test_a_frontend_repository_is_told_to_use_agent_browser(
     seen: list[str] = []
     session, _ = prepare(monkeypatch, [], git_repo)
     monkeypatch.setattr(
-        agent_session_module, 'resolve_model', lambda name: prompt_recording_model(seen)
+        agent_run_helper_module, 'resolve_model', lambda name: prompt_recording_model(seen)
     )
     session._services.git.repo_path = str(repo)
 
@@ -711,7 +713,7 @@ async def test_a_backend_only_repository_is_told_nothing_about_browsers(
     seen: list[str] = []
     session, _ = prepare(monkeypatch, [], git_repo)
     monkeypatch.setattr(
-        agent_session_module, 'resolve_model', lambda name: prompt_recording_model(seen)
+        agent_run_helper_module, 'resolve_model', lambda name: prompt_recording_model(seen)
     )
     session._services.git.repo_path = str(repo)
 
@@ -739,7 +741,7 @@ async def test_a_node_backend_is_not_mistaken_for_a_frontend(
     seen: list[str] = []
     session, _ = prepare(monkeypatch, [], git_repo)
     monkeypatch.setattr(
-        agent_session_module, 'resolve_model', lambda name: prompt_recording_model(seen)
+        agent_run_helper_module, 'resolve_model', lambda name: prompt_recording_model(seen)
     )
     session._services.git.repo_path = str(repo)
 
@@ -805,7 +807,7 @@ async def test_the_coder_run_carries_the_configured_budget(
     """
     windows: list[int | None] = []
     session, _ = prepare(monkeypatch, [], git_repo)
-    monkeypatch.setattr(agent_session_module, 'resolve_model', lambda name: quiet_model())
+    monkeypatch.setattr(agent_run_helper_module, 'resolve_model', lambda name: quiet_model())
     monkeypatch.setattr(agent_session_module, 'build_compaction', budget_recording(windows))
     session._coder_context_window = 40_000
     session._session.record_classification(True)
@@ -829,7 +831,7 @@ async def test_an_unset_budget_still_compacts(
     """
     windows: list[int | None] = []
     session, _ = prepare(monkeypatch, [], git_repo)
-    monkeypatch.setattr(agent_session_module, 'resolve_model', lambda name: quiet_model())
+    monkeypatch.setattr(agent_run_helper_module, 'resolve_model', lambda name: quiet_model())
     monkeypatch.setattr(agent_session_module, 'build_compaction', budget_recording(windows))
     session._coder_context_window = 0
     session._session.record_classification(True)
@@ -947,7 +949,7 @@ async def test_a_structured_plan_is_used_as_it_arrives(
     monkeypatch.setattr(planner_module.planner_agent, 'run', structured)
 
     session, _, _, _ = build_session([json.dumps({'prompt': 'do something'})])
-    plan = await session._plan_structured('irrelevant')
+    plan = await session._planning_coordinator.plan_structured('irrelevant')
 
     assert plan.titles == ['Read the config', 'Raise the timeout']
     # Structured, not text: the fallback must not have run.
@@ -979,7 +981,7 @@ async def test_a_structured_plan_drops_steps_without_a_title(
     monkeypatch.setattr(planner_module.planner_agent, 'run', structured)
 
     session, _, _, _ = build_session([json.dumps({'prompt': 'do something'})])
-    plan = await session._plan_structured('irrelevant')
+    plan = await session._planning_coordinator.plan_structured('irrelevant')
 
     assert plan.titles == ['Real step']
 
@@ -1056,10 +1058,10 @@ async def test_a_planner_question_reaches_the_user_and_the_answer_comes_back(
         return ModelResponse(parts=[TextPart('1. Add exponential backoff to the client.')])
 
     monkeypatch.setattr(
-        agent_session_module, 'resolve_model', lambda name: FunctionModel(converse)
+        agent_run_helper_module, 'resolve_model', lambda name: FunctionModel(converse)
     )
 
-    plan = await session._plan_as_text('irrelevant')
+    plan = await session._planning_coordinator.plan_as_text('irrelevant')
 
     assert answered == ['Which retry policy?']
     assert 'exponential backoff' in plan.lower()
@@ -1151,7 +1153,7 @@ async def test_a_three_step_plan_runs_three_times(
     session, _ = prepare(monkeypatch, [], git_repo)
     session._plan = three_step_plan()
     monkeypatch.setattr(
-        agent_session_module, 'resolve_model', lambda name: counting_model(prompts, [])
+        agent_run_helper_module, 'resolve_model', lambda name: counting_model(prompts, [])
     )
 
     assert await session._handle_executing() is SessionState.reviewing
@@ -1168,7 +1170,7 @@ async def test_each_step_is_told_which_step_it_is(
     session, _ = prepare(monkeypatch, [], git_repo)
     session._plan = three_step_plan()
     monkeypatch.setattr(
-        agent_session_module, 'resolve_model', lambda name: counting_model(prompts, [])
+        agent_run_helper_module, 'resolve_model', lambda name: counting_model(prompts, [])
     )
 
     await session._handle_executing()
@@ -1192,7 +1194,7 @@ async def test_a_later_step_is_told_what_earlier_steps_did(
     session, _ = prepare(monkeypatch, [], git_repo)
     session._plan = three_step_plan()
     monkeypatch.setattr(
-        agent_session_module, 'resolve_model', lambda name: counting_model(prompts, [
+        agent_run_helper_module, 'resolve_model', lambda name: counting_model(prompts, [
             ModelResponse(parts=[ToolCallPart(
                 tool_name='accept_step_without_changes',
                 args={'summary': 'The timeout lives in config.py line 12.'},
@@ -1494,7 +1496,7 @@ async def test_repeated_commit_failures_stop_and_ask(
 
     monkeypatch.setattr(session._services.git, 'has_uncommitted_changes', has_changes)
 
-    await session._resolve_commit_failures()
+    await session._commit_sweeper.resolve_commit_failures()
 
     # Asked twice: the first claim was checked and found untrue.
     assert len(asked) == 2
@@ -1522,7 +1524,7 @@ async def test_carrying_on_after_commit_failures_stops_asking(
 
     session._deps.questioner = Questioner()  # type: ignore[assignment]
 
-    await session._resolve_commit_failures()
+    await session._commit_sweeper.resolve_commit_failures()
 
     assert context.consecutive_commit_failures == 0
     assert list(context.uncommitted_steps) == ['Raise the timeout']
@@ -1542,7 +1544,7 @@ async def test_commit_failures_with_nobody_to_ask_do_not_hang(
         context.record_commit_failure('Raise the timeout')
     session._deps.questioner = None
 
-    await session._resolve_commit_failures()
+    await session._commit_sweeper.resolve_commit_failures()
 
     warnings = [event for event in events if isinstance(event, WarningEvent)]
     assert warnings
@@ -1600,7 +1602,7 @@ async def test_leftover_changes_are_swept_into_a_commit(
     session._services.git = git_repo
     Path(git_repo.repo_path, 'stray.py').write_text('value = 1\n', encoding='utf-8')
 
-    await session._sweep_uncommitted()
+    await session._commit_sweeper.sweep_uncommitted()
 
     committed: list[str] = [change.path for change in await git_repo.get_changed_files()]
     assert 'stray.py' in committed
@@ -1622,7 +1624,7 @@ async def test_a_clean_tree_is_not_swept(
     session._branch_created = True
     session._services.git = git_repo
 
-    await session._sweep_uncommitted()
+    await session._commit_sweeper.sweep_uncommitted()
 
     assert [event for event in events if isinstance(event, WarningEvent)] == []
 
@@ -1643,7 +1645,7 @@ async def test_an_established_command_is_carried_to_later_steps(
     session._session.note_command_passed('pytest -q tests/')
     session._session.record_test_command('pytest -q tests/')
     monkeypatch.setattr(
-        agent_session_module, 'resolve_model', lambda name: counting_model(prompts, [])
+        agent_run_helper_module, 'resolve_model', lambda name: counting_model(prompts, [])
     )
 
     await session._handle_executing()
@@ -1665,7 +1667,7 @@ async def test_a_waived_plan_never_mentions_testing_again(
     session._plan = three_step_plan()
     session._session.waive_verification('The user asked to skip tests for this task.')
     monkeypatch.setattr(
-        agent_session_module, 'resolve_model', lambda name: counting_model(prompts, [])
+        agent_run_helper_module, 'resolve_model', lambda name: counting_model(prompts, [])
     )
 
     await session._handle_executing()
@@ -1852,7 +1854,7 @@ async def test_a_window_too_large_is_narrowed_and_the_run_retried(
             )
         return await original(*args, **kwargs)
 
-    monkeypatch.setattr(agent_session_module, 'resolve_model', lambda name: quiet_model())
+    monkeypatch.setattr(agent_run_helper_module, 'resolve_model', lambda name: quiet_model())
     monkeypatch.setattr(coder_module.coder_agent, 'run', overflow_once)
 
     await session._handle_executing()
@@ -1905,7 +1907,7 @@ async def test_tool_retry_exhaustion_retries_once_after_compaction(
         compactions.append(1)
         return None
 
-    monkeypatch.setattr(agent_session_module, 'resolve_model', lambda name: quiet_model())
+    monkeypatch.setattr(agent_run_helper_module, 'resolve_model', lambda name: quiet_model())
     monkeypatch.setattr(coder_module.coder_agent, 'run', fails_once)
     monkeypatch.setattr(session, '_compact_after_tool_retry_exhaustion', compact)
 
@@ -1951,7 +1953,7 @@ async def test_persistent_tool_retry_exhaustion_marks_the_step_incomplete(
         compactions.append(1)
         return None
 
-    monkeypatch.setattr(agent_session_module, 'resolve_model', lambda name: quiet_model())
+    monkeypatch.setattr(agent_run_helper_module, 'resolve_model', lambda name: quiet_model())
     monkeypatch.setattr(coder_module.coder_agent, 'run', always_fails)
     monkeypatch.setattr(session, '_compact_after_tool_retry_exhaustion', compact)
 
@@ -2035,7 +2037,7 @@ async def test_a_provider_context_rejection_is_narrowed_and_retried(
             )
         return await original(*args, **kwargs)
 
-    monkeypatch.setattr(agent_session_module, 'resolve_model', lambda name: quiet_model())
+    monkeypatch.setattr(agent_run_helper_module, 'resolve_model', lambda name: quiet_model())
     monkeypatch.setattr(coder_module.coder_agent, 'run', reject_once)
 
     await session._handle_executing()
@@ -2058,7 +2060,7 @@ async def test_an_unworkable_window_is_explained_before_the_first_step(
     session, events = prepare(monkeypatch, [], git_repo)
     session._plan = three_step_plan()
     session._coder_context_window = 4_096
-    monkeypatch.setattr(agent_session_module, 'resolve_model', lambda name: quiet_model())
+    monkeypatch.setattr(agent_run_helper_module, 'resolve_model', lambda name: quiet_model())
 
     await session._handle_executing()
 
@@ -2116,7 +2118,7 @@ async def test_narrowing_stops_once_it_cannot_help(
     session, events = prepare(monkeypatch, [], git_repo)
     session._coder_context_window = 8_003
 
-    narrowed: bool = await session._narrow_after_overflow(8_003)
+    narrowed: bool = await session._overflow_recovery.narrow_after_overflow(8_003)
 
     assert narrowed is False, 'narrowing should have stopped'
     warnings = [event for event in events if isinstance(event, WarningEvent)]
@@ -2133,7 +2135,7 @@ async def test_narrowing_still_happens_while_it_can_help(
     session, _ = prepare(monkeypatch, [], git_repo)
     session._coder_context_window = 128_048
 
-    assert await session._narrow_after_overflow(128_048) is True
+    assert await session._overflow_recovery.narrow_after_overflow(128_048) is True
     assert session._coder_context_window == 64_024
 
 
@@ -2298,10 +2300,10 @@ async def test_forced_summary_precedes_narrowing_and_retries_with_its_history(
         calls.append('narrow')
         return False
 
-    monkeypatch.setattr(session, '_summarize_after_overflow', summarize)
-    monkeypatch.setattr(session, '_narrow_after_overflow', narrow)
+    monkeypatch.setattr(session._overflow_recovery, 'summarize_after_overflow', summarize)
+    monkeypatch.setattr(session._overflow_recovery, 'narrow_after_overflow', narrow)
 
-    result: str = await session._run_with_overflow_recovery(
+    result: str = await session._overflow_recovery.run_with_overflow_recovery(
         run,
         lambda: 32_768,
         history,
@@ -2337,9 +2339,9 @@ async def test_forced_summary_emits_a_distinct_recovery_warning(
         """
         return compacted
 
-    monkeypatch.setattr(agent_session_module, 'force_summarize_history', summarize)
+    monkeypatch.setattr(context_overflow_recovery_module, 'force_summarize_history', summarize)
 
-    result: list[ModelMessage] | None = await session._summarize_after_overflow(
+    result: list[ModelMessage] | None = await session._overflow_recovery.summarize_after_overflow(
         history, 32_768, CompactionRunPath.coder_streaming
     )
 
