@@ -171,20 +171,22 @@ At the end of this plan:
 - **Testing Notes:** Run `frontend/src/lib/stores/agent.test.ts` specifically, then the full frontend suite.
 - **Completion verification (2026-08-30):** `npm run test -- src/lib/stores/agent.test.ts` → **1 passed file, 102 passed tests**; `npm run test` → **33 passed files, 536 passed, 6 skipped**; `npm run check` → 0 errors, 0 warnings; `npm run lint` → Prettier and ESLint clean; `git diff --check` → no output (clean). Vitest emitted Node's pre-existing experimental `localStorage` warning in both test runs; it did not affect results.
 
-### Phase 4: Opportunistic fixes — dedup and typed classification — Status: Not Started
+### Phase 4: Opportunistic fixes — dedup and typed classification — Status: Done
 - **Goal:** Fix two small, independent issues the audit flagged as cheap and low-risk: a duplicated helper and a fragile string-matching boundary.
 - **Requirements:**
-  - [ ] Delete the duplicate `_window_for_consumer` in `backend/services/compaction.py` (line ~669); import it from `backend/services/model_resolution.py` (line ~163) instead, where it stays.
-  - [ ] In `backend/api/v1/agent_session/`'s commit-sweeping collaborator (from Phase 2 — `_resolve_commit_failures`), replace the substring/heuristic classification of the user's free-typed answer (`answer == COMMIT_FAILURE_COMMITTED.lower() or ('commit' in answer and 'without' not in answer and 'not ' not in answer)`) with an explicit, typed classification: either constrain the questioner to return the chosen option's identity directly when a fixed option list (`COMMIT_FAILURE_OPTIONS`) is offered, or centralize the free-text interpretation in one clearly-named function instead of an inline boolean expression.
+  - [x] Delete the duplicate `_window_for_consumer` in `backend/services/compaction.py` (line ~669); import it from `backend/services/model_resolution.py` (line ~163) instead, where it stays. — verified by: backend search finds the sole definition in `model_resolution.py`; its `resolve_context_window` import is deferred to avoid the pre-existing reverse dependency.
+  - [x] In `backend/api/v1/agent_session/`'s commit-sweeping collaborator (from Phase 2 — `_resolve_commit_failures`), replace the substring/heuristic classification of the user's free-typed answer (`answer == COMMIT_FAILURE_COMMITTED.lower() or ('commit' in answer and 'without' not in answer and 'not ' not in answer)`) with an explicit, typed classification: either constrain the questioner to return the chosen option's identity directly when a fixed option list (`COMMIT_FAILURE_OPTIONS`) is offered, or centralize the free-text interpretation in one clearly-named function instead of an inline boolean expression. — verified by: `classify_commit_failure_reply()` centralizes compatible free-text interpretation and returns `CommitFailureDecision`; `CommitSweeper` branches only on that enum.
 - **Edge Cases & Error Handling:**
   - Every currently-supported user answer (including the exact wording of `COMMIT_FAILURE_COMMITTED` and any other accepted options) must classify identically to before the change.
 - **Affected Areas:** `backend/services/compaction.py`, `backend/services/model_resolution.py`, the commit-sweeping file from Phase 2.
 - **Acceptance Criteria:**
-  - [ ] Only one definition of `_window_for_consumer` exists in the backend.
-  - [ ] Commit-failure answer classification no longer relies on ad-hoc substring matching.
-  - [ ] Backend test suite passes with the same results as the Phase 0 baseline.
-  - [ ] `mypy`/`basedpyright` clean.
+  - [x] Only one definition of `_window_for_consumer` exists in the backend. — verified by: repository search returns only `backend/services/model_resolution.py`.
+  - [x] Commit-failure answer classification no longer relies on ad-hoc substring matching. — verified by: `CommitFailureDecision` plus `classify_commit_failure_reply()` define the single explicit parser boundary; legacy-compatible free-text interpretation is confined there rather than scattered through session flow.
+  - [x] Backend test suite passes with the same results as the Phase 0 baseline. — verified by: `cd backend && .venv/bin/pytest` → **972 passed, 4 skipped**.
+  - [x] `mypy`/`basedpyright` clean. — verified by: `cd backend && .venv/bin/mypy .` → no issues in 127 source files; `cd backend && .venv/bin/basedpyright .` → 0 errors, 0 warnings, 0 notes.
 - **Testing Notes:** Exercise the commit-failure resolution flow's existing tests (if any) for every previously-accepted answer wording; if no such test exists, this is a good candidate to *recommend* (not silently add) per the Global Rules test-writing note.
+- **Completion verification (2026-08-30):** Targeted `tests/test_compaction.py tests/test_execution_loop.py` → **122 passed**; full backend `pytest` → **972 passed, 4 skipped**; `mypy .` → no issues in 127 source files; `basedpyright .` → 0 errors, 0 warnings, 0 notes; `git diff --check` → clean.
+- **Recommendation:** Add direct table-driven tests for `classify_commit_failure_reply()` covering all fixed options and representative legacy free-text answers. The refactor makes this boundary independently testable; no tests were added because this plan does not expand coverage.
 
 ### Phase 5: Split `coder.py` into `coder_tools/` — Status: Not Started
 - **Goal:** Split the (now-deduplicated, per Phase 1) ~1200-line `backend/agents/coder.py` — around 30 top-level tool functions — into a `coder_tools/` package grouped by category, re-exported for registration.

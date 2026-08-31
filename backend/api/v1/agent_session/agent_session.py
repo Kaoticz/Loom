@@ -96,12 +96,14 @@ from database.models.file import File
 from database.models.task import Task
 from uuid import UUID, uuid4
 from .agent_run_helper import AgentRunHelper
-from .commit_sweeper import CommitSweeper
-from .commit_sweeper import (
+from .commit_failure_decision import (
     COMMIT_FAILURE_COMMITTED,
     COMMIT_FAILURE_OPTIONS,
     COMMIT_FAILURE_STOP,
+)
+from .commit_sweeper import (
     MAX_CONSECUTIVE_COMMIT_FAILURES,
+    CommitSweeper,
 )
 from .context_overflow_recovery import ContextOverflowRecovery
 from .planning_coordinator import PlanningCoordinator

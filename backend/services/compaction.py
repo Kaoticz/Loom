@@ -29,6 +29,7 @@ from pydantic_ai_harness.compaction import (
     estimate_token_count,
 )
 from pydantic_ai.exceptions import ModelHTTPError
+from services.model_resolution import _window_for_consumer
 
 if TYPE_CHECKING:
     from pydantic_ai.models import ModelRequestContext
@@ -664,16 +665,3 @@ def build_usage_monitor(
         on_usage=on_usage,
         context_window=_window_for_consumer(context_window, allow_subminimum),
     )
-
-
-def _window_for_consumer(context_window: int | None, allow_subminimum: bool) -> int:
-    """
-    Resolve a requested window while preserving a known small model limit.
-
-    :param context_window: The requested window, or None for the default.
-    :param allow_subminimum: Whether a positive window may remain below Loom's floor.
-    :returns: The window suitable for compaction or monitoring.
-    """
-    if allow_subminimum and context_window is not None and context_window > 0:
-        return context_window
-    return resolve_context_window(context_window)

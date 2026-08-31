@@ -6,7 +6,6 @@ from typing import Any
 from httpx import AsyncClient, HTTPError, Response
 from pydantic_ai.models.openai import OpenAIChatModel, OpenAIChatModelSettings
 
-from services.compaction import resolve_context_window
 from pydantic_ai.providers.openai import OpenAIProvider
 from services.ollama_model_metadata import context_length_from_model_info, num_ctx_from_parameters
 
@@ -105,6 +104,10 @@ def effective_context_window(configured: int | None, measured: int | None) -> in
     :param measured: The window Ollama reported, or None when unavailable.
     :returns: The effective window to use for a run.
     """
+    # `compaction` uses this module's shared consumer helper, so defer its
+    # broader resolution import until both modules have initialized.
+    from services.compaction import resolve_context_window
+
     if configured is None or configured <= 0:
         if measured is not None:
             return measured
@@ -170,4 +173,8 @@ def _window_for_consumer(context_window: int | None, allow_subminimum: bool) -> 
     """
     if allow_subminimum and context_window is not None and context_window > 0:
         return context_window
+    # `compaction` imports this helper, so its broader window resolution remains
+    # deferred until the helper is called after both modules have initialized.
+    from services.compaction import resolve_context_window
+
     return resolve_context_window(context_window)

@@ -1,13 +1,13 @@
 from .agent_run_helper import AgentRunHelper
 from .agent_session import AgentSession
-from .commit_sweeper import (
+from .commit_failure_decision import (
     COMMIT_FAILURE_COMMITTED,
     COMMIT_FAILURE_CONTINUE,
     COMMIT_FAILURE_OPTIONS,
     COMMIT_FAILURE_STOP,
-    MAX_CONSECUTIVE_COMMIT_FAILURES,
-    CommitSweeper,
+    CommitFailureDecision,
 )
+from .commit_sweeper import MAX_CONSECUTIVE_COMMIT_FAILURES, CommitSweeper
 from .context_overflow_recovery import ContextOverflowRecovery
 from .planning_coordinator import PlanningCoordinator
 from .session_services import SessionServices
@@ -21,6 +21,7 @@ __all__: list[str] = [
     'COMMIT_FAILURE_CONTINUE',
     'COMMIT_FAILURE_OPTIONS',
     'COMMIT_FAILURE_STOP',
+    'CommitFailureDecision',
     'CommitSweeper',
     'ContextOverflowRecovery',
     'ClientGone',

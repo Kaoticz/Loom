@@ -6,6 +6,12 @@ from services.event_bus import CommitEvent, WarningEvent
 from services.git_manager import CommitResult
 from services.user_questions import StopRequested, UserQuestioner
 
+from .commit_failure_decision import (
+    COMMIT_FAILURE_OPTIONS,
+    CommitFailureDecision,
+    classify_commit_failure_reply,
+)
+
 if TYPE_CHECKING:
     from .agent_session import AgentSession
 
@@ -19,25 +25,6 @@ and clears by itself, and the retry inside the commit already covers that. Three
 in a row is a configuration problem, and every further step past it adds work
 that neither the review nor the merge can see.
 """
-
-COMMIT_FAILURE_COMMITTED: str = 'I have committed the changes myself'
-COMMIT_FAILURE_CONTINUE: str = 'Carry on without committing'
-COMMIT_FAILURE_STOP: str = 'Stop the session'
-
-COMMIT_FAILURE_OPTIONS: tuple[str, ...] = (
-    COMMIT_FAILURE_COMMITTED,
-    COMMIT_FAILURE_CONTINUE,
-    COMMIT_FAILURE_STOP,
-)
-"""
-What the user may do about commits that keep failing.
-
-Committing by hand is offered first because it is usually the quickest fix and
-Loom has no business guessing at someone's git configuration. The claim is
-verified rather than trusted, so choosing it wrongly costs another question
-rather than a lost step.
-"""
-
 
 class CommitSweeper:
     """
@@ -136,18 +123,11 @@ class CommitSweeper:
                 'Loom proceed?',
                 list(COMMIT_FAILURE_OPTIONS),
             )
-            answer: str = reply.strip().lower()
-
-            if answer == COMMIT_FAILURE_STOP.lower() or answer == 'stop':
+            decision: CommitFailureDecision = classify_commit_failure_reply(reply)
+            if decision is CommitFailureDecision.stop:
                 raise StopRequested()
 
-            # Keep the existing free-text classification intact. Phase 4 replaces
-            # this fragile boundary without changing which answers are accepted.
-            claimed_commit: bool = answer == COMMIT_FAILURE_COMMITTED.lower() or (
-                'commit' in answer and 'without' not in answer and 'not ' not in answer
-            )
-
-            if claimed_commit:
+            if decision is CommitFailureDecision.committed:
                 if await self._session._services.git.has_uncommitted_changes():
                     await self._session._events.emit(
                         WarningEvent(
