@@ -188,20 +188,21 @@ At the end of this plan:
 - **Completion verification (2026-08-30):** Targeted `tests/test_compaction.py tests/test_execution_loop.py` → **122 passed**; full backend `pytest` → **972 passed, 4 skipped**; `mypy .` → no issues in 127 source files; `basedpyright .` → 0 errors, 0 warnings, 0 notes; `git diff --check` → clean.
 - **Recommendation:** Add direct table-driven tests for `classify_commit_failure_reply()` covering all fixed options and representative legacy free-text answers. The refactor makes this boundary independently testable; no tests were added because this plan does not expand coverage.
 
-### Phase 5: Split `coder.py` into `coder_tools/` — Status: Not Started
+### Phase 5: Split `coder.py` into `coder_tools/` — Status: Done
 - **Goal:** Split the (now-deduplicated, per Phase 1) ~1200-line `backend/agents/coder.py` — around 30 top-level tool functions — into a `coder_tools/` package grouped by category, re-exported for registration.
 - **Requirements:**
-  - [ ] Create `backend/agents/coder_tools/` with `files.py` (file-mutation tools), `search.py` (search tools), `verification.py` (test/lint/verification tools), and `meta.py` (`ask_user`, `complete_task`, `complete_step`, and similar meta tools).
-  - [ ] Re-export everything needed for tool registration so `coder_agent`'s tool set is unchanged.
-  - [ ] Re-measure line counts after the split; none of the four new files should be anywhere near the 1000-line threshold given ~30 functions split four ways.
+  - [x] Create `backend/agents/coder_tools/` with `files.py` (file-mutation tools), `search.py` (search tools), `verification.py` (test/lint/verification tools), and `meta.py` (`ask_user`, `complete_task`, `complete_step`, and similar meta tools). — verified by: the category package and its `deps.py` dependency model; each category imports `AgentDeps` only from `.deps` and contains undecorated tools.
+  - [x] Re-export everything needed for tool registration so `coder_agent`'s tool set is unchanged. — verified by: `coder.py` re-exports `AgentDeps` and all 17 direct tool names, then registers its explicit ordered `_CODER_TOOLS` tuple; runtime validation reports the expected 17-name set.
+  - [x] Re-measure line counts after the split; none of the four new files should be anywhere near the 1000-line threshold given ~30 functions split four ways. — verified by: `files.py` 496 lines, `search.py` 270 lines, `verification.py` 165 lines, and `meta.py` 207 lines.
 - **Edge Cases & Error Handling:** None specific — this is a mechanical move, not a logic change.
 - **Affected Areas:** `backend/agents/coder.py` (becomes a package or a thin re-export point — decide based on whether anything besides tool functions remains in it), any file importing individual tool functions directly.
 - **Acceptance Criteria:**
-  - [ ] All ~30 tool functions are grouped into the four category files.
-  - [ ] `coder_agent`'s registered tool set is unchanged (verify by inspection or a test that lists registered tools, if one exists).
-  - [ ] Backend test suite passes with the same results as the Phase 0 baseline.
-  - [ ] `mypy`/`basedpyright` clean.
+  - [x] All 17 registered tool functions and their support helpers/constants are grouped into the four category files. — verified by: category layout inspection and the explicit ordered registration tuple in `backend/agents/coder.py`.
+  - [x] `coder_agent`'s registered tool set is unchanged (verify by inspection or a test that lists registered tools, if one exists). — verified by: `tests/test_agent_tools.py::test_all_tools_are_registered` and runtime set validation: 17 registered, exact expected set `{'ask_user', 'complete_step', 'record_test_command', 'forget_test_command', 'skip_verification', 'accept_step_without_changes', 'search_code', 'search_code_lexical', 'get_symbol', 'read_file', 'list_files', 'create_file', 'edit_file', 'delete_file', 'run_test_command', 'web_search', 'complete_task'}`.
+  - [x] Backend test suite passes with the same results as the Phase 0 baseline. — verified by: `cd backend && .venv/bin/pytest` → **972 passed, 4 skipped**.
+  - [x] `mypy`/`basedpyright` clean. — verified by: `cd backend && .venv/bin/mypy .` → no issues in 133 source files; `cd backend && .venv/bin/basedpyright .` → 0 errors, 0 warnings, 0 notes.
 - **Testing Notes:** Full backend suite; pay attention to any test that imports a tool function directly by its old path.
+- **Completion verification (2026-08-30):** Focused `tests/test_agent_tools.py tests/test_agents.py tests/test_context_budget.py` → **121 passed**; full backend `pytest` → **972 passed, 4 skipped**; `mypy .` → no issues in 133 source files; `basedpyright .` → 0 errors, 0 warnings, 0 notes; `git diff --check` → clean. The category files measure **496** (`files.py`), **270** (`search.py`), **165** (`verification.py`), and **207** (`meta.py`) lines. Runtime registration validation reports **17** registered tools and an exact match with the preceding expected set. `test_agent_tools.py` now monkeypatches `agents.coder_tools.search.AsyncClient`, the module that owns the web-search implementation; no tests were added. Post-audit corrections: `CODER_SYSTEM_PROMPT`'s source literal and evaluated value match `HEAD:backend/agents/coder.py` byte-for-byte (**9,950** source bytes and **9,944** value bytes), and the standalone `READ_ONLY_TOOLS`, `answering_agent`, and `PLANNING_TOOLS` documentation literals and values also match HEAD exactly; the focused suite, full backend suite, mypy, and basedpyright were rerun with the results above.
 
 ### Phase 6: Decompose `settings/+page.svelte` — Status: Not Started
 - **Goal:** Split the 819-line settings page (script block ~306 lines, mostly markup otherwise) into a layout root plus three focused child components.

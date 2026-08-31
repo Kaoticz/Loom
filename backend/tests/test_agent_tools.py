@@ -11,7 +11,7 @@ from unittest.mock import MagicMock
 import pytest
 from httpx import AsyncClient, MockTransport, Request, Response
 
-import agents.coder as coder_module
+import agents.coder_tools.search as coder_search_module
 from agents.coder import AgentDeps, coder_agent
 from database.models.file import File
 from database.models.symbol import Symbol
@@ -562,7 +562,7 @@ def stub_searxng(
     def factory(*args: Any, **kwargs: Any) -> AsyncClient:
         return AsyncClient(transport=MockTransport(handler))
 
-    monkeypatch.setattr(coder_module, 'AsyncClient', factory)
+    monkeypatch.setattr(coder_search_module, 'AsyncClient', factory)
 
 
 async def test_web_search_parses_and_limits_results(
