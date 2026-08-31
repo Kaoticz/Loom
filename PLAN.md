@@ -204,21 +204,22 @@ At the end of this plan:
 - **Testing Notes:** Full backend suite; pay attention to any test that imports a tool function directly by its old path.
 - **Completion verification (2026-08-30):** Focused `tests/test_agent_tools.py tests/test_agents.py tests/test_context_budget.py` → **121 passed**; full backend `pytest` → **972 passed, 4 skipped**; `mypy .` → no issues in 133 source files; `basedpyright .` → 0 errors, 0 warnings, 0 notes; `git diff --check` → clean. The category files measure **496** (`files.py`), **270** (`search.py`), **165** (`verification.py`), and **207** (`meta.py`) lines. Runtime registration validation reports **17** registered tools and an exact match with the preceding expected set. `test_agent_tools.py` now monkeypatches `agents.coder_tools.search.AsyncClient`, the module that owns the web-search implementation; no tests were added. Post-audit corrections: `CODER_SYSTEM_PROMPT`'s source literal and evaluated value match `HEAD:backend/agents/coder.py` byte-for-byte (**9,950** source bytes and **9,944** value bytes), and the standalone `READ_ONLY_TOOLS`, `answering_agent`, and `PLANNING_TOOLS` documentation literals and values also match HEAD exactly; the focused suite, full backend suite, mypy, and basedpyright were rerun with the results above.
 
-### Phase 6: Decompose `settings/+page.svelte` — Status: Not Started
+### Phase 6: Decompose `settings/+page.svelte` — Status: Done
 - **Goal:** Split the 819-line settings page (script block ~306 lines, mostly markup otherwise) into a layout root plus three focused child components.
 - **Requirements:**
-  - [ ] Extract `IndexStatusPanel.svelte` (index status display, `refreshIndexStatus`, `deleteIndex`).
-  - [ ] Extract `SecretsEditor.svelte` (secrets editing UI).
-  - [ ] Extract `ModelSettingsPanel.svelte` (`describeEmbeddingModel`, `detectContextWindow`, and related model-settings UI).
-  - [ ] `+page.svelte` keeps the repo-picker (`validateRepo`) and theme controls directly, composing the three extracted components, per `frontend/AGENTS.md`'s "Keep data-fetching and store subscriptions in page-level components" guidance.
-  - [ ] Pass data down via props; communicate upward via dispatched events or callback props, per `frontend/AGENTS.md`.
+  - [x] Extract `IndexStatusPanel.svelte` (index status display, `refreshIndexStatus`, `deleteIndex`). — verified by: panel-local status/deletion state, confirmation, error handling, and a refresh request signal that follows mount and repository validation without firing per typed character.
+  - [x] Extract `SecretsEditor.svelte` (secrets editing UI). — verified by: immutable typed callback updates for add, remove, and field edits.
+  - [x] Extract `ModelSettingsPanel.svelte` (`describeEmbeddingModel`, `detectContextWindow`, and related model-settings UI). — verified by: model panel plus focused `ContextWindowControls.svelte`, retaining request-token protection and all model/chunk controls.
+  - [x] `+page.svelte` keeps the repo-picker (`validateRepo`) and theme controls directly, composing the three extracted components. — verified by: root config/model-list ownership, repository validation/picker, Dockerfile, appearance, and save/cancel controls.
+  - [x] Pass data down via props; communicate upward via dispatched events or callback props, per `frontend/AGENTS.md`. — verified by: typed model-settings and secret callbacks; no extracted component mutates `agentStore`.
 - **Edge Cases & Error Handling:** None specific — preserve existing error/loading states for each panel exactly.
 - **Affected Areas:** `frontend/src/routes/settings/+page.svelte`, `frontend/src/routes/settings/page.test.ts` (update to test the composed page and/or the new components as appropriate — no behavior change expected).
 - **Acceptance Criteria:**
-  - [ ] `+page.svelte` is under ~200 lines, or close to it (per `frontend/AGENTS.md`'s component-size standard), with the three panels extracted.
-  - [ ] Frontend test suite passes with the same results as the Phase 0 baseline.
-  - [ ] `npm run check` and `npm run lint` clean.
+  - [x] `+page.svelte` is under ~200 lines, or close to it (per `frontend/AGENTS.md`'s component-size standard), with the three panels extracted. — verified by: root 235 lines; `IndexStatusPanel.svelte` 171, `SecretsEditor.svelte` 74, `ModelSettingsPanel.svelte` 185, and `ContextWindowControls.svelte` 157.
+  - [x] Frontend test suite passes with the same results as the Phase 0 baseline. — verified by: `npm run test` → **536 passed, 6 skipped**.
+  - [x] `npm run check` and `npm run lint` clean. — verified by: both commands complete with 0 errors and 0 warnings.
 - **Testing Notes:** Run `frontend/src/routes/settings/page.test.ts` and the full frontend suite; manually exercise the settings page in the browser (repo picker, secrets editor, model settings, index status/deletion, theme toggle) since this phase touches user-facing UI directly — per the general guidance to verify UI changes in a browser, not just via test suites.
+- **Completion verification (2026-08-31):** Focused `npm run test -- src/routes/settings/page.test.ts` → **27 passed**; full `npm run test` → **536 passed, 6 skipped**; `npm run check` → 0 errors, 0 warnings; `npm run lint` → clean; `git diff --check` → clean. Browser smoke test confirmed model selection/context controls, add/edit secret fields, picker open/close, disabled index status, and theme toggle. A live index deletion was deliberately not executed because it is destructive; its confirmation, success, failure, and disabled behavior remain covered by the composed-page tests. No existing tests needed changes.
 
 ### Phase 7: One-class-per-file — `backend/services/event_bus.py` — Status: Not Started
 - **Goal:** Split the 22-class `event_bus.py` into a package with one file per class.
