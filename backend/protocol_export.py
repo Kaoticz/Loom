@@ -6,7 +6,7 @@ from pathlib import Path
 
 from database.task_log_entry_type import TaskLogEntryType
 from database.task_status import TaskStatus
-from services.plan_parser import PlanFormat
+from services.plan_format import PlanFormat
 from schemas.command_action import CommandAction
 from schemas.agent_messages import MessageType
 from services.events import SandboxStage, SessionStatus, ToolStatus

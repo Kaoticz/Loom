@@ -11,7 +11,9 @@ from database.models.code_embedding import CodeEmbedding
 from database.models.embedding_model import EmbeddingModel
 from database.models.file import File
 from database.models.symbol import Symbol
-from services.embedding import ChunkTooLargeForModel, EmbeddingError, EmbeddingInputTooLong
+from services.chunk_too_large_for_model import ChunkTooLargeForModel
+from services.embedding_error import EmbeddingError
+from services.embedding_input_too_long import EmbeddingInputTooLong
 from services.indexing import IndexingService, clamp_chunk_lines
 from tests.conftest import TEST_PROJECT, ast_grep_available, stub_embedding_service
 
@@ -230,7 +232,7 @@ async def test_wrongly_sized_vector_is_refused(repo: str) -> None:
     Storing it would leave a chunk that cannot be compared with the rest of the
     index, which only surfaces later as a failed search.
     """
-    from services.embedding import EmbeddingError
+    from services.embedding_error import EmbeddingError
 
     model: EmbeddingModel = await EmbeddingModel.create(model_name='nomic-embed-text', dimensions=768)
     service: IndexingService = IndexingService(

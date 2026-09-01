@@ -16,8 +16,8 @@ from pydantic_ai.messages import (
     TextPart,
     TextPartDelta,
 )
-from services.compaction import RequestHistoryCapture
-from services.conversation_history import TurnRole
+from services.request_history_capture import RequestHistoryCapture
+from services.turn_role import TurnRole
 from services.events import CompactionRunPath
 from services.model_resolution import resolve_model
 from services.session_state import SessionState

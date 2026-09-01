@@ -9,16 +9,16 @@ from pydantic_ai import RunContext
 
 from services.code_search import (
     DEFAULT_LEXICAL_MODE,
-    CodeSearchOutcome,
-    LexicalMatch,
-    LexicalMatchMode,
-    SymbolDefinition,
     describe_ignored_keywords,
     describe_matched_files,
     describe_no_lexical_matches,
     normalise_keywords,
     split_at_keyword_limit,
 )
+from services.code_search_outcome import CodeSearchOutcome
+from services.lexical_match import LexicalMatch
+from services.lexical_match_mode import LexicalMatchMode
+from services.symbol_definition import SymbolDefinition
 from services.tool_reporting import describe_symbol_lookup, report_tool
 
 from .deps import AgentDeps

@@ -12,7 +12,8 @@ from schemas.context_window_detection_response import ContextWindowDetectionResp
 from schemas.context_window_detection_status import ContextWindowDetectionStatus
 from schemas.index_deletion_response import IndexDeletionResponse
 from schemas.index_status_response import IndexStatusResponse
-from services.embedding import EmbeddingService, ModelDescription
+from services.embedding import EmbeddingService
+from services.model_description import ModelDescription
 from services.index_deletion import (
     IndexDeletionSummary,
     count_project_index,

@@ -8,12 +8,12 @@ from agents.coder import CODER_SYSTEM_PROMPT, coder_agent
 from pydantic_ai.messages import ModelMessage
 from pydantic_ai_harness.compaction import estimate_token_count
 from services.compaction import (
-    RequestHistoryCapture,
     force_summarize_history,
     looks_like_context_overflow,
     narrowed_window,
     resolve_context_window,
 )
+from services.request_history_capture import RequestHistoryCapture
 from services.context_budget import context_window_complaint, estimate_fixed_overhead
 from services.events import CompactionRunPath, WarningEvent
 from services.model_resolution import resolve_model

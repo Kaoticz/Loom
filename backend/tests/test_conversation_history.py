@@ -5,10 +5,10 @@ import pytest
 from services.conversation_history import (
     ConversationHistory,
     FILE_WRITING_TOOLS,
-    TurnRole,
     estimate_tokens,
     truncate_to_tokens,
 )
+from services.turn_role import TurnRole
 
 
 def test_token_estimation_heuristics() -> None:

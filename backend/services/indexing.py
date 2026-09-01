@@ -7,12 +7,10 @@ from database.models.file import File
 from database.models.symbol import Symbol
 from database.models.code_embedding import CodeEmbedding
 from database.models.embedding_model import EmbeddingModel
-from services.embedding import (
-    ChunkTooLargeForModel,
-    EmbeddingError,
-    EmbeddingInputTooLong,
-    EmbeddingService,
-)
+from services.chunk_too_large_for_model import ChunkTooLargeForModel
+from services.embedding import EmbeddingService
+from services.embedding_error import EmbeddingError
+from services.embedding_input_too_long import EmbeddingInputTooLong
 from asyncio import Semaphore
 from logging import Logger, getLogger
 from collections.abc import Sequence

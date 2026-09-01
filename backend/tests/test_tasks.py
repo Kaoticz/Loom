@@ -18,7 +18,7 @@ from schemas.task_request import TaskRequest
 from schemas.task_patch_request import TaskPatchRequest
 from services.events import CommitEvent, PlanEvent, ReviewEvent, ThoughtEvent, ToolObservationEvent, ToolStatus
 from services.task_recorder import TaskRecorder
-from services.plan_parser import PlanStep
+from services.plan_step import PlanStep
 
 pytestmark = pytest.mark.usefixtures('require_database')
 

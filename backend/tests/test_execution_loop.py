@@ -30,7 +30,8 @@ from services.git_manager import GitManagerService
 from services.command_result import CommandResult
 from services.session_state import SessionState
 from tests.test_agent_session import FakeGit, build_session, opening
-from services.plan_parser import ParsedPlan, PlanStep
+from services.parsed_plan import ParsedPlan
+from services.plan_step import PlanStep
 from pydantic_ai_harness.compaction import TieredCompaction
 from services.compaction import (
     DEFAULT_CONTEXT_WINDOW,
@@ -931,7 +932,7 @@ async def test_a_structured_plan_is_used_as_it_arrives(
     import agents.planner as planner_module
     from agents.planned_step import PlannedStep
     from agents.structured_plan import StructuredPlan
-    from services.plan_parser import PlanFormat
+    from services.plan_format import PlanFormat
     from tests.test_agent_session import build_session
 
     calls: list[dict[str, Any]] = []
@@ -2248,7 +2249,7 @@ async def test_forced_summary_precedes_narrowing_and_retries_with_its_history(
     """
     from pydantic_ai.exceptions import UnexpectedModelBehavior
 
-    from services.compaction import RequestHistoryCapture
+    from services.request_history_capture import RequestHistoryCapture
 
     session, _ = prepare(monkeypatch, [], git_repo)
     history: RequestHistoryCapture = RequestHistoryCapture()
@@ -2322,7 +2323,7 @@ async def test_forced_summary_emits_a_distinct_recovery_warning(
     """
     Users can distinguish successful summary recovery from window narrowing.
     """
-    from services.compaction import RequestHistoryCapture
+    from services.request_history_capture import RequestHistoryCapture
     from services.events import WarningEvent
 
     session, events = prepare(monkeypatch, [], git_repo)

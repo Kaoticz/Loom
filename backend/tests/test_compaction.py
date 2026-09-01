@@ -31,10 +31,7 @@ from services.compaction import (
     IRRECOVERABLE_TOOLS,
     KEEP_RECENT_MESSAGES,
     MINIMUM_CONTEXT_WINDOW,
-    RequestHistoryCapture,
-    SummarizeAndStripToolMessages,
     TARGET_FRACTION,
-    ObservedCompaction,
     build_compaction,
     build_forced_summarization,
     force_summarize_history,
@@ -42,6 +39,9 @@ from services.compaction import (
     resolve_context_window,
     _strip_redundant_system_prompts,
 )
+from services.observed_compaction import ObservedCompaction
+from services.request_history_capture import RequestHistoryCapture
+from services.summarize_and_strip_tool_messages import SummarizeAndStripToolMessages
 
 
 def call(tool_name: str, **arguments: Any) -> ToolCallPart:

@@ -1994,7 +1994,7 @@ async def test_planning_falls_back_to_text_when_structure_fails(
     and requiring a usable plan to arrive anyway.
     """
     import agents.planner as planner_module
-    from services.plan_parser import PlanFormat
+    from services.plan_format import PlanFormat
 
     async def refuse(*_: object, **__: object) -> object:
         raise RuntimeError('this model does not do structured output')
@@ -2025,7 +2025,7 @@ async def test_a_structured_planning_overflow_retries_structure(
     from agents.structured_plan import StructuredPlan
     from pydantic_ai.exceptions import UnexpectedModelBehavior
     import agents.planner as planner_module
-    from services.plan_parser import PlanFormat
+    from services.plan_format import PlanFormat
 
     session, _, _, _ = build_session([json.dumps({'prompt': 'do something'})])
     session._planner_context_window = 128_048
@@ -2121,7 +2121,7 @@ async def test_structure_that_says_nothing_falls_back_too(
     """
     import agents.planner as planner_module
     from agents.structured_plan import StructuredPlan
-    from services.plan_parser import PlanFormat
+    from services.plan_format import PlanFormat
 
     class EmptyResult:
         output: StructuredPlan = StructuredPlan(steps=[])
@@ -2293,7 +2293,7 @@ async def test_compaction_capabilities_include_only_the_ladder() -> None:
     Long-running paths have no eager, message-count-based pruning capability.
     """
     from pydantic_ai.capabilities import AbstractCapability
-    from services.compaction import ObservedCompaction
+    from services.observed_compaction import ObservedCompaction
     from services.events import CompactionRunPath
 
     session, _, _, _ = build_session([json.dumps({'prompt': 'do it'})])

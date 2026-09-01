@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 from collections.abc import Awaitable, Callable
-from dataclasses import dataclass, replace
+from dataclasses import replace
 from logging import Logger, getLogger
 from typing import TYPE_CHECKING, Any, overload, override
 
@@ -30,6 +30,9 @@ from pydantic_ai_harness.compaction import (
 )
 from pydantic_ai.exceptions import ModelHTTPError
 from services.model_resolution import _window_for_consumer
+from services.observed_compaction import ObservedCompaction
+from services.request_history_capture import RequestHistoryCapture
+from services.summarize_and_strip_tool_messages import SummarizeAndStripToolMessages
 
 if TYPE_CHECKING:
     from pydantic_ai.models import ModelRequestContext
@@ -317,191 +320,6 @@ def resolve_context_window(configured: int | None) -> int:
     if configured is None or configured <= 0:
         return DEFAULT_CONTEXT_WINDOW
     return max(configured, MINIMUM_CONTEXT_WINDOW)
-
-
-class ObservedCompaction(AbstractCapability[Any]):
-    """
-    Observe a compaction capability without changing its decisions.
-
-    :param inner: The compaction capability that may rewrite request messages.
-    :param on_compaction: Receives the estimated token counts before and after a rewrite.
-    """
-
-    def __init__(
-        self,
-        inner: AbstractCapability[Any],
-        on_compaction: Callable[[int, int], Awaitable[None]],
-    ) -> None:
-        """
-        Create a compaction observer.
-
-        :param inner: The capability that performs compaction.
-        :param on_compaction: Receives counts when the capability shortened a request.
-        """
-        super().__init__()
-        self._inner: AbstractCapability[Any] = inner
-        self._on_compaction: Callable[[int, int], Awaitable[None]] = on_compaction
-
-    @override
-    async def before_model_request(
-        self,
-        ctx: RunContext[Any],
-        request_context: ModelRequestContext,
-    ) -> ModelRequestContext:
-        """
-        Delegate compaction and report a genuine reduction when one occurred.
-
-        Observer failures are deliberately contained: a missing notice must not
-        prevent the model request it was meant to describe.
-
-        :param ctx: The active model run context.
-        :param request_context: The model request that may be compacted.
-        :returns: The request context returned by the wrapped capability.
-        """
-        try:
-            before: int = estimate_token_count(request_context.messages)
-        except Exception:
-            logger.exception('Could not measure request tokens before compaction.')
-            return await self._inner.before_model_request(ctx, request_context)
-
-        compacted: ModelRequestContext = await self._inner.before_model_request(ctx, request_context)
-        try:
-            after: int = estimate_token_count(compacted.messages)
-            if before - after < COMPACTION_REPORT_MINIMUM_RECLAIM_TOKENS:
-                return compacted
-            await self._on_compaction(before, after)
-        except Exception:
-            logger.exception('Could not report a compaction event.')
-        return compacted
-
-
-class RequestHistoryCapture(AbstractCapability[Any]):
-    """
-    Retain the most recent compacted request history for recovery.
-
-    The agent discards its graph state when a model request raises. Capturing the
-    history after ordinary capabilities run lets the session retry from a forced
-    summary instead of throwing that useful context away before narrowing.
-    """
-
-    def __init__(self) -> None:
-        """
-        Create an empty request-history capture.
-        """
-        super().__init__()
-        self._messages: list[ModelMessage] = []
-
-    @property
-    def messages(self) -> list[ModelMessage]:
-        """
-        Return a copy of the last captured request history.
-
-        :returns: The history prepared for the most recent model request.
-        """
-        return list(self._messages)
-
-    @override
-    async def before_model_request(
-        self,
-        ctx: RunContext[Any],
-        request_context: ModelRequestContext,
-    ) -> ModelRequestContext:
-        """
-        Save the already-compacted history without changing the request.
-
-        :param ctx: The active model run context, unused by this observer.
-        :param request_context: The request whose prepared history is retained.
-        :returns: The original request context, unchanged.
-        """
-        self._messages = list(request_context.messages)
-        return request_context
-
-
-@dataclass
-class SummarizeAndStripToolMessages(AbstractCapability[Any]):
-    """
-    Summarize history and then remove replaceable tool messages in one tier.
-
-    The enclosing `TieredCompaction` calls this tier only after the history is
-    above its target. The tool-part strip lives inside `compact`, rather than as
-    a later tier, so it always follows a summary even when that summary alone
-    brings the history back below the target.
-
-    :param summarizer: The strategy that summarizes the older portion of history.
-    :param exclude_tools: Tool names whose call/result parts remain intact.
-    """
-
-    summarizer: SummarizingCompaction[Any]
-    exclude_tools: frozenset[str]
-
-    def with_focus(self, focus: str) -> SummarizeAndStripToolMessages:
-        """
-        Prioritize focus in the summary without changing stripping behavior.
-
-        :param focus: The topic the summary must preserve.
-        :returns: An equivalent combined tier whose summary receives the focus.
-        """
-        return replace(self, summarizer=self.summarizer.with_focus(focus))
-
-    async def compact(
-        self,
-        messages: list[ModelMessage],
-        ctx: RunContext[Any],
-    ) -> list[ModelMessage]:
-        """
-        Summarize history and remove nonessential tool parts.
-
-        Retain the final request intact when stripping its parts would otherwise
-        remove the current step from the history. A final request that is empty
-        or contains only replaceable tool parts is backfilled with the latest
-        original user prompt so it remains a wire-mappable user message after
-        tool-pair cleanup.
-
-        :param messages: The history that exceeded the enclosing ladder's target.
-        :param ctx: The running model context used by the summarizer.
-        :returns: The summarized history with replaceable tool parts removed.
-        """
-        summarized: list[ModelMessage] = await self.summarizer.compact(messages, ctx)
-        stripped: list[ModelMessage] = []
-        final_message_index: int = len(summarized) - 1
-        for index, message in enumerate(summarized):
-            if isinstance(message, ModelRequest):
-                parts: list[ModelRequestPart] = [
-                    part for part in message.parts if not self._is_replaceable_tool_part(part)
-                ]
-                if parts:
-                    stripped.append(replace(message, parts=parts))
-                elif index == final_message_index:
-                    stripped.append(message)
-                continue
-
-            response_parts: list[ModelResponsePart] = [
-                part for part in message.parts if not self._is_replaceable_tool_part(part)
-            ]
-            if response_parts:
-                stripped.append(replace(message, parts=response_parts))
-
-        if (
-            stripped
-            and isinstance(stripped[-1], ModelRequest)
-            and all(self._is_replaceable_tool_part(part) for part in stripped[-1].parts)
-        ):
-            prompt: UserPromptPart | None = _latest_user_prompt(messages)
-            terminal_part: UserPromptPart = prompt or UserPromptPart(EMPTY_TERMINAL_REQUEST_FALLBACK)
-            stripped[-1] = replace(stripped[-1], parts=[terminal_part])
-        return _strip_redundant_system_prompts(stripped)
-
-    def _is_replaceable_tool_part(self, part: ModelRequestPart | ModelResponsePart) -> bool:
-        """
-        Identify a tool part that can be removed from the working history.
-
-        :param part: One request or response message part.
-        :returns: True when the part belongs to a nonessential tool.
-        """
-        return (
-            isinstance(part, (ToolCallPart, ToolReturnPart))
-            and part.tool_name not in self.exclude_tools
-        )
 
 
 def build_forced_summarization(

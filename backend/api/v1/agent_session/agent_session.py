@@ -24,7 +24,7 @@ from pydantic_ai.providers.openai import OpenAIProvider
 from schemas.agent_commands import parse_command
 from schemas.command_action import CommandAction
 from schemas.session_command import SessionCommand
-from services.conversation_history import ConversationHistory, TurnRole
+from services.conversation_history import ConversationHistory
 from services.embedding import DEFAULT_EMBEDDING_MODEL, EmbeddingService
 from services.events import (
     CommitEvent,
@@ -57,28 +57,25 @@ from services.compaction import (
     force_summarize_history,
     looks_like_context_overflow,
     build_usage_monitor,
-    RequestHistoryCapture,
     resolve_context_window,
 )
+from services.request_history_capture import RequestHistoryCapture
 from services.context_budget import (
-    ProviderUsageDivergence,
     ReportProviderUsage,
     context_window_complaint,
     estimate_fixed_overhead,
     provider_usage_correction,
     provider_usage_divergence,
 )
+from services.provider_usage_divergence import ProviderUsageDivergence
+from services.turn_role import TurnRole
 from services.browser_tooling import BROWSER_GUIDANCE
 from services.frontend_detection import repository_has_frontend
 from services.indexing import IndexingService, clamp_chunk_lines
-from services.plan_parser import (
-    NO_STEPS_CORRECTION,
-    ParsedPlan,
-    PlanFormat,
-    PlanStep,
-    parse_plan,
-    render_plan,
-)
+from services.parsed_plan import ParsedPlan
+from services.plan_format import PlanFormat
+from services.plan_parser import NO_STEPS_CORRECTION, parse_plan, render_plan
+from services.plan_step import PlanStep
 from services.review_context import build_review_prompt, collect_review_diffs
 from services.model_resolution import (
     effective_context_window,

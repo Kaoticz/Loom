@@ -1,15 +1,16 @@
 from __future__ import annotations
 
 from collections.abc import Sequence
-from enum import Enum
-from typing import Annotated
 
 from database.models.code_embedding import CodeEmbedding
 from database.models.embedding_model import EmbeddingModel
 from database.models.file import File
 from database.models.symbol import Symbol
-from pydantic import BaseModel, Field
+from services.code_search_outcome import CodeSearchOutcome
+from services.lexical_match import LexicalMatch
+from services.lexical_match_mode import LexicalMatchMode
 from services.projects import normalise_project_path
+from services.symbol_definition import SymbolDefinition
 from tortoise.expressions import Q
 from tortoise_embeddings.vector_distance import VectorDistance
 
@@ -29,18 +30,6 @@ arbitrarily expensive one, and ten is well past what a search worth making needs
 Keywords beyond the cap are reported rather than dropped in silence, so the
 agent can tell that part of what it asked for was not searched for.
 """
-
-
-class LexicalMatchMode(str, Enum):
-    """
-    How several keywords combine when searching for lines.
-
-    The values are what the model sees in the tool schema, so they are the plain
-    words rather than the member names.
-    """
-
-    any_of = 'any'
-    all_of = 'all'
 
 
 DEFAULT_LEXICAL_MODE: LexicalMatchMode = LexicalMatchMode.any_of
@@ -129,20 +118,6 @@ paths. The count is always stated in full; only the listing is shortened.
 """
 
 
-class CodeSearchOutcome(BaseModel):
-    """
-    What a merged search produced, kept apart for its two different audiences.
-
-    The agent needs the code, and the reader needs to know which files it came
-    from. Carrying both means the display never has to pick a rendered blob back
-    apart to find the paths, which would tie it to the exact rendering format.
-    """
-
-    rendered: Annotated[str, Field(description='The full text returned to the agent.')]
-    file_paths: Annotated[list[str], Field(description='Matched files, unique, in order.')]
-    notices: Annotated[list[str], Field(description='Warnings about the search itself.')]
-
-
 def describe_matched_files(
     subject: str,
     file_paths: Sequence[str],
@@ -219,24 +194,6 @@ def describe_no_lexical_matches(keywords: Sequence[str], mode: LexicalMatchMode)
     return f'No occurrences of any of {quoted} were found.'
 
 
-class LexicalMatch(BaseModel):
-    """
-    A single line matching a lexical search, with its surrounding context.
-    """
-
-    file_path: Annotated[str, Field(description='Repository-relative path of the matching file.')]
-    line_number: Annotated[int, Field(ge=1, description='1-based line number of the matching line.')]
-    snippet: Annotated[str, Field(description='The matching line with a few lines of surrounding context.')]
-
-    def render(self) -> str:
-        """
-        Render this match as a readable block for the agent.
-
-        :returns: The rendered match.
-        """
-        return f'{self.file_path}:{self.line_number}\n{self.snippet}'
-
-
 def extract_lines(content: str, line_start: int, line_end: int) -> str:
     """
     Take an inclusive, 1-based range of lines out of a file's text.
@@ -257,36 +214,6 @@ def extract_lines(content: str, line_start: int, line_end: int) -> str:
     lines: list[str] = content.splitlines()
     first: int = max(line_start, 1)
     return '\n'.join(lines[first - 1 : line_end])
-
-
-class SymbolDefinition(BaseModel):
-    """
-    A symbol's declaration, with the source that defines it.
-
-    The agent asks for a definition in order to read it, so the source is the
-    substance of the answer and the location is what makes it actionable.
-    """
-
-    symbol_name: Annotated[str, Field(description='The declared name of the symbol.')]
-    kind: Annotated[str, Field(description="What the symbol is, for example 'function' or 'class'.")]
-    file_path: Annotated[str, Field(description='Repository-relative path of the declaring file.')]
-    line_start: Annotated[int, Field(ge=1, description='1-based line where the definition begins.')]
-    line_end: Annotated[int, Field(ge=1, description='1-based line where the definition ends.')]
-    source: Annotated[str, Field(description='The source text of the definition.')]
-
-    def render(self) -> str:
-        """
-        Render this definition as a readable block for the agent.
-
-        :returns: The rendered definition.
-        """
-        header: str = (
-            f'{self.kind} {self.symbol_name} '
-            f'({self.file_path}:{self.line_start}-{self.line_end})'
-        )
-        if not self.source:
-            return f'{header}\nThe source is no longer at these lines; the file may have changed.'
-        return f'{header}\n{self.source}'
 
 
 class CodeSearchService:

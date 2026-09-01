@@ -15,7 +15,8 @@ import agents.coder_tools.search as coder_search_module
 from agents.coder import AgentDeps, coder_agent
 from database.models.file import File
 from database.models.symbol import Symbol
-from services.code_search import CodeSearchService, LexicalMatchMode
+from services.code_search import CodeSearchService
+from services.lexical_match_mode import LexicalMatchMode
 from services.docker_sandbox import DockerSandboxManager
 from services.events import (
     AgentEvent,

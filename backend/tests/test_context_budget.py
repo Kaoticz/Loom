@@ -1,13 +1,13 @@
 from agents.coder import CODER_SYSTEM_PROMPT, coder_agent
 from services.compaction import DEFAULT_CONTEXT_WINDOW
 from services.context_budget import (
-    ProviderUsageDivergence,
     WORKING_HEADROOM_TOKENS,
     context_window_complaint,
     estimate_fixed_overhead,
     provider_usage_correction,
     provider_usage_divergence,
 )
+from services.provider_usage_divergence import ProviderUsageDivergence
 
 
 def test_the_fixed_overhead_is_measured_from_what_is_actually_sent() -> None:

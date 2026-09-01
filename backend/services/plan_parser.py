@@ -1,10 +1,9 @@
 from __future__ import annotations
 
 import re
-from enum import Enum
-from typing import Annotated, ClassVar
-
-from pydantic import BaseModel, ConfigDict, Field
+from services.parsed_plan import ParsedPlan
+from services.plan_format import PlanFormat
+from services.plan_step import PlanStep
 
 PLAN_TERMINATOR: str = 'PLAN_COMPLETE'
 NUMBERED_STEP: re.Pattern[str] = re.compile(r'^\s*(\d+)\s*[.)]\s+(?P<body>\S.*)$')
@@ -12,71 +11,6 @@ NO_STEPS_CORRECTION: str = (
     'Your plan contained no actionable steps. Please provide a numbered list, '
     'one concrete action per line, ending with a line containing only PLAN_COMPLETE.'
 )
-
-
-class PlanFormat(str, Enum):
-    """
-    How a plan was produced, and therefore how it should be shown.
-
-    Carried explicitly rather than inferred from whether descriptions happen to
-    be present. A structured plan whose descriptions all came back empty is
-    still a structured plan, and inferring the format would render it as plain
-    text — a disagreement between what was produced and what is shown, which is
-    the failure mode that keeps appearing in this project.
-    """
-
-    structured = 'structured'
-    text = 'text'
-
-
-class PlanStep(BaseModel):
-    """
-    One step of a plan.
-
-    The description is optional because a model asked for one may return an
-    empty string, and because a plan recovered from free text has titles only.
-    """
-
-    model_config: ClassVar[ConfigDict] = ConfigDict(frozen=True)
-
-    title: Annotated[str, Field(description='A short name for the step.')]
-    description: Annotated[
-        str, Field(default='', description='What the step involves, if the model gave one.')
-    ] = ''
-
-
-class ParsedPlan(BaseModel):
-    """
-    The steps recovered from an agent's plan output.
-    """
-
-    model_config: ClassVar[ConfigDict] = ConfigDict(frozen=True)
-
-    steps: Annotated[
-        list[PlanStep], Field(default_factory=list, description='The actionable steps, in order.')
-    ]
-    used_fallback: Annotated[bool, Field(description='Whether the output had no numbered steps and was taken as a single step.')] = False
-    format: Annotated[
-        PlanFormat, Field(description='Whether the plan came back structured or as free text.')
-    ] = PlanFormat.text
-
-    @property
-    def is_empty(self) -> bool:
-        """
-        Whether the agent produced nothing actionable.
-
-        :returns: True if no steps were recovered.
-        """
-        return len(self.steps) == 0
-
-    @property
-    def titles(self) -> list[str]:
-        """
-        The step titles, in order.
-
-        :returns: One title per step.
-        """
-        return [step.title for step in self.steps]
 
 
 def parse_plan(output: str) -> ParsedPlan:
