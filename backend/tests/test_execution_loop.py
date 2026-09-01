@@ -929,7 +929,8 @@ async def test_a_structured_plan_is_used_as_it_arrives(
     failed anything.
     """
     import agents.planner as planner_module
-    from agents.planner import PlannedStep, StructuredPlan
+    from agents.planned_step import PlannedStep
+    from agents.structured_plan import StructuredPlan
     from services.plan_parser import PlanFormat
     from tests.test_agent_session import build_session
 
@@ -966,7 +967,8 @@ async def test_a_structured_plan_drops_steps_without_a_title(
     A titleless step is not actionable and would render as an empty row.
     """
     import agents.planner as planner_module
-    from agents.planner import PlannedStep, StructuredPlan
+    from agents.planned_step import PlannedStep
+    from agents.structured_plan import StructuredPlan
     from tests.test_agent_session import build_session
 
     async def structured(prompt: str, **kwargs: Any) -> Any:

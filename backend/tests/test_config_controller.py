@@ -3,11 +3,9 @@ from fastapi import FastAPI
 from fastapi.testclient import TestClient
 
 from api.v1 import config_controller
-from schemas.context_window import (
-    ContextWindowDetectionRequest,
-    ContextWindowDetectionResponse,
-    ContextWindowDetectionStatus,
-)
+from schemas.context_window_detection_request import ContextWindowDetectionRequest
+from schemas.context_window_detection_response import ContextWindowDetectionResponse
+from schemas.context_window_detection_status import ContextWindowDetectionStatus
 
 
 async def test_context_window_endpoint_reports_a_detected_modelfile_override(

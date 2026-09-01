@@ -17,7 +17,9 @@ from asyncio import Semaphore
 from logging import Logger, getLogger
 from collections.abc import Sequence
 from services.symbol_patterns import build_rules, language_for
-from services.chunking import Chunk, SymbolSpan, build_chunks
+from services.chunk import Chunk
+from services.chunking import build_chunks
+from services.symbol_span import SymbolSpan
 from services.indexing_progress import ProgressCallback, ProgressReporter
 from services.repository_files import list_indexable_files
 from services.projects import normalise_project_path

@@ -8,7 +8,8 @@ from agents.classifier import (
     build_classification_prompt,
 )
 from agents.coder import CODER_SYSTEM_PROMPT, AgentDeps, answering_agent, coder_agent
-from agents.planner import PLANNER_SYSTEM_PROMPT, StructuredPlan, planner_agent
+from agents.planner import PLANNER_SYSTEM_PROMPT, planner_agent
+from agents.structured_plan import StructuredPlan
 from agents.commit_message import commit_message_agent
 from agents.reviewer import ReviewResult, reviewer_agent
 from fastapi import WebSocket
@@ -20,7 +21,9 @@ from pydantic_ai.agent import AgentRunResult
 from pydantic_ai.messages import ModelMessage
 from pydantic_ai.models.openai import OpenAIChatModel, OpenAIChatModelSettings
 from pydantic_ai.providers.openai import OpenAIProvider
-from schemas.agent_commands import CommandAction, SessionCommand, parse_command
+from schemas.agent_commands import parse_command
+from schemas.command_action import CommandAction
+from schemas.session_command import SessionCommand
 from services.conversation_history import ConversationHistory, TurnRole
 from services.embedding import DEFAULT_EMBEDDING_MODEL, EmbeddingService
 from services.events import (
@@ -91,7 +94,7 @@ from services.session_fsm import SessionState, SessionStateMachine
 from services.session_limits import IterationLimits
 from services.session_registry import SessionRegistry
 from services.task_recorder import TaskRecorder
-from database.enums import TaskStatus
+from database.task_status import TaskStatus
 from database.models.file import File
 from database.models.task import Task
 from uuid import UUID, uuid4

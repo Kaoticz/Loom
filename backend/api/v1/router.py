@@ -5,12 +5,10 @@ from api.v1.agent_socket import ws_router
 from api.v1.config_controller import router as config_router
 from schemas.health_response import HealthResponse
 from schemas.task_request import TaskRequest
-from schemas.task_response import (
-    TaskDetailResponse,
-    TaskListResponse,
-    TaskPatchRequest,
-    TaskResponse,
-)
+from schemas.task_detail_response import TaskDetailResponse
+from schemas.task_list_response import TaskListResponse
+from schemas.task_patch_request import TaskPatchRequest
+from schemas.task_response import TaskResponse
 
 api_router: APIRouter = APIRouter()
 api_router.include_router(ws_router)

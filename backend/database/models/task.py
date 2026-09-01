@@ -1,7 +1,7 @@
 from datetime import datetime
 from uuid import UUID
 
-from database.enums import TaskStatus
+from database.task_status import TaskStatus
 from tortoise.fields import (
     CharEnumField,
     CharField,

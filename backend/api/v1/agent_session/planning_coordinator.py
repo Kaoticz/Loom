@@ -3,7 +3,8 @@ from __future__ import annotations
 import logging
 from typing import TYPE_CHECKING
 
-from agents.planner import PLANNER_SYSTEM_PROMPT, StructuredPlan, planner_agent
+from agents.planner import PLANNER_SYSTEM_PROMPT, planner_agent
+from agents.structured_plan import StructuredPlan
 from pydantic_ai.agent import AgentRunResult
 from services.compaction import looks_like_context_overflow
 from services.conversation_history import TurnRole

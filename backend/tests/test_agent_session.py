@@ -8,10 +8,11 @@ from unittest.mock import MagicMock
 
 import pytest
 
-from schemas.agent_commands import CommandAction, SessionCommand
+from schemas.command_action import CommandAction
+from schemas.session_command import SessionCommand
 from api.v1.agent_session import AgentSession, SessionServices, StopRequested
 from agents.coder import AgentDeps
-from database.enums import TaskStatus
+from database.task_status import TaskStatus
 from schemas.agent_messages import MessageType
 from services.code_search import CodeSearchService
 from services.projects import normalise_project_path
@@ -2017,7 +2018,8 @@ async def test_a_structured_planning_overflow_retries_structure(
     """
     A recoverable overflow must retry structured output instead of falling back to text.
     """
-    from agents.planner import PlannedStep, StructuredPlan
+    from agents.planned_step import PlannedStep
+    from agents.structured_plan import StructuredPlan
     from pydantic_ai.exceptions import UnexpectedModelBehavior
     import agents.planner as planner_module
     from services.plan_parser import PlanFormat
@@ -2115,7 +2117,7 @@ async def test_structure_that_says_nothing_falls_back_too(
     the round, when the text path might still recover something.
     """
     import agents.planner as planner_module
-    from agents.planner import StructuredPlan
+    from agents.structured_plan import StructuredPlan
     from services.plan_parser import PlanFormat
 
     class EmptyResult:

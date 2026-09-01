@@ -253,24 +253,25 @@ At the end of this plan:
 - **Testing Notes:** Full backend suite.
 - **Completion verification (2026-08-31):** Focused `tests/test_agent_messages.py tests/test_agent_socket_controller.py tests/test_agent_session.py tests/test_protocol_export.py` → **139 passed**; full backend `pytest` → **972 passed, 4 skipped**; `mypy .` → no issues in **175 source files**; `basedpyright .` → **0 errors, 0 warnings, 0 notes**; `git diff --check` → no output (clean). `rg '^class ' schemas/agent_messages --glob '*.py' | wc -l` → **18**; package-internal `schemas.agent_messages` references → **0**; external `schemas.agent_messages.<submodule>` imports → **0**; preserved `from schemas.agent_messages import` package-root consumers → **5**. A direct package import of `AgentMessage`, `MessageType`, and `to_message` succeeded; all package internals use direct sibling imports, and `BaseAgentMessage` imports no subclass, so the split introduces no circular import.
 
-### Phase 9: One-class-per-file — small schema/DTO files — Status: Not Started
+### Phase 9: One-class-per-file — small schema/DTO files — Status: Done
 - **Goal:** Split the remaining small multi-class schema/DTO files (2-5 classes each, no folder needed — siblings in the existing directory).
 - **Requirements:**
-  - [ ] `backend/database/enums.py` → `task_status.py`, `task_log_entry_type.py` (in `backend/database/`).
-  - [ ] `backend/agents/planner.py` → extract `PlannedStep` to `planned_step.py` and `StructuredPlan` to `structured_plan.py` (in `backend/agents/`); any non-class planner logic remaining in `planner.py` imports them back.
-  - [ ] `backend/services/chunking.py` → extract `SymbolSpan` to `symbol_span.py` and `Chunk` to `chunk.py` (in `backend/services/`); any non-class chunking logic remaining in `chunking.py` imports them back.
-  - [ ] `backend/schemas/agent_commands.py` → `command_action.py`, `session_command.py`.
-  - [ ] `backend/schemas/context_window.py` → `context_window_detection_status.py`, `context_window_detection_request.py`, `context_window_detection_response.py`.
-  - [ ] `backend/schemas/index_maintenance.py` → `index_status_response.py`, `index_deletion_response.py`.
-  - [ ] `backend/schemas/task_response.py` → keep `TaskResponse` in `task_response.py`; extract `TaskLogEntryResponse`, `TaskDetailResponse`, `TaskListResponse`, `TaskPatchRequest` into their own files (`task_log_entry_response.py`, `task_detail_response.py`, `task_list_response.py`, `task_patch_request.py`).
-  - [ ] Update every import site across the codebase referencing any of the old module paths above for the classes that moved.
+   - [x] `backend/database/enums.py` → `task_status.py`, `task_log_entry_type.py` (in `backend/database/`).
+   - [x] `backend/agents/planner.py` → extract `PlannedStep` to `planned_step.py` and `StructuredPlan` to `structured_plan.py` (in `backend/agents/`); any non-class planner logic remaining in `planner.py` imports them back.
+   - [x] `backend/services/chunking.py` → extract `SymbolSpan` to `symbol_span.py` and `Chunk` to `chunk.py` (in `backend/services/`); any non-class chunking logic remaining in `chunking.py` imports them back.
+   - [x] `backend/schemas/agent_commands.py` → `command_action.py`, `session_command.py`.
+   - [x] `backend/schemas/context_window.py` → `context_window_detection_status.py`, `context_window_detection_request.py`, `context_window_detection_response.py`.
+   - [x] `backend/schemas/index_maintenance.py` → `index_status_response.py`, `index_deletion_response.py`.
+   - [x] `backend/schemas/task_response.py` → keep `TaskResponse` in `task_response.py`; extract `TaskLogEntryResponse`, `TaskDetailResponse`, `TaskListResponse`, `TaskPatchRequest` into their own files (`task_log_entry_response.py`, `task_detail_response.py`, `task_list_response.py`, `task_patch_request.py`).
+   - [x] Update every import site across the codebase referencing any of the old module paths above for the classes that moved.
 - **Edge Cases & Error Handling:** None specific — straightforward mechanical splits.
 - **Affected Areas:** The 7 files listed above, plus every file importing from them.
 - **Acceptance Criteria:**
-  - [ ] No file among these 7 (or their replacements) defines more than one class.
-  - [ ] Backend test suite passes with the same results as the Phase 0 baseline.
-  - [ ] `mypy`/`basedpyright` clean.
+   - [x] No file among these 7 (or their replacements) defines more than one class. — verified by: class scan reports 18 classes across the 18 individual Phase 9 class files.
+   - [x] Backend test suite passes with the same results as the Phase 0 baseline. — verified by: `cd backend && .venv/bin/pytest` → **972 passed, 4 skipped**.
+   - [x] `mypy`/`basedpyright` clean. — verified by: `cd backend && .venv/bin/mypy .` → no issues in 189 source files; `cd backend && .venv/bin/basedpyright .` → 0 errors, 0 warnings, 0 notes.
 - **Testing Notes:** Full backend suite.
+- **Completion verification (2026-08-31):** Focused `tests/test_agent_commands.py tests/test_session_inbox.py tests/test_config_controller.py tests/test_chunking.py tests/test_indexing.py tests/test_tasks.py tests/test_agent_session.py tests/test_execution_loop.py tests/test_agents.py tests/test_agent_tools.py` → **411 passed**; full backend `pytest` → **972 passed, 4 skipped**; `mypy .` → no issues in **189 source files**; `basedpyright .` → **0 errors, 0 warnings, 0 notes**; `git diff --check` → clean. Structural checks confirm the three legacy modules are deleted, no legacy imports remain, and all 18 Phase 9 classes each occupy their own file. No files under `data/` were changed.
 
 ### Phase 10: One-class-per-file — process/execution-layer services — Status: Not Started
 - **Goal:** Split the process/execution-layer service files (each has one primary service/manager class plus 1-3 small support types) into one file per class, as siblings in `backend/services/` (each split produces ≤4 files — no folder needed per the convention's threshold).
