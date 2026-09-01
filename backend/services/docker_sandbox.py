@@ -13,7 +13,7 @@ import docker
 from docker.errors import NotFound
 from pydantic import BaseModel, Field
 
-from services.event_bus import SandboxStage
+from services.events import SandboxStage
 
 logger: Logger = getLogger(__name__)
 

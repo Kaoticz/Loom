@@ -5,7 +5,7 @@ from typing import Any
 
 from pydantic_ai import RunContext
 
-from services.event_bus import CommitEvent, WarningEvent
+from services.events import CommitEvent, WarningEvent
 from services.git_manager import CommitResult
 from services.session_context import SessionContext
 from services.tool_reporting import report_tool

@@ -17,7 +17,7 @@ from services.code_search import CodeSearchService
 from services.projects import normalise_project_path
 from services.conversation_history import ConversationHistory
 from services.docker_sandbox import DockerSandboxManager
-from services.event_bus import (
+from services.events import (
     INDEXING_PROGRESS_KEY,
     AgentEvent,
     DoneEvent,
@@ -726,7 +726,7 @@ async def test_no_changes_is_reported_as_a_rejection(
         limits=IterationLimits(max_review_retries=1),
     )
 
-    from services.event_bus import ReviewEvent
+    from services.events import ReviewEvent
 
     # The user aborted at the cap, which is a cancellation rather than a failure.
     assert await session.run() is SessionState.cancelled
@@ -747,7 +747,7 @@ async def test_merge_conflict_fails_cleanly(monkeypatch: pytest.MonkeyPatch) -> 
         git=git,
     )
 
-    from services.event_bus import ErrorEvent
+    from services.events import ErrorEvent
 
     assert await session.run() is SessionState.failed
     errors = [event for event in events if isinstance(event, ErrorEvent)]
@@ -2187,7 +2187,7 @@ async def test_a_measured_window_budgets_every_long_run_path() -> None:
     assert await session._measure_context_window() == 8_192
     assert calls == [session._coder_model]
 
-    from services.event_bus import CompactionRunPath
+    from services.events import CompactionRunPath
 
     capability: object = session._compaction_for(
         session._coder_context_window, CompactionRunPath.coder_streaming
@@ -2289,7 +2289,7 @@ async def test_compaction_capabilities_include_only_the_ladder() -> None:
     """
     from pydantic_ai.capabilities import AbstractCapability
     from services.compaction import ObservedCompaction
-    from services.event_bus import CompactionRunPath
+    from services.events import CompactionRunPath
 
     session, _, _, _ = build_session([json.dumps({'prompt': 'do it'})])
     capabilities: list[AbstractCapability[Any]] = session._compaction_capabilities_for(

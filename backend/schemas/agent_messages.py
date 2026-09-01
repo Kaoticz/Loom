@@ -7,7 +7,7 @@ from pydantic import BaseModel, ConfigDict, Field
 
 from services.plan_parser import PlanFormat, PlanStep
 
-from services.event_bus import (
+from services.events import (
     BaseAgentEvent,
     CommitEvent,
     CompactionEvent,

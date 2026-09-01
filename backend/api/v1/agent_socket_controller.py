@@ -7,7 +7,7 @@ from services.code_search import CodeSearchService
 from services.conversation_history import ConversationHistory
 from services.docker_sandbox import DockerSandboxManager
 from services.embedding import EmbeddingService
-from services.event_bus import AgentEvent, ErrorEvent, EventBus
+from services.events import AgentEvent, ErrorEvent, EventBus
 from services.file_editor import FileEditorService
 from services.git_manager import GitManagerService
 from services.indexing import IndexingService

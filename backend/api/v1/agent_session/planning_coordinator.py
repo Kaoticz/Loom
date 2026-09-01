@@ -7,7 +7,7 @@ from agents.planner import PLANNER_SYSTEM_PROMPT, StructuredPlan, planner_agent
 from pydantic_ai.agent import AgentRunResult
 from services.compaction import looks_like_context_overflow
 from services.conversation_history import TurnRole
-from services.event_bus import CompactionRunPath, ErrorEvent, SessionStatus
+from services.events import CompactionRunPath, ErrorEvent, SessionStatus
 from services.plan_parser import NO_STEPS_CORRECTION, ParsedPlan, PlanFormat, PlanStep, parse_plan, render_plan
 from services.session_fsm import SessionState
 

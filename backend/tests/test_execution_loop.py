@@ -16,7 +16,7 @@ import api.v1.agent_session.agent_run_helper as agent_run_helper_module
 import api.v1.agent_session.agent_session as agent_session_module
 import api.v1.agent_session.context_overflow_recovery as context_overflow_recovery_module
 from api.v1.agent_session import AgentSession
-from services.event_bus import (
+from services.events import (
     AgentEvent,
     CompactionEvent,
     CompactionRunPath,
@@ -429,7 +429,7 @@ async def test_executing_phase_is_announced_with_its_status(
     Requirement 3.1: the announcement is `SYSTEM`, and it names the phase rather
     than leaving the client to recognise the wording.
     """
-    from services.event_bus import SessionStatus
+    from services.events import SessionStatus
 
     responses: list[ModelResponse] = [
         ModelResponse(parts=[TextPart(content='All done.')]),
@@ -1407,7 +1407,7 @@ async def test_a_failing_commit_warns_and_does_not_kill_the_session(
     The changes are on disk either way, so failing the session loses the work
     along with the diagnosis.
     """
-    from services.event_bus import WarningEvent
+    from services.events import WarningEvent
     from tests.test_agent_tools import invoke
 
     session, events = prepare(monkeypatch, [], git_repo)
@@ -1536,7 +1536,7 @@ async def test_commit_failures_with_nobody_to_ask_do_not_hang(
     """
     Stopping a session nobody is watching would discard the work for no benefit.
     """
-    from services.event_bus import WarningEvent
+    from services.events import WarningEvent
 
     session, events = prepare(monkeypatch, [], git_repo)
     context = session._session
@@ -1594,7 +1594,7 @@ async def test_leftover_changes_are_swept_into_a_commit(
     """
     from pathlib import Path
 
-    from services.event_bus import WarningEvent
+    from services.events import WarningEvent
 
     session, events = prepare(monkeypatch, [], git_repo)
     await git_repo.create_branch('ai-task-sweep')
@@ -1617,7 +1617,7 @@ async def test_a_clean_tree_is_not_swept(
     """
     An empty commit and a warning about nothing would be noise.
     """
-    from services.event_bus import WarningEvent
+    from services.events import WarningEvent
 
     session, events = prepare(monkeypatch, [], git_repo)
     await git_repo.create_branch('ai-task-clean')
@@ -1835,7 +1835,7 @@ async def test_a_window_too_large_is_narrowed_and_the_run_retried(
     """
     from pydantic_ai.exceptions import UnexpectedModelBehavior
 
-    from services.event_bus import WarningEvent
+    from services.events import WarningEvent
 
     session, events = prepare(monkeypatch, [], git_repo)
     session._coder_context_window = 128_048
@@ -1925,7 +1925,7 @@ async def test_persistent_tool_retry_exhaustion_marks_the_step_incomplete(
     """
     from pydantic_ai.exceptions import UnexpectedModelBehavior
 
-    from services.event_bus import WarningEvent
+    from services.events import WarningEvent
 
     session, events = prepare(monkeypatch, [], git_repo)
     session._session.record_classification(True)
@@ -1976,7 +1976,7 @@ async def test_tool_retry_exhaustion_is_tolerated_for_an_unparsed_plan(
     """
     from pydantic_ai.exceptions import UnexpectedModelBehavior
 
-    from services.event_bus import WarningEvent
+    from services.events import WarningEvent
 
     session, events = prepare(monkeypatch, [], git_repo)
     session._plan = ParsedPlan(steps=[])
@@ -2055,7 +2055,7 @@ async def test_an_unworkable_window_is_explained_before_the_first_step(
     run that cannot possibly work reads as a bug in Loom rather than as a
     setting to change.
     """
-    from services.event_bus import WarningEvent
+    from services.events import WarningEvent
 
     session, events = prepare(monkeypatch, [], git_repo)
     session._plan = three_step_plan()
@@ -2076,7 +2076,7 @@ async def test_a_workable_window_is_not_complained_about(
     """
     A warning on every run would train the user to ignore it.
     """
-    from services.event_bus import WarningEvent
+    from services.events import WarningEvent
 
     session, events = prepare(monkeypatch, [], git_repo)
     session._plan = three_step_plan()
@@ -2113,7 +2113,7 @@ async def test_narrowing_stops_once_it_cannot_help(
     is. Below that floor the model has nowhere to put the work, so narrowing
     again would fail the same way while looking like it were doing something.
     """
-    from services.event_bus import WarningEvent
+    from services.events import WarningEvent
 
     session, events = prepare(monkeypatch, [], git_repo)
     session._coder_context_window = 8_003
@@ -2151,7 +2151,7 @@ async def test_context_usage_is_reported_with_both_readings(
     """
     from pydantic_ai_harness.compaction import ContextUsage
 
-    from services.event_bus import ContextUsageEvent
+    from services.events import ContextUsageEvent
 
     session, events = prepare(monkeypatch, [], git_repo)
 
@@ -2174,7 +2174,7 @@ async def test_an_unresolved_window_is_passed_through(
     """
     from pydantic_ai_harness.compaction import ContextUsage
 
-    from services.event_bus import ContextUsageEvent
+    from services.events import ContextUsageEvent
 
     session, events = prepare(monkeypatch, [], git_repo)
 
@@ -2194,7 +2194,7 @@ async def test_provider_input_truncation_narrows_once_with_concrete_counts(
     """
     from pydantic_ai_harness.compaction import ContextUsage
 
-    from services.event_bus import WarningEvent
+    from services.events import WarningEvent
 
     session, events = prepare(monkeypatch, [], git_repo)
     await session._report_context_usage(
@@ -2321,7 +2321,7 @@ async def test_forced_summary_emits_a_distinct_recovery_warning(
     Users can distinguish successful summary recovery from window narrowing.
     """
     from services.compaction import RequestHistoryCapture
-    from services.event_bus import WarningEvent
+    from services.events import WarningEvent
 
     session, events = prepare(monkeypatch, [], git_repo)
     history: RequestHistoryCapture = RequestHistoryCapture()
@@ -2359,7 +2359,7 @@ async def test_provider_underestimate_reserves_budget_and_warns_once(
     """
     from pydantic_ai_harness.compaction import ContextUsage
 
-    from services.event_bus import WarningEvent
+    from services.events import WarningEvent
 
     session, events = prepare(monkeypatch, [], git_repo)
     await session._report_context_usage(
@@ -2390,7 +2390,7 @@ async def test_agreeing_or_absent_provider_usage_emits_no_warning(
     """
     from pydantic_ai_harness.compaction import ContextUsage
 
-    from services.event_bus import WarningEvent
+    from services.events import WarningEvent
 
     session, events = prepare(monkeypatch, [], git_repo)
     await session._report_context_usage(
@@ -2413,7 +2413,7 @@ async def test_provider_usage_capability_reconciles_each_successful_response(
     from pydantic_ai.usage import RequestUsage
     from pydantic_ai_harness.compaction import ContextUsage
 
-    from services.event_bus import WarningEvent
+    from services.events import WarningEvent
 
     session, events = prepare(monkeypatch, [], git_repo)
     await session._report_context_usage(

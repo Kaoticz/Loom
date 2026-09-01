@@ -24,7 +24,7 @@ from schemas.agent_messages import (
     to_message,
     truncate_diff_side,
 )
-from services.event_bus import (
+from services.events import (
     BaseAgentEvent,
     CommitEvent,
     CompactionEvent,

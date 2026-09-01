@@ -8,7 +8,7 @@ from unittest.mock import MagicMock
 import pytest
 from docker.errors import NotFound
 
-from services.event_bus import SandboxStage
+from services.events import SandboxStage
 from services.docker_sandbox import (
     DEFAULT_SANDBOX_IMAGE,
     TIMEOUT_EXIT_CODE,

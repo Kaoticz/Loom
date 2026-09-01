@@ -4,7 +4,7 @@ from collections.abc import AsyncGenerator
 from contextlib import asynccontextmanager
 from typing import Any
 
-from services.event_bus import EventBus, ToolActionEvent, ToolObservationEvent, ToolStatus
+from services.events import EventBus, ToolActionEvent, ToolObservationEvent, ToolStatus
 
 MAX_REPORTED_RESULT_LENGTH: int = 2000
 

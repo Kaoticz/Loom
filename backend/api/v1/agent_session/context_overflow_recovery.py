@@ -15,7 +15,7 @@ from services.compaction import (
     resolve_context_window,
 )
 from services.context_budget import context_window_complaint, estimate_fixed_overhead
-from services.event_bus import CompactionRunPath, WarningEvent
+from services.events import CompactionRunPath, WarningEvent
 from services.model_resolution import resolve_model
 
 if TYPE_CHECKING:

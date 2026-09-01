@@ -17,7 +17,7 @@ from database.models.file import File
 from database.models.symbol import Symbol
 from services.code_search import CodeSearchService, LexicalMatchMode
 from services.docker_sandbox import DockerSandboxManager
-from services.event_bus import (
+from services.events import (
     AgentEvent,
     CommitEvent,
     DiffEvent,

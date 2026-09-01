@@ -18,7 +18,7 @@ from pydantic_ai.messages import (
 )
 from services.compaction import RequestHistoryCapture
 from services.conversation_history import TurnRole
-from services.event_bus import CompactionRunPath
+from services.events import CompactionRunPath
 from services.model_resolution import resolve_model
 from services.session_fsm import SessionState
 from services.thought_buffer import ThoughtBuffer

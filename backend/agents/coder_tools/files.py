@@ -8,7 +8,7 @@ from typing import Any
 
 from pydantic_ai import RunContext
 
-from services.event_bus import DiffEvent
+from services.events import DiffEvent
 from services.file_editor import EditResult
 from services.repository_files import list_indexable_files
 from services.tool_reporting import ToolReport, describe_file_read, report_tool

@@ -16,7 +16,7 @@ from services.code_search import CodeSearchService
 from services.projects import normalise_project_path
 from services.docker_sandbox import DockerSandboxManager
 from services.embedding import EmbeddingService
-from services.event_bus import EventBus
+from services.events import EventBus
 from services.file_editor import FileEditorService
 from services.git_manager import GitManagerService
 from services.session_context import SessionContext

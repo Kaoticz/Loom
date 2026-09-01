@@ -15,7 +15,7 @@ from database.models.task import Task
 from database.models.task_memory import TaskMemory
 from schemas.task_request import TaskRequest
 from schemas.task_response import TaskPatchRequest
-from services.event_bus import CommitEvent, PlanEvent, ReviewEvent, ThoughtEvent, ToolObservationEvent, ToolStatus
+from services.events import CommitEvent, PlanEvent, ReviewEvent, ThoughtEvent, ToolObservationEvent, ToolStatus
 from services.task_recorder import TaskRecorder
 from services.plan_parser import PlanStep
 

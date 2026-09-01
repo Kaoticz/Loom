@@ -7,7 +7,7 @@ from typing import Any
 from database.enums import TaskLogEntryType, TaskStatus
 from database.models.task import Task
 from database.models.task_memory import TaskMemory
-from services.event_bus import (
+from services.events import (
     BaseAgentEvent,
     CommitEvent,
     PlanEvent,

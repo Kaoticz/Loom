@@ -23,7 +23,7 @@ from pydantic_ai.providers.openai import OpenAIProvider
 from schemas.agent_commands import CommandAction, SessionCommand, parse_command
 from services.conversation_history import ConversationHistory, TurnRole
 from services.embedding import DEFAULT_EMBEDDING_MODEL, EmbeddingService
-from services.event_bus import (
+from services.events import (
     CommitEvent,
     CompactionEvent,
     CompactionRunPath,

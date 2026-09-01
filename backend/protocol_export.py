@@ -8,7 +8,7 @@ from database.enums import TaskLogEntryType, TaskStatus
 from services.plan_parser import PlanFormat
 from schemas.agent_commands import CommandAction
 from schemas.agent_messages import MessageType
-from services.event_bus import SandboxStage, SessionStatus, ToolStatus
+from services.events import SandboxStage, SessionStatus, ToolStatus
 
 """
 The vocabulary the backend and the frontend must agree on.

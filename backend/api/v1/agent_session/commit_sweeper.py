@@ -2,7 +2,7 @@ from __future__ import annotations
 
 from typing import TYPE_CHECKING
 
-from services.event_bus import CommitEvent, WarningEvent
+from services.events import CommitEvent, WarningEvent
 from services.git_manager import CommitResult
 from services.user_questions import StopRequested, UserQuestioner
 
