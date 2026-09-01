@@ -7,13 +7,14 @@ import shutil
 import tempfile
 from collections.abc import Iterable, Mapping
 from logging import Logger, getLogger
-from typing import Annotated, Any
+from typing import Any
 
 import docker
 from docker.errors import NotFound
-from pydantic import BaseModel, Field
 
+from services.command_result import CommandResult
 from services.events import SandboxStage
+from services.sandbox_error import SandboxError
 
 logger: Logger = getLogger(__name__)
 
@@ -64,46 +65,6 @@ def host_path_within(source: str, destination: str, container_path: str) -> str:
     if container_path == destination:
         return source
     return os.path.join(source, os.path.relpath(container_path, destination))
-
-
-class SandboxError(RuntimeError):
-    """
-    Raised when the sandbox cannot be prepared or is not usable.
-
-    Carries the step that failed, so that callers can tell the causes apart
-    rather than presenting every one of them as the same sentence.
-    """
-
-    stage: SandboxStage
-
-    def __init__(self, stage: SandboxStage, message: str) -> None:
-        """
-        Describe a sandbox failure.
-
-        :param stage: Which step of preparing the sandbox failed.
-        :param message: What went wrong, in terms the reader can act on.
-        """
-        super().__init__(message)
-        self.stage = stage
-
-
-class CommandResult(BaseModel):
-    """
-    Outcome of a command executed inside the sandbox.
-    """
-
-    exit_code: Annotated[int, Field(description='Process exit status. Zero means the command succeeded.')]
-    output: Annotated[str, Field(description='Combined stdout and stderr, with any secret values redacted.')]
-    timed_out: Annotated[bool, Field(description='Whether the command was killed for exceeding its time limit.')] = False
-
-    @property
-    def success(self) -> bool:
-        """
-        Whether the command completed successfully.
-
-        :returns: True if the command exited with status zero.
-        """
-        return self.exit_code == 0
 
 
 class DockerSandboxManager:

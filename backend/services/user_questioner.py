@@ -2,6 +2,9 @@ from __future__ import annotations
 
 from collections.abc import Awaitable, Callable, Sequence
 
+from services.client_gone import ClientGone
+from services.stop_requested import StopRequested
+
 MAX_SUGGESTED_ANSWERS: int = 6
 """
 How many answers the agent may suggest.
@@ -10,18 +13,6 @@ Beyond this a list stops being a choice and becomes something to read carefully,
 at which point a free reply serves the reader better anyway. The interface adds
 its own free-reply option on top, so the reader always sees one more than this.
 """
-
-
-class ClientGone(Exception):
-    """
-    Raised when the client has disconnected and the session cannot continue.
-    """
-
-
-class StopRequested(Exception):
-    """
-    Raised when the user has asked the session to stop.
-    """
 
 
 EmitQuestion = Callable[[str, Sequence[str]], Awaitable[None]]

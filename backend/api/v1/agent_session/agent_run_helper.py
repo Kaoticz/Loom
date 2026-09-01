@@ -20,9 +20,10 @@ from services.compaction import RequestHistoryCapture
 from services.conversation_history import TurnRole
 from services.events import CompactionRunPath
 from services.model_resolution import resolve_model
-from services.session_fsm import SessionState
+from services.session_state import SessionState
 from services.thought_buffer import ThoughtBuffer
-from services.user_questions import ClientGone, StopRequested
+from services.client_gone import ClientGone
+from services.stop_requested import StopRequested
 
 from .terminal_tool_completed import TerminalToolCompleted
 

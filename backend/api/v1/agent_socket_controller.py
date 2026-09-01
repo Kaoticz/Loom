@@ -12,7 +12,7 @@ from services.file_editor import FileEditorService
 from services.git_manager import GitManagerService
 from services.indexing import IndexingService
 from services.session_context import SessionContext
-from services.session_fsm import SessionStateMachine
+from services.session_state_machine import SessionStateMachine
 from services.session_registry import SessionRegistry
 from services.session_limits import IterationLimits
 import logging

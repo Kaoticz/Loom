@@ -6,10 +6,10 @@ from typing import Any
 from pydantic_ai import RunContext
 
 from services.events import CommitEvent, WarningEvent
-from services.git_manager import CommitResult
+from services.commit_result import CommitResult
 from services.session_context import SessionContext
 from services.tool_reporting import report_tool
-from services.user_questions import MAX_SUGGESTED_ANSWERS, UserQuestioner
+from services.user_questioner import MAX_SUGGESTED_ANSWERS, UserQuestioner
 
 from .deps import AgentDeps
 

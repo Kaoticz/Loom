@@ -2,13 +2,9 @@ from __future__ import annotations
 
 import pytest
 
-from services.session_fsm import (
-    InvalidStateTransitionError,
-    SessionState,
-    SessionStateMachine,
-    is_terminal,
-    is_valid_transition,
-)
+from services.invalid_state_transition_error import InvalidStateTransitionError
+from services.session_state import SessionState
+from services.session_state_machine import SessionStateMachine, is_terminal, is_valid_transition
 
 HAPPY_PATH: list[SessionState] = [
     SessionState.classifying,

@@ -7,7 +7,8 @@ from logging import Logger, getLogger
 from schemas.agent_commands import parse_command
 from schemas.command_action import CommandAction
 from schemas.session_command import SessionCommand
-from services.user_questions import ClientGone, StopRequested
+from services.client_gone import ClientGone
+from services.stop_requested import StopRequested
 
 logger: Logger = getLogger(__name__)
 

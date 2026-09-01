@@ -1,61 +1,13 @@
 from git import Git, Head, Repo
 from git.exc import GitCommandError
-from pydantic import BaseModel, Field
-from typing import Annotated
 import asyncio
 from logging import Logger, getLogger
 
+from services.commit_info import CommitInfo
+from services.commit_result import CommitResult
+from services.file_change import FileChange
+
 logger: Logger = getLogger(__name__)
-
-
-class FileChange(BaseModel):
-    """
-    A single file's contribution to a cumulative diff.
-    """
-
-    path: Annotated[str, Field(description='Repository-relative path of the changed file.')]
-    insertions: Annotated[int, Field(ge=0, description='Lines added, or zero for a binary file.')]
-    deletions: Annotated[int, Field(ge=0, description='Lines removed, or zero for a binary file.')]
-
-    @property
-    def total_changed(self) -> int:
-        """
-        How many lines the change touches in total.
-
-        :returns: The sum of insertions and deletions.
-        """
-        return self.insertions + self.deletions
-
-
-class CommitInfo(BaseModel):
-    """
-    Details of a commit that was just written.
-    """
-
-    commit_hash: Annotated[str, Field(description='The full SHA of the new commit.')]
-    message: Annotated[str, Field(description='The commit message.')]
-    files_changed: Annotated[list[str], Field(default_factory=list, description='Repository-relative paths touched by the commit.')]
-
-class CommitResult(BaseModel):
-    """
-    What came of trying to commit.
-
-    All three outcomes are distinct and the caller acts differently on each: a
-    commit was made, there was nothing to commit, or it failed and the changes
-    are still sitting in the working tree where review will not see them.
-    """
-
-    commit: Annotated[CommitInfo | None, Field(description='The commit, if one was made.')] = None
-    error: Annotated[str | None, Field(description='Why the commit failed, if it did.')] = None
-
-    @property
-    def failed(self) -> bool:
-        """
-        Whether the commit was attempted and did not succeed.
-
-        :returns: True if an error was recorded.
-        """
-        return self.error is not None
 
 
 class GitManagerService:

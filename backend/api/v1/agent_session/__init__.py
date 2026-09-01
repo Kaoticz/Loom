@@ -12,7 +12,8 @@ from .context_overflow_recovery import ContextOverflowRecovery
 from .planning_coordinator import PlanningCoordinator
 from .session_services import SessionServices
 from .terminal_tool_completed import TerminalToolCompleted
-from services.user_questions import ClientGone, StopRequested
+from services.client_gone import ClientGone
+from services.stop_requested import StopRequested
 
 __all__: list[str] = [
     'AgentRunHelper',

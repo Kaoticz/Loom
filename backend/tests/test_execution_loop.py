@@ -27,8 +27,8 @@ from services.events import (
     ToolActionEvent,
 )
 from services.git_manager import GitManagerService
-from services.docker_sandbox import CommandResult
-from services.session_fsm import SessionState
+from services.command_result import CommandResult
+from services.session_state import SessionState
 from tests.test_agent_session import FakeGit, build_session, opening
 from services.plan_parser import ParsedPlan, PlanStep
 from pydantic_ai_harness.compaction import TieredCompaction

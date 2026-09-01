@@ -273,22 +273,23 @@ At the end of this plan:
 - **Testing Notes:** Full backend suite.
 - **Completion verification (2026-08-31):** Focused `tests/test_agent_commands.py tests/test_session_inbox.py tests/test_config_controller.py tests/test_chunking.py tests/test_indexing.py tests/test_tasks.py tests/test_agent_session.py tests/test_execution_loop.py tests/test_agents.py tests/test_agent_tools.py` → **411 passed**; full backend `pytest` → **972 passed, 4 skipped**; `mypy .` → no issues in **189 source files**; `basedpyright .` → **0 errors, 0 warnings, 0 notes**; `git diff --check` → clean. Structural checks confirm the three legacy modules are deleted, no legacy imports remain, and all 18 Phase 9 classes each occupy their own file. No files under `data/` were changed.
 
-### Phase 10: One-class-per-file — process/execution-layer services — Status: Not Started
+### Phase 10: One-class-per-file — process/execution-layer services — Status: Done
 - **Goal:** Split the process/execution-layer service files (each has one primary service/manager class plus 1-3 small support types) into one file per class, as siblings in `backend/services/` (each split produces ≤4 files — no folder needed per the convention's threshold).
 - **Requirements:**
-  - [ ] `backend/services/docker_sandbox.py` → `sandbox_error.py` (`SandboxError`), `command_result.py` (`CommandResult`); keep `DockerSandboxManager` in `docker_sandbox.py`.
-  - [ ] `backend/services/git_manager.py` → `file_change.py`, `commit_info.py`, `commit_result.py`; keep `GitManagerService` in `git_manager.py`.
-  - [ ] `backend/services/file_editor.py` → `edit_result.py`; keep `FileEditorService` in `file_editor.py`.
-  - [ ] `backend/services/session_fsm.py` → `session_state.py` (`SessionState` enum), `invalid_state_transition_error.py`; rename the remaining file to `session_state_machine.py` to match `SessionStateMachine` (the file no longer matches its old "fsm" abbreviation once it's the eponymous file for just this one class).
-  - [ ] `backend/services/user_questions.py` → `client_gone.py`, `stop_requested.py`; rename the remaining file to `user_questioner.py` to match `UserQuestioner`.
-  - [ ] Update every import site across the codebase referencing any of the old module paths for classes/files that moved or were renamed.
+   - [x] `backend/services/docker_sandbox.py` → `sandbox_error.py` (`SandboxError`), `command_result.py` (`CommandResult`); keep `DockerSandboxManager` in `docker_sandbox.py`.
+   - [x] `backend/services/git_manager.py` → `file_change.py`, `commit_info.py`, `commit_result.py`; keep `GitManagerService` in `git_manager.py`.
+   - [x] `backend/services/file_editor.py` → `edit_result.py`; keep `FileEditorService` in `file_editor.py`.
+   - [x] `backend/services/session_fsm.py` → `session_state.py` (`SessionState` enum), `invalid_state_transition_error.py`; rename the remaining file to `session_state_machine.py` to match `SessionStateMachine` (the file no longer matches its old "fsm" abbreviation once it's the eponymous file for just this one class).
+   - [x] `backend/services/user_questions.py` → `client_gone.py`, `stop_requested.py`; rename the remaining file to `user_questioner.py` to match `UserQuestioner`.
+   - [x] Update every import site across the codebase referencing any of the old module paths for classes/files that moved or were renamed.
 - **Edge Cases & Error Handling:** None specific.
 - **Affected Areas:** The 5 files listed above, plus every file importing from them.
 - **Acceptance Criteria:**
-  - [ ] No file among these 5 (or their replacements) defines more than one class.
-  - [ ] Backend test suite passes with the same results as the Phase 0 baseline.
-  - [ ] `mypy`/`basedpyright` clean.
+   - [x] No file among these 5 (or their replacements) defines more than one class. — verified by: class scan reports 15 classes across the 15 individual Phase 10 class files.
+   - [x] Backend test suite passes with the same results as the Phase 0 baseline. — verified by: `cd backend && .venv/bin/pytest` → **972 passed, 4 skipped**.
+   - [x] `mypy`/`basedpyright` clean. — verified by: `cd backend && .venv/bin/mypy .` → no issues in 199 source files; `cd backend && .venv/bin/basedpyright .` → **0 errors, 0 warnings, 0 notes**.
 - **Testing Notes:** Full backend suite; pay particular attention to sandbox and git-related tests given these services' role in the execution/verification loop.
+- **Completion verification (2026-09-01):** Focused `tests/test_sandbox.py tests/test_git_manager.py tests/test_file_editor.py tests/test_session_state_machine.py tests/test_session_inbox.py tests/test_review_context.py tests/test_agent_tools.py tests/test_agent_session.py tests/test_execution_loop.py tests/test_agent_socket_controller.py tests/test_integration.py` → **389 passed**; full backend `pytest` → **972 passed, 4 skipped**; `mypy .` → no issues in **199 source files**; `basedpyright .` → **0 errors, 0 warnings, 0 notes**; `git diff --check` → clean. Structural checks confirm the legacy `session_fsm.py` and `user_questions.py` modules are deleted, no old module imports or support-type imports through their former primary modules remain, all imports are direct, and the 15 Phase 10 classes each occupy their own file. The `api.v1.agent_session` package continues to re-export `ClientGone` and `StopRequested` from their direct modules. No files under `data/` were changed.
 
 ### Phase 11: One-class-per-file — retrieval/context-management services — Status: Not Started
 - **Goal:** Split the retrieval/context-management service files into one file per class, as siblings in `backend/services/`.

@@ -12,7 +12,7 @@ from services.file_editor import FileEditorService
 from services.git_manager import GitManagerService
 from services.indexing import IndexingService
 from services.session_context import SessionContext
-from services.user_questions import UserQuestioner
+from services.user_questioner import UserQuestioner
 
 
 class AgentDeps(BaseModel):

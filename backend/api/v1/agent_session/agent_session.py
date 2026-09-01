@@ -45,9 +45,12 @@ from services.events import (
     SystemEvent,
     ThoughtEvent,
 )
-from services.docker_sandbox import DockerSandboxManager, SandboxError
+from services.docker_sandbox import DockerSandboxManager
+from services.sandbox_error import SandboxError
 from services.file_editor import FileEditorService
-from services.git_manager import CommitResult, FileChange, GitManagerService
+from services.commit_result import CommitResult
+from services.file_change import FileChange
+from services.git_manager import GitManagerService
 from services.code_search import CodeSearchService
 from services.compaction import (
     build_compaction,
@@ -85,12 +88,11 @@ from services.model_resolution import (
 )
 from services.session_context import SessionContext
 from services.session_inbox import SessionInbox
-from services.user_questions import (
-    ClientGone as ClientGone,
-    StopRequested as StopRequested,
-    UserQuestioner,
-)
-from services.session_fsm import SessionState, SessionStateMachine
+from services.client_gone import ClientGone
+from services.stop_requested import StopRequested
+from services.user_questioner import UserQuestioner
+from services.session_state import SessionState
+from services.session_state_machine import SessionStateMachine
 from services.session_limits import IterationLimits
 from services.session_registry import SessionRegistry
 from services.task_recorder import TaskRecorder

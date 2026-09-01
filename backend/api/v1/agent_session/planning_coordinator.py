@@ -10,7 +10,7 @@ from services.compaction import looks_like_context_overflow
 from services.conversation_history import TurnRole
 from services.events import CompactionRunPath, ErrorEvent, SessionStatus
 from services.plan_parser import NO_STEPS_CORRECTION, ParsedPlan, PlanFormat, PlanStep, parse_plan, render_plan
-from services.session_fsm import SessionState
+from services.session_state import SessionState
 
 if TYPE_CHECKING:
     from .agent_session import AgentSession

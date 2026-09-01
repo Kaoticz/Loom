@@ -3,7 +3,7 @@ from __future__ import annotations
 from pydantic_ai import RunContext
 
 from services.browser_tooling import browser_automation_refusal
-from services.docker_sandbox import CommandResult
+from services.command_result import CommandResult
 from services.tool_reporting import report_tool
 
 from .deps import AgentDeps

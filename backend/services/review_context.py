@@ -2,7 +2,7 @@ from __future__ import annotations
 
 from collections.abc import Awaitable, Callable, Sequence
 
-from services.git_manager import FileChange
+from services.file_change import FileChange
 
 DEFAULT_REVIEW_BUDGET_CHARACTERS: int = 24_000
 

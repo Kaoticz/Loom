@@ -33,9 +33,12 @@ from services.events import (
 from services.indexing_progress import ProgressReporter
 from services.indexing import IndexingService
 from services.file_editor import FileEditorService
-from services.git_manager import CommitResult, FileChange, GitManagerService
+from services.commit_result import CommitResult
+from services.file_change import FileChange
+from services.git_manager import GitManagerService
 from services.session_context import SessionContext
-from services.session_fsm import SessionState, SessionStateMachine
+from services.session_state import SessionState
+from services.session_state_machine import SessionStateMachine
 from services.session_limits import IterationLimits
 from services.session_registry import SessionRegistry
 from tests.conftest import TEST_REPO_PATH, stub_embedding_service

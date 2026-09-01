@@ -3,8 +3,9 @@ from __future__ import annotations
 from typing import TYPE_CHECKING
 
 from services.events import CommitEvent, WarningEvent
-from services.git_manager import CommitResult
-from services.user_questions import StopRequested, UserQuestioner
+from services.commit_result import CommitResult
+from services.stop_requested import StopRequested
+from services.user_questioner import UserQuestioner
 
 from .commit_failure_decision import (
     COMMIT_FAILURE_OPTIONS,

@@ -160,7 +160,8 @@ def wired(monkeypatch: pytest.MonkeyPatch) -> None:
     :param monkeypatch: Fixture used to install the substitutes.
     """
     import api.v1.agent_session.agent_run_helper as agent_run_helper_module
-    from services.docker_sandbox import CommandResult, DockerSandboxManager
+    from services.command_result import CommandResult
+    from services.docker_sandbox import DockerSandboxManager
     from services.embedding import EmbeddingService
 
     model: FunctionModel = scripted_coder()

@@ -30,7 +30,7 @@ from services.file_editor import FileEditorService
 from services.git_manager import GitManagerService
 from services.indexing import IndexingService
 from services.session_context import SessionContext
-from services.user_questions import UserQuestioner
+from services.user_questioner import UserQuestioner
 from tests.conftest import TEST_PROJECT, TEST_REPO_PATH, git_log, stub_embedding_service
 
 EXPECTED_TOOLS: set[str] = {
@@ -293,7 +293,7 @@ async def test_run_test_command_refuses_an_empty_command(deps: AgentDeps, comman
     """
     An empty command is refused without reaching the sandbox.
     """
-    from services.docker_sandbox import CommandResult
+    from services.command_result import CommandResult
 
     ran: list[str] = []
 
@@ -317,7 +317,7 @@ async def test_playwright_is_refused_before_reaching_the_sandbox(deps: AgentDeps
     slow and leaves the sandbox changed, so running it and complaining
     afterwards would achieve neither.
     """
-    from services.docker_sandbox import CommandResult
+    from services.command_result import CommandResult
 
     ran: list[str] = []
 
@@ -1010,7 +1010,7 @@ async def test_missing_sandbox_tells_the_agent_not_to_retry(deps: AgentDeps) -> 
     A stack trace fragment tells the agent nothing actionable, so it retries a
     command that can never succeed instead of adapting and saying so.
     """
-    from services.docker_sandbox import CommandResult
+    from services.command_result import CommandResult
 
     async def unavailable(command: str) -> CommandResult:
         raise RuntimeError('Error while fetching server API version')
@@ -1637,7 +1637,7 @@ async def test_a_missing_tool_does_not_count_as_a_failed_verification(
     turns "pytest is not installed" into permission to stop verifying, which is
     exactly the wandering this guards against.
     """
-    from services.docker_sandbox import CommandResult
+    from services.command_result import CommandResult
 
     async def missing(command: str) -> CommandResult:
         return CommandResult(exit_code=127, output='bash: pytest: command not found')
@@ -1659,7 +1659,7 @@ async def test_a_missing_python_module_is_recognised_too(deps: AgentDeps) -> Non
     The exit code is indistinguishable from a real failure, and this is the most
     likely way the problem shows up in a Python repository.
     """
-    from services.docker_sandbox import CommandResult
+    from services.command_result import CommandResult
 
     async def missing(command: str) -> CommandResult:
         return CommandResult(exit_code=1, output='/usr/bin/python: No module named pytest')
@@ -1680,7 +1680,7 @@ async def test_a_real_test_failure_still_counts(deps: AgentDeps) -> None:
     Telling the agent to install something when the code is broken would send it
     after the wrong problem entirely.
     """
-    from services.docker_sandbox import CommandResult
+    from services.command_result import CommandResult
 
     async def failing(command: str) -> CommandResult:
         return CommandResult(exit_code=1, output='FAILED tests/test_a.py::test_b - assert 1 == 2')
@@ -1703,7 +1703,7 @@ async def test_a_command_that_was_never_run_cannot_be_recorded(deps: AgentDeps) 
     together, one of which reinstalls the world on every use. Every later step
     would have inherited it.
     """
-    from services.docker_sandbox import CommandResult
+    from services.command_result import CommandResult
 
     async def probe(command: str) -> CommandResult:
         return CommandResult(exit_code=0, output='v25.9.0\n11.12.1')
@@ -1726,7 +1726,7 @@ async def test_a_command_that_passed_can_be_recorded(deps: AgentDeps) -> None:
     """
     The intended path: run it, watch it pass, then record it.
     """
-    from services.docker_sandbox import CommandResult
+    from services.command_result import CommandResult
 
     async def passing(command: str) -> CommandResult:
         return CommandResult(exit_code=0, output='4 passed')
@@ -1744,7 +1744,7 @@ async def test_a_command_that_failed_cannot_be_recorded(deps: AgentDeps) -> None
     """
     A command that ran and failed has not been shown to verify anything.
     """
-    from services.docker_sandbox import CommandResult
+    from services.command_result import CommandResult
 
     async def failing(command: str) -> CommandResult:
         return CommandResult(exit_code=1, output='1 failed')
@@ -1762,7 +1762,7 @@ async def test_recording_must_match_what_was_run(deps: AgentDeps) -> None:
     """
     Near enough is not enough: the extra part is the part that was never tried.
     """
-    from services.docker_sandbox import CommandResult
+    from services.command_result import CommandResult
 
     async def passing(command: str) -> CommandResult:
         return CommandResult(exit_code=0, output='ok')
