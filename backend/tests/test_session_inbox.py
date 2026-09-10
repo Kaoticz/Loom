@@ -6,9 +6,10 @@ from collections.abc import Awaitable, Callable
 
 import pytest
 
-from schemas.agent_commands import CommandAction
+from schemas.command_action import CommandAction
 from services.session_inbox import SessionInbox
-from services.user_questions import ClientGone, StopRequested
+from services.client_gone import ClientGone
+from services.stop_requested import StopRequested
 
 
 def pipe(fail_after: int | None = None) -> tuple[SessionInbox, Callable[[str], Awaitable[None]]]:

@@ -5,10 +5,10 @@ from httpx import AsyncClient, ConnectError, MockTransport, Request, Response
 
 from services.embedding import (
     DEFAULT_EMBEDDING_MODEL,
-    EmbeddingError,
-    EmbeddingInputTooLong,
     EmbeddingService,
 )
+from services.embedding_error import EmbeddingError
+from services.embedding_input_too_long import EmbeddingInputTooLong
 
 
 def service_returning(handler: object) -> EmbeddingService:

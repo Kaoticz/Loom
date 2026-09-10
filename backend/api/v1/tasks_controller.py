@@ -1,17 +1,15 @@
 from uuid import UUID, uuid4
 
-from database.enums import TaskStatus
+from database.task_status import TaskStatus
 from database.models.task import Task
 from database.models.task_memory import TaskMemory
 from fastapi import HTTPException
 from schemas.task_request import TaskRequest
-from schemas.task_response import (
-    TaskDetailResponse,
-    TaskListResponse,
-    TaskLogEntryResponse,
-    TaskPatchRequest,
-    TaskResponse,
-)
+from schemas.task_detail_response import TaskDetailResponse
+from schemas.task_list_response import TaskListResponse
+from schemas.task_log_entry_response import TaskLogEntryResponse
+from schemas.task_patch_request import TaskPatchRequest
+from schemas.task_response import TaskResponse
 
 MAX_PAGE_SIZE: int = 100
 

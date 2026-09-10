@@ -4,7 +4,9 @@ import json
 
 import pytest
 
-from schemas.agent_commands import CommandAction, SessionCommand, parse_command
+from schemas.agent_commands import parse_command
+from schemas.command_action import CommandAction
+from schemas.session_command import SessionCommand
 
 
 def test_shorthand_approval_is_understood() -> None:

@@ -10,14 +10,15 @@ from fastapi import HTTPException
 from tortoise import Tortoise
 
 from api.v1.tasks_controller import MAX_PAGE_SIZE, TaskController
-from database.enums import TaskLogEntryType, TaskStatus
+from database.task_log_entry_type import TaskLogEntryType
+from database.task_status import TaskStatus
 from database.models.task import Task
 from database.models.task_memory import TaskMemory
 from schemas.task_request import TaskRequest
-from schemas.task_response import TaskPatchRequest
-from services.event_bus import CommitEvent, PlanEvent, ReviewEvent, ThoughtEvent, ToolObservationEvent, ToolStatus
+from schemas.task_patch_request import TaskPatchRequest
+from services.events import CommitEvent, PlanEvent, ReviewEvent, ThoughtEvent, ToolObservationEvent, ToolStatus
 from services.task_recorder import TaskRecorder
-from services.plan_parser import PlanStep
+from services.plan_step import PlanStep
 
 pytestmark = pytest.mark.usefixtures('require_database')
 

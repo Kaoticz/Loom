@@ -2,13 +2,9 @@ from __future__ import annotations
 
 import pytest
 
-from services.chunking import (
-    Chunk,
-    SymbolSpan,
-    build_chunks,
-    extend_over_decorators,
-    window_chunks,
-)
+from services.chunk import Chunk
+from services.chunking import build_chunks, extend_over_decorators, window_chunks
+from services.symbol_span import SymbolSpan
 
 
 def spans(*pairs: tuple[int, int]) -> list[SymbolSpan]:

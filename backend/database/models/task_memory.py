@@ -1,7 +1,7 @@
 from datetime import datetime
 from typing import Any
 
-from database.enums import TaskLogEntryType
+from database.task_log_entry_type import TaskLogEntryType
 from database.models.task import Task
 from tortoise.fields import (
     CharEnumField,

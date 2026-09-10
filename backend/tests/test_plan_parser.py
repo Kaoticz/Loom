@@ -2,7 +2,10 @@ from __future__ import annotations
 
 import pytest
 
-from services.plan_parser import PlanFormat, PlanStep, ParsedPlan, parse_plan, render_plan
+from services.parsed_plan import ParsedPlan
+from services.plan_format import PlanFormat
+from services.plan_parser import parse_plan, render_plan
+from services.plan_step import PlanStep
 
 
 def test_extracts_numbered_steps() -> None:

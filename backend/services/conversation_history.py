@@ -1,10 +1,10 @@
 from __future__ import annotations
 
 from collections.abc import Iterable, Sequence
-from enum import Enum
-from typing import Annotated, Any, ClassVar
+from typing import Any
 
-from pydantic import BaseModel, ConfigDict, Field
+from services.conversation_turn import ConversationTurn
+from services.turn_role import TurnRole
 
 CHARS_PER_PROSE_TOKEN: int = 4
 CHARS_PER_CODE_TOKEN: int = 2
@@ -13,19 +13,6 @@ DEFAULT_RECENT_TURNS_KEPT: int = 3
 
 FILE_WRITING_TOOLS: frozenset[str] = frozenset({'edit_file', 'create_file', 'delete_file'})
 TEST_RUNNING_TOOLS: frozenset[str] = frozenset({'run_test', 'run_test_command'})
-
-
-class TurnRole(str, Enum):
-    """
-    The origin of a single turn in the accumulated conversation.
-    """
-
-    user = 'user'
-    agent = 'agent'
-    tool_call = 'tool_call'
-    tool_result = 'tool_result'
-    reviewer = 'reviewer'
-    system = 'system'
 
 
 def estimate_tokens(text: str, is_code: bool = False) -> int:
@@ -66,41 +53,6 @@ def truncate_to_tokens(text: str, max_tokens: int, is_code: bool = False) -> str
     if allowed_chars == 0:
         return notice.strip()
     return text[:allowed_chars] + notice
-
-
-class ConversationTurn(BaseModel):
-    """
-    A single exchange in the accumulated agent conversation.
-    """
-
-    model_config: ClassVar[ConfigDict] = ConfigDict(frozen=True)
-
-    role: Annotated[TurnRole, Field()]
-    content: Annotated[str, Field()]
-    iteration: Annotated[int, Field(ge=0)] = 0
-    tool_name: Annotated[str | None, Field()] = None
-    metadata: Annotated[dict[str, Any], Field(default_factory=dict)]
-    is_code: Annotated[bool, Field()] = False
-
-    def render(self) -> str:
-        """
-        Render this turn as a labelled block for injection into a prompt.
-
-        :returns: The rendered representation of the turn.
-        """
-        if self.role is TurnRole.tool_call:
-            return f'[tool_call] {self.tool_name or "unknown"}: {self.content}'
-        if self.role is TurnRole.tool_result:
-            return f'[tool_result] {self.tool_name or "unknown"}: {self.content}'
-        return f'[{self.role.value}] {self.content}'
-
-    def estimated_tokens(self) -> int:
-        """
-        Approximate the token cost of rendering this turn.
-
-        :returns: The estimated token count of the rendered turn.
-        """
-        return estimate_tokens(self.render(), self.is_code)
 
 
 class ConversationHistory:

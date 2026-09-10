@@ -4,10 +4,11 @@ from collections import Counter
 from logging import Logger, getLogger
 from typing import Any
 
-from database.enums import TaskLogEntryType, TaskStatus
+from database.task_log_entry_type import TaskLogEntryType
+from database.task_status import TaskStatus
 from database.models.task import Task
 from database.models.task_memory import TaskMemory
-from services.event_bus import (
+from services.events import (
     BaseAgentEvent,
     CommitEvent,
     PlanEvent,

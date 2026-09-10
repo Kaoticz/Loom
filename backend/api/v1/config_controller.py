@@ -7,13 +7,13 @@ import os
 
 from dishka.integrations.fastapi import FromDishka, inject
 
-from schemas.context_window import (
-    ContextWindowDetectionRequest,
-    ContextWindowDetectionResponse,
-    ContextWindowDetectionStatus,
-)
-from schemas.index_maintenance import IndexDeletionResponse, IndexStatusResponse
-from services.embedding import EmbeddingService, ModelDescription
+from schemas.context_window_detection_request import ContextWindowDetectionRequest
+from schemas.context_window_detection_response import ContextWindowDetectionResponse
+from schemas.context_window_detection_status import ContextWindowDetectionStatus
+from schemas.index_deletion_response import IndexDeletionResponse
+from schemas.index_status_response import IndexStatusResponse
+from services.embedding import EmbeddingService
+from services.model_description import ModelDescription
 from services.index_deletion import (
     IndexDeletionSummary,
     count_project_index,

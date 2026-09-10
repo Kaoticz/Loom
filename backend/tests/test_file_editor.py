@@ -4,7 +4,8 @@ from pathlib import Path
 
 import pytest
 
-from services.file_editor import EditResult, FileEditorService
+from services.edit_result import EditResult
+from services.file_editor import FileEditorService
 
 
 async def test_single_match_is_replaced(editor: FileEditorService, repo: str) -> None:

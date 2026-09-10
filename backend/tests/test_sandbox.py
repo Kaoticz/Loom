@@ -8,16 +8,16 @@ from unittest.mock import MagicMock
 import pytest
 from docker.errors import NotFound
 
-from services.event_bus import SandboxStage
+from services.events import SandboxStage
 from services.docker_sandbox import (
     DEFAULT_SANDBOX_IMAGE,
     TIMEOUT_EXIT_CODE,
-    CommandResult,
     DockerSandboxManager,
-    SandboxError,
     host_path_within,
     mount_covering,
 )
+from services.command_result import CommandResult
+from services.sandbox_error import SandboxError
 
 
 def attach_fake_container(

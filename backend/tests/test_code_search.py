@@ -8,9 +8,6 @@ from services.code_search import (
     MAX_DISPLAYED_MATCH_PATHS,
     MAX_LEXICAL_KEYWORDS,
     CodeSearchService,
-    LexicalMatch,
-    LexicalMatchMode,
-    SymbolDefinition,
     describe_ignored_keywords,
     describe_matched_files,
     describe_no_lexical_matches,
@@ -18,6 +15,9 @@ from services.code_search import (
     normalise_keywords,
     split_at_keyword_limit,
 )
+from services.lexical_match import LexicalMatch
+from services.lexical_match_mode import LexicalMatchMode
+from services.symbol_definition import SymbolDefinition
 from services.projects import normalise_project_path
 from tests.conftest import TEST_PROJECT, TEST_REPO_PATH
 

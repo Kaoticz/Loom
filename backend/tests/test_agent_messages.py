@@ -24,7 +24,7 @@ from schemas.agent_messages import (
     to_message,
     truncate_diff_side,
 )
-from services.event_bus import (
+from services.events import (
     BaseAgentEvent,
     CommitEvent,
     CompactionEvent,
@@ -43,7 +43,8 @@ from services.event_bus import (
     ToolObservationEvent,
     ToolStatus,
 )
-from services.plan_parser import PlanFormat, PlanStep
+from services.plan_format import PlanFormat
+from services.plan_step import PlanStep
 
 ADAPTER: TypeAdapter[AgentMessage] = TypeAdapter(AgentMessage)
 

@@ -2,13 +2,13 @@ from __future__ import annotations
 
 import json
 from collections.abc import Awaitable, Callable
-from enum import Enum
 from typing import TYPE_CHECKING, Any, override
 
 from pydantic_ai.capabilities import AbstractCapability
 from pydantic_ai.messages import ModelResponse
 
 from services.conversation_history import estimate_tokens
+from services.provider_usage_divergence import ProviderUsageDivergence
 
 if TYPE_CHECKING:
     from pydantic_ai.models import ModelRequestContext
@@ -39,17 +39,6 @@ The smallest provider-to-Loom input ratio that signals unseen prompt growth.
 At this distance the provider is accounting for material content Loom's heuristic
 did not see, so later compaction budgets need an additional reserve.
 """
-
-
-class ProviderUsageDivergence(str, Enum):
-    """
-    How the provider's prompt-token count compares with Loom's estimate.
-    """
-
-    unavailable = 'unavailable'
-    agreement = 'agreement'
-    input_truncated = 'input_truncated'
-    estimate_too_low = 'estimate_too_low'
 
 
 def provider_usage_divergence(

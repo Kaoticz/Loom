@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import pytest
 
-from services.event_bus import (
+from services.events import (
     AgentEvent,
     CommitEvent,
     DiffEvent,

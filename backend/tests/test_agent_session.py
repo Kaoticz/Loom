@@ -8,16 +8,17 @@ from unittest.mock import MagicMock
 
 import pytest
 
-from schemas.agent_commands import CommandAction, SessionCommand
+from schemas.command_action import CommandAction
+from schemas.session_command import SessionCommand
 from api.v1.agent_session import AgentSession, SessionServices, StopRequested
 from agents.coder import AgentDeps
-from database.enums import TaskStatus
+from database.task_status import TaskStatus
 from schemas.agent_messages import MessageType
 from services.code_search import CodeSearchService
 from services.projects import normalise_project_path
 from services.conversation_history import ConversationHistory
 from services.docker_sandbox import DockerSandboxManager
-from services.event_bus import (
+from services.events import (
     INDEXING_PROGRESS_KEY,
     AgentEvent,
     DoneEvent,
@@ -32,9 +33,12 @@ from services.event_bus import (
 from services.indexing_progress import ProgressReporter
 from services.indexing import IndexingService
 from services.file_editor import FileEditorService
-from services.git_manager import CommitResult, FileChange, GitManagerService
+from services.commit_result import CommitResult
+from services.file_change import FileChange
+from services.git_manager import GitManagerService
 from services.session_context import SessionContext
-from services.session_fsm import SessionState, SessionStateMachine
+from services.session_state import SessionState
+from services.session_state_machine import SessionStateMachine
 from services.session_limits import IterationLimits
 from services.session_registry import SessionRegistry
 from tests.conftest import TEST_REPO_PATH, stub_embedding_service
@@ -726,7 +730,7 @@ async def test_no_changes_is_reported_as_a_rejection(
         limits=IterationLimits(max_review_retries=1),
     )
 
-    from services.event_bus import ReviewEvent
+    from services.events import ReviewEvent
 
     # The user aborted at the cap, which is a cancellation rather than a failure.
     assert await session.run() is SessionState.cancelled
@@ -747,7 +751,7 @@ async def test_merge_conflict_fails_cleanly(monkeypatch: pytest.MonkeyPatch) -> 
         git=git,
     )
 
-    from services.event_bus import ErrorEvent
+    from services.events import ErrorEvent
 
     assert await session.run() is SessionState.failed
     errors = [event for event in events if isinstance(event, ErrorEvent)]
@@ -1796,7 +1800,7 @@ async def test_the_classifier_is_asked_before_any_planning(
     ])
 
     original_classify = session._handle_classifying
-    original_plan = session._handle_planning
+    original_plan = session._planning_coordinator.handle_planning
 
     async def note_classify() -> SessionState:
         order.append('classify')
@@ -1807,7 +1811,7 @@ async def test_the_classifier_is_asked_before_any_planning(
         return await original_plan()
 
     monkeypatch.setattr(session, '_handle_classifying', note_classify)
-    monkeypatch.setattr(session, '_handle_planning', note_plan)
+    monkeypatch.setattr(session._planning_coordinator, 'handle_planning', note_plan)
 
     await session.run()
 
@@ -1990,7 +1994,7 @@ async def test_planning_falls_back_to_text_when_structure_fails(
     and requiring a usable plan to arrive anyway.
     """
     import agents.planner as planner_module
-    from services.plan_parser import PlanFormat
+    from services.plan_format import PlanFormat
 
     async def refuse(*_: object, **__: object) -> object:
         raise RuntimeError('this model does not do structured output')
@@ -1999,12 +2003,12 @@ async def test_planning_falls_back_to_text_when_structure_fails(
 
     session, _, _, _ = build_session([json.dumps({'prompt': 'do something'})])
 
-    async def planner_text(_self: object, _prompt: str) -> str:
+    async def planner_text(_prompt: str) -> str:
         return '1. Read the file.\n2. Edit it.\nPLAN_COMPLETE'
 
-    monkeypatch.setattr(type(session), '_plan_as_text', planner_text)
+    monkeypatch.setattr(session._planning_coordinator, 'plan_as_text', planner_text)
 
-    plan = await session._plan_structured('irrelevant')
+    plan = await session._planning_coordinator.plan_structured('irrelevant')
 
     assert plan.titles == ['Read the file.', 'Edit it.']
     # Marked as text, so the reader is shown text rather than empty accordions.
@@ -2017,10 +2021,11 @@ async def test_a_structured_planning_overflow_retries_structure(
     """
     A recoverable overflow must retry structured output instead of falling back to text.
     """
-    from agents.planner import PlannedStep, StructuredPlan
+    from agents.planned_step import PlannedStep
+    from agents.structured_plan import StructuredPlan
     from pydantic_ai.exceptions import UnexpectedModelBehavior
     import agents.planner as planner_module
-    from services.plan_parser import PlanFormat
+    from services.plan_format import PlanFormat
 
     session, _, _, _ = build_session([json.dumps({'prompt': 'do something'})])
     session._planner_context_window = 128_048
@@ -2043,7 +2048,7 @@ async def test_a_structured_planning_overflow_retries_structure(
 
     monkeypatch.setattr(planner_module.planner_agent, 'run', overflow_once)
 
-    plan = await session._plan_structured('irrelevant')
+    plan = await session._planning_coordinator.plan_structured('irrelevant')
 
     assert attempts == [128_048, 64_024]
     assert plan.titles == ['Read the file.']
@@ -2078,7 +2083,7 @@ async def test_a_text_planning_overflow_is_narrowed_and_retried(
 
     monkeypatch.setattr(planner_module.planner_agent, 'run', overflow_once)
 
-    assert await session._plan_as_text('irrelevant') == '1. Read the file.'
+    assert await session._planning_coordinator.plan_as_text('irrelevant') == '1. Read the file.'
     assert attempts == [128_048, 64_024]
 
 
@@ -2100,7 +2105,7 @@ async def test_stop_requested_during_text_planning_is_not_retried(
     monkeypatch.setattr(planner_module.planner_agent, 'run', stop)
 
     with pytest.raises(StopRequested):
-        await session._plan_as_text('irrelevant')
+        await session._planning_coordinator.plan_as_text('irrelevant')
 
     assert attempts == [1]
 
@@ -2115,8 +2120,8 @@ async def test_structure_that_says_nothing_falls_back_too(
     the round, when the text path might still recover something.
     """
     import agents.planner as planner_module
-    from agents.planner import StructuredPlan
-    from services.plan_parser import PlanFormat
+    from agents.structured_plan import StructuredPlan
+    from services.plan_format import PlanFormat
 
     class EmptyResult:
         output: StructuredPlan = StructuredPlan(steps=[])
@@ -2128,12 +2133,12 @@ async def test_structure_that_says_nothing_falls_back_too(
 
     session, _, _, _ = build_session([json.dumps({'prompt': 'do something'})])
 
-    async def planner_text(_self: object, _prompt: str) -> str:
+    async def planner_text(_prompt: str) -> str:
         return '1. Recovered step.'
 
-    monkeypatch.setattr(type(session), '_plan_as_text', planner_text)
+    monkeypatch.setattr(session._planning_coordinator, 'plan_as_text', planner_text)
 
-    plan = await session._plan_structured('irrelevant')
+    plan = await session._planning_coordinator.plan_structured('irrelevant')
 
     assert plan.titles == ['Recovered step.']
     assert plan.format is PlanFormat.text
@@ -2187,7 +2192,7 @@ async def test_a_measured_window_budgets_every_long_run_path() -> None:
     assert await session._measure_context_window() == 8_192
     assert calls == [session._coder_model]
 
-    from services.event_bus import CompactionRunPath
+    from services.events import CompactionRunPath
 
     capability: object = session._compaction_for(
         session._coder_context_window, CompactionRunPath.coder_streaming
@@ -2288,8 +2293,8 @@ async def test_compaction_capabilities_include_only_the_ladder() -> None:
     Long-running paths have no eager, message-count-based pruning capability.
     """
     from pydantic_ai.capabilities import AbstractCapability
-    from services.compaction import ObservedCompaction
-    from services.event_bus import CompactionRunPath
+    from services.observed_compaction import ObservedCompaction
+    from services.events import CompactionRunPath
 
     session, _, _, _ = build_session([json.dumps({'prompt': 'do it'})])
     capabilities: list[AbstractCapability[Any]] = session._compaction_capabilities_for(
@@ -2413,7 +2418,7 @@ async def test_the_text_fallback_cannot_write_code(monkeypatch: pytest.MonkeyPat
     monkeypatch.setattr(planner_module.planner_agent, 'run', dispatch)
 
     session, _, _, _ = build_session([json.dumps({'prompt': 'do something'})])
-    plan = await session._plan_structured('irrelevant')
+    plan = await session._planning_coordinator.plan_structured('irrelevant')
 
     assert plan.titles == ['Recovered step.']
     # Deps are passed, so the read-only tools can reach the repository.
@@ -2429,7 +2434,7 @@ async def test_the_text_fallback_uses_the_planner_budget(
     The budget follows the agent whose history is compacted, which is now the planner.
     """
     import agents.planner as planner_module
-    import api.v1.agent_session as session_module
+    import api.v1.agent_session.agent_session as session_module
     from services.compaction import build_compaction
 
     windows: list[int | None] = []
@@ -2454,7 +2459,7 @@ async def test_the_text_fallback_uses_the_planner_budget(
 
     monkeypatch.setattr(planner_module.planner_agent, 'run', answer)
 
-    await session._plan_as_text('irrelevant')
+    await session._planning_coordinator.plan_as_text('irrelevant')
 
     assert windows == [8_192]
     assert original(8_192).target_tokens == build_compaction(8_192).target_tokens

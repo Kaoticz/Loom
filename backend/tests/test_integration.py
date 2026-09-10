@@ -159,14 +159,15 @@ def wired(monkeypatch: pytest.MonkeyPatch) -> None:
 
     :param monkeypatch: Fixture used to install the substitutes.
     """
-    import api.v1.agent_session as agent_session_module
-    from services.docker_sandbox import CommandResult, DockerSandboxManager
+    import api.v1.agent_session.agent_run_helper as agent_run_helper_module
+    from services.command_result import CommandResult
+    from services.docker_sandbox import DockerSandboxManager
     from services.embedding import EmbeddingService
 
     model: FunctionModel = scripted_coder()
     # The resolver is a module level function now, so it is patched where the
     # session looks it up rather than on the class.
-    monkeypatch.setattr(agent_session_module, 'resolve_model', lambda name: model)
+    monkeypatch.setattr(agent_run_helper_module, 'resolve_model', lambda name: model)
 
     async def fake_embed(self: EmbeddingService, text: str) -> list[float]:
         return [0.1, 0.2, 0.3]

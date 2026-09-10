@@ -1,9 +1,12 @@
 from __future__ import annotations
 
-from typing import Annotated, Any
+from typing import Any
 
 from httpx import AsyncClient, HTTPError, Response
-from pydantic import BaseModel, Field
+from services.chunk_too_large_for_model import ChunkTooLargeForModel
+from services.embedding_error import EmbeddingError
+from services.embedding_input_too_long import EmbeddingInputTooLong
+from services.model_description import ModelDescription
 from services.ollama_model_metadata import (
     ARCHITECTURE_KEY,
     CONTEXT_LENGTH_SUFFIX,
@@ -15,50 +18,6 @@ DEFAULT_EMBEDDING_MODEL: str = 'nomic-embed-text'
 DIMENSION_PROBE_TEXT: str = 'dimension probe'
 
 EMBEDDING_LENGTH_SUFFIX: str = '.embedding_length'
-
-
-class EmbeddingError(RuntimeError):
-    """
-    Raised when an embedding could not be generated.
-
-    A failure to embed is always surfaced rather than being masked with a zero
-    vector, because a zero vector silently poisons every downstream similarity
-    search.
-    """
-
-
-class ModelDescription(BaseModel):
-    """
-    What a model reports about itself, for showing to the user.
-
-    Both values are optional because a model need not describe itself, and
-    neither is required for indexing to work. They exist so that a person
-    choosing between models can see what they are choosing.
-    """
-
-    dimensions: int | None = Field(default=None, description='Vector width the model reports, or None if it does not say.')
-    context_length: int | None = Field(default=None, description='Tokens the model accepts, or None if it does not say.')
-
-
-class EmbeddingInputTooLong(EmbeddingError):
-    """
-    Raised when the text sent to embed is longer than the model will accept.
-
-    Distinguished from other failures because the caller can do something about
-    it: a shorter piece of the same text will usually succeed, whereas an
-    unreachable service will not improve on retry.
-    """
-
-
-class ChunkTooLargeForModel(EmbeddingError):
-    """
-    Raised when a chosen chunk size does not fit the chosen embedding model.
-
-    Only reachable when the chunk size was set by hand. On automatic sizing an
-    over-long chunk is divided until it fits, but a chosen size is a decision,
-    and quietly overriding it would leave the setting appearing to work while
-    doing nothing.
-    """
 
 
 class EmbeddingService:

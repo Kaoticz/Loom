@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from services.git_manager import FileChange
+from services.file_change import FileChange
 from services.review_context import (
     build_review_prompt,
     collect_review_diffs,
