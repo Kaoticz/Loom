@@ -4,10 +4,9 @@ import os
 from typing import Any
 
 from httpx import AsyncClient, HTTPError, Response
-from pydantic_ai.models.openai import OpenAIChatModelSettings
 
 from services.ollama_model_metadata import context_length_from_model_info, num_ctx_from_parameters
-from services.ollama_native_model import OllamaNativeModel
+from services.ollama_native_model import OllamaNativeModel, OllamaNativeModelSettings
 
 OLLAMA_BASE_URL: str = 'http://ollama:11434'
 MODEL_METADATA_TIMEOUT_SECONDS: float = 2.0
@@ -15,7 +14,7 @@ MODEL_METADATA_TIMEOUT_SECONDS: float = 2.0
 
 def model_settings(
     context_window: int | None, *, allow_subminimum: bool = False
-) -> OpenAIChatModelSettings:
+) -> OllamaNativeModelSettings:
     """
     Build the per-run settings that keep a model inside its window.
 
@@ -29,20 +28,19 @@ def model_settings(
     `AgentSession`, which narrows its working window whenever this failure shows
     the configured one to be optimistic.
 
-    `num_ctx` tells Ollama how large a window to actually allocate. Ollama
-    defaults it low, often 4096, regardless of what the model could hold. Until
-    this was sent, Loom budgeted compaction against the configured window while
-    the model ran with a much smaller one, so compaction sat far below its target
-    and never fired while the real window overflowed. It goes through
-    `extra_body` because `num_ctx` is Ollama's own option rather than part of the
-    OpenAI schema; a provider that does not know it ignores it.
+    The window travels as the required `num_ctx`, which `OllamaNativeModel`
+    reads before each call. The model compares it against what Ollama currently
+    has loaded and only sends `options.num_ctx` when a reload to a larger
+    window is genuinely needed, so alternating consumers never thrash the
+    server down to a smaller window. A provider that does not know the key
+    ignores it.
 
     :param context_window: The configured or measured window in tokens, or None for the default.
     :param allow_subminimum: Preserve a positive model measurement below Loom's usual floor.
     :returns: The settings to pass to a run.
     """
     window: int = _window_for_consumer(context_window, allow_subminimum)
-    return OpenAIChatModelSettings(extra_body={'options': {'num_ctx': window}})
+    return OllamaNativeModelSettings(ollama_required_num_ctx=window)
 
 
 async def measure_ollama_context_window(

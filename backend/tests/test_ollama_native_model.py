@@ -23,7 +23,11 @@ from pydantic_ai.models import ModelRequestParameters
 from pydantic_ai.output import OutputObjectDefinition
 from pydantic_ai.tools import ToolDefinition
 
-from services.ollama_native_model import OllamaNativeModel, decide_num_ctx
+from services.ollama_native_model import (
+    OllamaNativeModel,
+    OllamaNativeModelSettings,
+    decide_num_ctx,
+)
 
 
 @asynccontextmanager
@@ -498,6 +502,200 @@ async def test_a_stream_without_a_final_chunk_raises() -> None:
             with pytest.raises(UnexpectedModelBehavior):
                 async for _ in streamed:
                     pass
+
+
+def _running_model(name: str, context_length: int) -> dict[str, Any]:
+    """
+    Build one `/api/ps` model entry.
+
+    :param name: The loaded model name.
+    :param context_length: The context size it is loaded with.
+    :returns: The entry payload.
+    """
+    return {'name': name, 'model': name, 'context_length': context_length}
+
+
+def _ps_and_chat_handler(
+    seen_chat_bodies: list[dict[str, Any]],
+    seen_paths: list[str],
+    *,
+    running_models: list[dict[str, Any]] | None = None,
+    ps_status: int = 200,
+    chat_body: bytes | None = None,
+) -> Callable[[Request], Response]:
+    """
+    Answer `/api/ps` and `/api/chat` from one transport.
+
+    :param seen_chat_bodies: Collects each chat request body.
+    :param seen_paths: Collects each requested path.
+    :param running_models: The `/api/ps` model entries.
+    :param ps_status: The `/api/ps` response status.
+    :param chat_body: The raw `/api/chat` response body, defaulting to one reply.
+    :returns: The mock transport handler.
+    """
+    def handler(request: Request) -> Response:
+        seen_paths.append(request.url.path)
+        if request.url.path == '/api/ps':
+            return Response(ps_status, json={'models': running_models or []})
+        assert request.url.path == '/api/chat'
+        seen_chat_bodies.append(json.loads(request.content))
+        if chat_body is not None:
+            return Response(200, content=chat_body)
+        return Response(200, json=_chat_response('done'))
+
+    return handler
+
+
+async def test_a_satisfied_window_sends_no_num_ctx() -> None:
+    """
+    A loaded window at or above the requirement must not force a reload.
+    """
+    seen_chat_bodies: list[dict[str, Any]] = []
+    seen_paths: list[str] = []
+    handler = _ps_and_chat_handler(
+        seen_chat_bodies,
+        seen_paths,
+        running_models=[_running_model('qwen2.5-coder', 65_536)],
+    )
+
+    async with _mocked_model(handler) as model:
+        await model.request(
+            [ModelRequest(parts=[UserPromptPart(content='fix it')])],
+            OllamaNativeModelSettings(ollama_required_num_ctx=32_768),
+            ModelRequestParameters(),
+        )
+
+    assert seen_paths == ['/api/ps', '/api/chat']
+    assert 'options' not in seen_chat_bodies[0]
+
+
+async def test_a_smaller_loaded_window_sends_the_required_num_ctx() -> None:
+    """
+    Only a genuinely larger requirement forces a reload.
+    """
+    seen_chat_bodies: list[dict[str, Any]] = []
+    seen_paths: list[str] = []
+    handler = _ps_and_chat_handler(
+        seen_chat_bodies,
+        seen_paths,
+        running_models=[_running_model('qwen2.5-coder', 4_096)],
+    )
+
+    async with _mocked_model(handler) as model:
+        await model.request(
+            [ModelRequest(parts=[UserPromptPart(content='fix it')])],
+            OllamaNativeModelSettings(ollama_required_num_ctx=32_768),
+            ModelRequestParameters(),
+        )
+
+    assert seen_chat_bodies[0]['options'] == {'num_ctx': 32_768}
+
+
+async def test_an_unlisted_model_requests_the_required_window() -> None:
+    """
+    Nothing loaded means nothing to preserve.
+    """
+    seen_chat_bodies: list[dict[str, Any]] = []
+    seen_paths: list[str] = []
+    handler = _ps_and_chat_handler(seen_chat_bodies, seen_paths, running_models=[])
+
+    async with _mocked_model(handler) as model:
+        await model.request(
+            [ModelRequest(parts=[UserPromptPart(content='fix it')])],
+            OllamaNativeModelSettings(ollama_required_num_ctx=32_768),
+            ModelRequestParameters(),
+        )
+
+    assert seen_chat_bodies[0]['options'] == {'num_ctx': 32_768}
+
+
+async def test_missing_settings_send_no_num_ctx_without_probing() -> None:
+    """
+    With no stated requirement there is nothing to enforce and no probe to run.
+    """
+    seen_chat_bodies: list[dict[str, Any]] = []
+    seen_paths: list[str] = []
+    handler = _ps_and_chat_handler(seen_chat_bodies, seen_paths)
+
+    async with _mocked_model(handler) as model:
+        await model.request(
+            [ModelRequest(parts=[UserPromptPart(content='fix it')])],
+            None,
+            ModelRequestParameters(),
+        )
+
+    assert seen_paths == ['/api/chat']
+    assert 'options' not in seen_chat_bodies[0]
+
+
+async def test_a_failed_probe_raises() -> None:
+    """
+    A probe failure must surface rather than guess a window.
+    """
+    seen_chat_bodies: list[dict[str, Any]] = []
+    seen_paths: list[str] = []
+    handler = _ps_and_chat_handler(seen_chat_bodies, seen_paths, ps_status=500)
+
+    async with _mocked_model(handler) as model:
+        with pytest.raises(Exception):
+            await model.request(
+                [ModelRequest(parts=[UserPromptPart(content='fix it')])],
+                OllamaNativeModelSettings(ollama_required_num_ctx=32_768),
+                ModelRequestParameters(),
+            )
+
+    assert seen_chat_bodies == []
+
+
+async def test_a_streamed_satisfied_window_sends_no_num_ctx() -> None:
+    """
+    The streaming path applies the same never-reload-down rule.
+    """
+    seen_chat_bodies: list[dict[str, Any]] = []
+    seen_paths: list[str] = []
+    handler = _ps_and_chat_handler(
+        seen_chat_bodies,
+        seen_paths,
+        running_models=[_running_model('qwen2.5-coder', 65_536)],
+        chat_body=_ndjson([_stream_chunk('hi', done=True)]),
+    )
+
+    async with _mocked_model(handler) as model:
+        async with model.request_stream(
+            [ModelRequest(parts=[UserPromptPart(content='fix it')])],
+            OllamaNativeModelSettings(ollama_required_num_ctx=32_768),
+            ModelRequestParameters(),
+        ) as streamed:
+            events: list[ModelResponseStreamEvent] = [event async for event in streamed]
+
+    assert seen_paths == ['/api/ps', '/api/chat']
+    assert 'options' not in seen_chat_bodies[0]
+    assert events != []
+
+
+async def test_a_streamed_smaller_loaded_window_sends_the_required_num_ctx() -> None:
+    """
+    The streaming path reloads only for a genuinely larger requirement.
+    """
+    seen_chat_bodies: list[dict[str, Any]] = []
+    seen_paths: list[str] = []
+    handler = _ps_and_chat_handler(
+        seen_chat_bodies,
+        seen_paths,
+        running_models=[_running_model('qwen2.5-coder', 4_096)],
+        chat_body=_ndjson([_stream_chunk('hi', done=True)]),
+    )
+
+    async with _mocked_model(handler) as model:
+        async with model.request_stream(
+            [ModelRequest(parts=[UserPromptPart(content='fix it')])],
+            OllamaNativeModelSettings(ollama_required_num_ctx=32_768),
+            ModelRequestParameters(),
+        ) as streamed:
+            events: list[ModelResponseStreamEvent] = [event async for event in streamed]
+
+    assert seen_chat_bodies[0]['options'] == {'num_ctx': 32_768}
+    assert events != []
 
 
 def test_nothing_loaded_requests_the_required_window() -> None:

@@ -4,7 +4,7 @@ from collections.abc import AsyncGenerator, AsyncIterator
 from contextlib import asynccontextmanager
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
-from typing import Any, override
+from typing import Any, cast, override
 
 from ollama import AsyncClient, ChatResponse
 from pydantic_ai.exceptions import UnexpectedModelBehavior
@@ -29,6 +29,24 @@ from pydantic_ai.profiles import ModelProfileSpec
 from pydantic_ai.settings import ModelSettings
 from pydantic_ai.tools import RunContext
 from pydantic_ai.usage import RequestUsage
+
+
+class OllamaNativeModelSettings(ModelSettings, total=False):
+    """
+    Per-request settings read by OllamaNativeModel.
+
+    A plain `ModelSettings` extension, so providers that do not know the
+    Ollama-specific keys ignore them, exactly as they ignored the old
+    OpenAI-shaped settings this replaces.
+    """
+
+    ollama_required_num_ctx: int
+    """The context window the call requires.
+
+    A ceiling for the request, not the value sent: before each call the model
+    compares this against what Ollama currently has loaded and only sends
+    `options.num_ctx` when a reload to a larger window is genuinely needed.
+    """
 
 
 class OllamaNativeModel(Model[Any]):
@@ -114,7 +132,9 @@ class OllamaNativeModel(Model[Any]):
         :raises UnexpectedModelBehavior: If a message part cannot be sent to Ollama.
         """
         check_allow_model_requests()
-        _, model_request_parameters = self.prepare_request(model_settings, model_request_parameters)
+        merged_settings, model_request_parameters = self.prepare_request(
+            model_settings, model_request_parameters
+        )
         instruction_parts: list[InstructionPart] | None = self._get_instruction_parts(
             messages, model_request_parameters
         )
@@ -122,19 +142,25 @@ class OllamaNativeModel(Model[Any]):
         tools: list[dict[str, Any]] | None = _request_tools(model_request_parameters)
         output_format: dict[str, Any] | None = _request_format(model_request_parameters)
         if self._client is not None:
+            options: dict[str, Any] | None = await _request_options(
+                self._client, self._model_name, merged_settings
+            )
             response: ChatResponse = await self._client.chat(
                 model=self._model_name,
                 messages=ollama_messages,
                 tools=tools,
                 format=output_format,
+                options=options,
             )
         else:
             async with AsyncClient(host=self._base_url) as client:
+                options = await _request_options(client, self._model_name, merged_settings)
                 response = await client.chat(
                     model=self._model_name,
                     messages=ollama_messages,
                     tools=tools,
                     format=output_format,
+                    options=options,
                 )
         return _response_to_model_response(
             response,
@@ -163,7 +189,9 @@ class OllamaNativeModel(Model[Any]):
         :raises UnexpectedModelBehavior: If a message part cannot be sent to Ollama.
         """
         check_allow_model_requests()
-        _, model_request_parameters = self.prepare_request(model_settings, model_request_parameters)
+        merged_settings, model_request_parameters = self.prepare_request(
+            model_settings, model_request_parameters
+        )
         instruction_parts: list[InstructionPart] | None = self._get_instruction_parts(
             messages, model_request_parameters
         )
@@ -171,11 +199,15 @@ class OllamaNativeModel(Model[Any]):
         tools: list[dict[str, Any]] | None = _request_tools(model_request_parameters)
         output_format: dict[str, Any] | None = _request_format(model_request_parameters)
         if self._client is not None:
+            options: dict[str, Any] | None = await _request_options(
+                self._client, self._model_name, merged_settings
+            )
             chat_stream: AsyncIterator[ChatResponse] = await self._client.chat(
                 model=self._model_name,
                 messages=ollama_messages,
                 tools=tools,
                 format=output_format,
+                options=options,
                 stream=True,
             )
             yield OllamaNativeStreamedResponse(
@@ -187,11 +219,13 @@ class OllamaNativeModel(Model[Any]):
             )
         else:
             async with AsyncClient(host=self._base_url) as client:
+                options = await _request_options(client, self._model_name, merged_settings)
                 chat_stream = await client.chat(
                     model=self._model_name,
                     messages=ollama_messages,
                     tools=tools,
                     format=output_format,
+                    options=options,
                     stream=True,
                 )
                 yield OllamaNativeStreamedResponse(
@@ -431,6 +465,62 @@ def _request_format(model_request_parameters: ModelRequestParameters) -> dict[st
     if output_object is None:
         return None
     return dict(output_object.json_schema)
+
+
+def _required_window(model_settings: ModelSettings | None) -> int | None:
+    """
+    Read the required context window from per-request settings, if any.
+
+    :param model_settings: The settings the call was made with.
+    :returns: The required window, or None when no requirement was provided.
+    """
+    if model_settings is None:
+        return None
+    window: int | None = cast(OllamaNativeModelSettings, model_settings).get(
+        'ollama_required_num_ctx'
+    )
+    if window is None or window <= 0:
+        return None
+    return window
+
+
+async def _loaded_context_size(client: AsyncClient, model_name: str) -> int | None:
+    """
+    Read the context size Ollama currently has loaded for the model, if any.
+
+    :param client: The Ollama client to query.
+    :param model_name: The Ollama model name.
+    :returns: The loaded context size, or None when the model is not running.
+    """
+    running = await client.ps()
+    for entry in running.models:
+        if entry.model == model_name or entry.name == model_name:
+            return entry.context_length
+    return None
+
+
+async def _request_options(
+    client: AsyncClient, model_name: str, model_settings: ModelSettings | None
+) -> dict[str, Any] | None:
+    """
+    Decide the Ollama `options` for a call, applying the never-reload-down rule.
+
+    A `/api/ps` failure propagates: proceeding with a guessed window could
+    force a needless reload or silently run under-window.
+
+    :param client: The Ollama client to query for loaded models.
+    :param model_name: The Ollama model name.
+    :param model_settings: The settings the call was made with.
+    :returns: The `options` payload, or None when no override is needed.
+    """
+    required_window: int | None = _required_window(model_settings)
+    if required_window is None:
+        return None
+    loaded_size: int | None = await _loaded_context_size(client, model_name)
+    num_ctx: int | None = decide_num_ctx(loaded_size, required_window)
+    if num_ctx is None:
+        return None
+    return {'num_ctx': num_ctx}
 
 
 _FINISH_REASON_MAP: dict[str, FinishReason] = {'stop': 'stop', 'length': 'length'}

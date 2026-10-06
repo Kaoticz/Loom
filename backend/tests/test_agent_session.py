@@ -2199,18 +2199,16 @@ async def test_a_measured_window_budgets_every_long_run_path() -> None:
     )
     assert getattr(capability, '_inner').context_window == 8_192
     assert session._usage_monitor_for(session._planner_context_window).context_window == 8_192
-    assert session._model_settings_for(session._coder_context_window).get('extra_body') == {
-        'options': {'num_ctx': 8_192}
-    }
+    assert session._model_settings_for(session._coder_context_window).get('ollama_required_num_ctx') == 8_192
 
 
 async def test_the_classifier_and_reviewer_are_given_num_ctx(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     """
-    Requirement: every Ollama run passes `num_ctx` so the model allocates its window.
+    Requirement: every Ollama run carries the required window.
 
-    The coder and planner already sent it. The classifier and the reviewer run
+    The coder and planner already send it. The classifier and the reviewer run
     against the same serving model, so they must too, or those one-shot calls
     fall back to Ollama's low default instead of the budget the session measured.
     """
@@ -2260,9 +2258,8 @@ async def test_the_classifier_and_reviewer_are_given_num_ctx(
 
     await session._handle_reviewing()
 
-    expected: dict[str, Any] = {'options': {'num_ctx': 8_192}}
-    assert seen['classifier'][0].get('extra_body') == expected
-    assert seen['reviewer'][0].get('extra_body') == expected
+    assert seen['classifier'][0].get('ollama_required_num_ctx') == 8_192
+    assert seen['reviewer'][0].get('ollama_required_num_ctx') == 8_192
 
 
 async def test_auto_context_windows_use_a_larger_measurement() -> None:

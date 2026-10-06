@@ -260,4 +260,4 @@ def test_a_small_measured_window_reaches_ollama_unchanged() -> None:
     A real sub-minimum model limit must not be raised before it is sent back.
     """
     settings = model_settings(1_024, allow_subminimum=True)
-    assert settings.get('extra_body') == {'options': {'num_ctx': 1_024}}
+    assert settings.get('ollama_required_num_ctx') == 1_024
