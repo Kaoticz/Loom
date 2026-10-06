@@ -4,10 +4,10 @@ import os
 from typing import Any
 
 from httpx import AsyncClient, HTTPError, Response
-from pydantic_ai.models.openai import OpenAIChatModel, OpenAIChatModelSettings
+from pydantic_ai.models.openai import OpenAIChatModelSettings
 
-from pydantic_ai.providers.openai import OpenAIProvider
 from services.ollama_model_metadata import context_length_from_model_info, num_ctx_from_parameters
+from services.ollama_native_model import OllamaNativeModel
 
 OLLAMA_BASE_URL: str = 'http://ollama:11434'
 MODEL_METADATA_TIMEOUT_SECONDS: float = 2.0
@@ -119,13 +119,13 @@ def effective_context_window(configured: int | None, measured: int | None) -> in
     return min(configured_window, measured)
 
 
-def resolve_model(model_name: str) -> OpenAIChatModel | str:
+def resolve_model(model_name: str) -> OllamaNativeModel | str:
     """
     Resolve a configured model name into something an agent can run.
 
-    Ollama is reached through its OpenAI-compatible endpoint, so those names are
-    turned into a configured client. Anything else is passed through untouched
-    for Pydantic AI to interpret.
+    Ollama is reached through its native API, so those names are turned into
+    a native model. Anything else is passed through untouched for Pydantic AI
+    to interpret.
 
     Lives here rather than on the session because the session is not always in
     reach of the caller: the controller resolves models for the coder, the
@@ -137,10 +137,9 @@ def resolve_model(model_name: str) -> OpenAIChatModel | str:
     if not model_name.startswith('ollama:'):
         return model_name
 
-    base_url: str = _ollama_base_url()
-    return OpenAIChatModel(
+    return OllamaNativeModel(
         model_name=_ollama_model_name(model_name),
-        provider=OpenAIProvider(base_url=f'{base_url}/v1', api_key='ollama'),
+        base_url=_ollama_base_url(),
     )
 
 
