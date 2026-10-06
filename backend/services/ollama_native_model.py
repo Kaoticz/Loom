@@ -1,5 +1,8 @@
 from __future__ import annotations
 
+from collections.abc import AsyncGenerator, AsyncIterator
+from contextlib import asynccontextmanager
+from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from typing import Any, override
 
@@ -12,6 +15,7 @@ from pydantic_ai.messages import (
     ModelRequest,
     ModelResponse,
     ModelResponsePart,
+    ModelResponseStreamEvent,
     RetryPromptPart,
     SystemPromptPart,
     TextPart,
@@ -20,9 +24,10 @@ from pydantic_ai.messages import (
     ToolReturnPart,
     UserPromptPart,
 )
-from pydantic_ai.models import Model, ModelRequestParameters, check_allow_model_requests
+from pydantic_ai.models import Model, ModelRequestParameters, StreamedResponse, check_allow_model_requests
 from pydantic_ai.profiles import ModelProfileSpec
 from pydantic_ai.settings import ModelSettings
+from pydantic_ai.tools import RunContext
 from pydantic_ai.usage import RequestUsage
 
 
@@ -31,9 +36,7 @@ class OllamaNativeModel(Model[Any]):
     An Ollama model reached through its native `/api/chat` endpoint.
 
     Ollama's OpenAI-compatible endpoint silently drops `num_ctx`, so Ollama
-    traffic goes through this model instead of `OpenAIChatModel`. Request
-    handling lands in Phase 3 (non-streaming) and Phase 4 (streaming); until
-    then this class only identifies the model to run.
+    traffic goes through this model instead of `OpenAIChatModel`.
     """
 
     def __init__(
@@ -139,6 +142,168 @@ class OllamaNativeModel(Model[Any]):
             system=self.system,
             base_url=self._base_url,
         )
+
+    @override
+    @asynccontextmanager
+    async def request_stream(
+        self,
+        messages: list[ModelMessage],
+        model_settings: ModelSettings | None,
+        model_request_parameters: ModelRequestParameters,
+        run_context: RunContext[Any] | None = None,
+    ) -> AsyncGenerator[StreamedResponse]:
+        """
+        Make a streaming request to the model.
+
+        :param messages: The conversation history for the request.
+        :param model_settings: Per-request model settings, if any.
+        :param model_request_parameters: Tool and output configuration for the request.
+        :param run_context: The run context, unused.
+        :returns: A generator yielding the streamed response.
+        :raises UnexpectedModelBehavior: If a message part cannot be sent to Ollama.
+        """
+        check_allow_model_requests()
+        _, model_request_parameters = self.prepare_request(model_settings, model_request_parameters)
+        instruction_parts: list[InstructionPart] | None = self._get_instruction_parts(
+            messages, model_request_parameters
+        )
+        ollama_messages: list[dict[str, Any]] = _request_messages(messages, instruction_parts)
+        tools: list[dict[str, Any]] | None = _request_tools(model_request_parameters)
+        output_format: dict[str, Any] | None = _request_format(model_request_parameters)
+        if self._client is not None:
+            chat_stream: AsyncIterator[ChatResponse] = await self._client.chat(
+                model=self._model_name,
+                messages=ollama_messages,
+                tools=tools,
+                format=output_format,
+                stream=True,
+            )
+            yield OllamaNativeStreamedResponse(
+                model_request_parameters,
+                chat_stream,
+                self._model_name,
+                self.system,
+                self._base_url,
+            )
+        else:
+            async with AsyncClient(host=self._base_url) as client:
+                chat_stream = await client.chat(
+                    model=self._model_name,
+                    messages=ollama_messages,
+                    tools=tools,
+                    format=output_format,
+                    stream=True,
+                )
+                yield OllamaNativeStreamedResponse(
+                    model_request_parameters,
+                    chat_stream,
+                    self._model_name,
+                    self.system,
+                    self._base_url,
+                )
+
+
+@dataclass
+class OllamaNativeStreamedResponse(StreamedResponse):
+    """
+    A streamed `/api/chat` response mapped to pydantic_ai stream events.
+
+    Ollama streams text as per-line content fragments and reports tool calls
+    whole, in a single chunk, rather than as incremental deltas.
+    """
+
+    _chunk_stream: AsyncIterator[ChatResponse]
+    _model_name: str
+    _provider_name: str
+    _provider_url: str
+    _timestamp: datetime = field(default_factory=lambda: datetime.now(timezone.utc))
+
+    @property
+    @override
+    def model_name(self) -> str:
+        """
+        Return the model name.
+
+        :returns: The model name.
+        """
+        return self._model_name
+
+    @property
+    @override
+    def provider_name(self) -> str:
+        """
+        Return the provider name.
+
+        :returns: The provider name.
+        """
+        return self._provider_name
+
+    @property
+    @override
+    def provider_url(self) -> str:
+        """
+        Return the provider URL.
+
+        :returns: The provider URL.
+        """
+        return self._provider_url
+
+    @property
+    @override
+    def timestamp(self) -> datetime:
+        """
+        Return when streaming started locally.
+
+        :returns: The stream start time.
+        """
+        return self._timestamp
+
+    @override
+    async def close_stream(self) -> None:
+        """
+        Close the underlying chat stream, releasing its connection.
+        """
+        if isinstance(self._chunk_stream, AsyncGenerator):
+            await self._chunk_stream.aclose()
+
+    @override
+    async def _get_event_iterator(self) -> AsyncIterator[ModelResponseStreamEvent]:
+        """
+        Translate native chat chunks into pydantic_ai stream events.
+
+        :returns: An iterator of stream events.
+        :raises UnexpectedModelBehavior: If the stream ends without a final chunk.
+        """
+        seen_done: bool = False
+        async for chunk in self._chunk_stream:
+            if chunk.model:
+                self._model_name = chunk.model
+            if chunk.prompt_eval_count is not None:
+                self._usage.input_tokens = chunk.prompt_eval_count
+            if chunk.eval_count is not None:
+                self._usage.output_tokens = chunk.eval_count
+            if chunk.done_reason is not None and chunk.done_reason in _FINISH_REASON_MAP:
+                self.finish_reason = _FINISH_REASON_MAP[  # pyright: ignore[reportUnannotatedClassAttribute]
+                    chunk.done_reason
+                ]
+            if chunk.done:
+                seen_done = True
+            if chunk.message.content:
+                for text_event in self._parts_manager.handle_text_delta(
+                    vendor_part_id='content', content=chunk.message.content
+                ):
+                    if text_event is not None:
+                        yield text_event
+            for index, tool_call in enumerate(chunk.message.tool_calls or []):
+                tool_event = self._parts_manager.handle_tool_call_delta(
+                    vendor_part_id=index,
+                    tool_name=tool_call.function.name,
+                    args=dict(tool_call.function.arguments),
+                )
+                if tool_event is not None:
+                    yield tool_event
+        if not seen_done:
+            raise UnexpectedModelBehavior('Ollama ended the chat stream without a final chunk.')
 
 
 def _request_messages(

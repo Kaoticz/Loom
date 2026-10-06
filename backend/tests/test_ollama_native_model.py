@@ -6,10 +6,15 @@ from typing import Any
 import pytest
 from httpx import ConnectError, MockTransport, Request, Response
 from ollama import AsyncClient as OllamaAsyncClient
+from pydantic_ai.exceptions import UnexpectedModelBehavior
 from pydantic_ai.messages import (
     ModelRequest,
     ModelResponse,
+    ModelResponseStreamEvent,
+    PartDeltaEvent,
+    PartStartEvent,
     TextPart,
+    TextPartDelta,
     ToolCallPart,
     ToolReturnPart,
     UserPromptPart,
@@ -322,6 +327,177 @@ async def test_tool_history_round_trips_through_tool_role_messages() -> None:
         },
         {'role': 'tool', 'content': 'file contents', 'tool_name': 'read_file'},
     ]
+
+
+def _ndjson(lines: list[dict[str, Any]]) -> bytes:
+    """
+    Encode native chat chunks as a streaming response body.
+
+    :param lines: One payload per streamed line.
+    :returns: The NDJSON body.
+    """
+    return '\n'.join(json.dumps(line) for line in lines).encode()
+
+
+def _stream_chunk(content: str, *, done: bool = False) -> dict[str, Any]:
+    """
+    Build one native streamed `/api/chat` line.
+
+    :param content: The content fragment for the line.
+    :param done: Whether this line ends the stream.
+    :returns: The line payload.
+    """
+    line: dict[str, Any] = {
+        'model': 'qwen2.5-coder',
+        'created_at': '2026-10-06T00:00:00Z',
+        'message': {'role': 'assistant', 'content': content},
+        'done': done,
+    }
+    if done:
+        line['done_reason'] = 'stop'
+        line['prompt_eval_count'] = 10
+        line['eval_count'] = 5
+    return line
+
+
+async def test_streamed_text_arrives_as_start_and_delta_events() -> None:
+    """
+    Incremental content maps to the start/delta sequence the session consumes.
+    """
+
+    def handler(request: Request) -> Response:
+        return Response(
+            200, content=_ndjson([_stream_chunk('Hel'), _stream_chunk('lo'), _stream_chunk('', done=True)])
+        )
+
+    async with _mocked_model(handler) as model:
+        async with model.request_stream(
+            [ModelRequest(parts=[UserPromptPart(content='fix it')])],
+            None,
+            ModelRequestParameters(),
+        ) as streamed:
+            events: list[ModelResponseStreamEvent] = [event async for event in streamed]
+            final: ModelResponse = streamed.get()
+
+    starts: list[PartStartEvent] = [event for event in events if isinstance(event, PartStartEvent)]
+    text_deltas: list[TextPartDelta] = [
+        event.delta
+        for event in events
+        if isinstance(event, PartDeltaEvent) and isinstance(event.delta, TextPartDelta)
+    ]
+    assert len(starts) == 1
+    assert isinstance(starts[0].part, TextPart)
+    assert starts[0].part.content == 'Hel'
+    assert ''.join(delta.content_delta for delta in text_deltas) == 'lo'
+    assert len(final.parts) == 1
+    assert isinstance(final.parts[0], TextPart)
+    assert final.parts[0].content == 'Hello'
+    assert final.usage.input_tokens == 10
+    assert final.usage.output_tokens == 5
+
+
+async def test_streamed_tool_calls_arrive_whole_in_one_chunk() -> None:
+    """
+    Ollama reports streamed tool calls complete, not as incremental deltas.
+    """
+
+    def handler(request: Request) -> Response:
+        return Response(
+            200,
+            content=_ndjson(
+                [
+                    _stream_chunk(''),
+                    {
+                        'model': 'qwen2.5-coder',
+                        'created_at': '2026-10-06T00:00:00Z',
+                        'message': {
+                            'role': 'assistant',
+                            'content': '',
+                            'tool_calls': [
+                                {'function': {'name': 'read_file', 'arguments': {'path': 'main.py'}}}
+                            ],
+                        },
+                        'done': False,
+                    },
+                    _stream_chunk('', done=True),
+                ]
+            ),
+        )
+
+    async with _mocked_model(handler) as model:
+        async with model.request_stream(
+            [ModelRequest(parts=[UserPromptPart(content='read it')])],
+            None,
+            ModelRequestParameters(),
+        ) as streamed:
+            events: list[ModelResponseStreamEvent] = [event async for event in streamed]
+            final: ModelResponse = streamed.get()
+
+    starts: list[PartStartEvent] = [event for event in events if isinstance(event, PartStartEvent)]
+    assert len(starts) == 1
+    assert isinstance(starts[0].part, ToolCallPart)
+    assert starts[0].part.tool_name == 'read_file'
+    assert starts[0].part.args == {'path': 'main.py'}
+    assert len(final.parts) == 1
+    assert isinstance(final.parts[0], ToolCallPart)
+    assert final.parts[0].args == {'path': 'main.py'}
+
+
+async def test_a_failed_stream_connect_raises() -> None:
+    """
+    A stream that never starts must surface, never read as empty.
+    """
+
+    def handler(request: Request) -> Response:
+        return Response(500, text='boom')
+
+    async with _mocked_model(handler) as model:
+        async with model.request_stream(
+            [ModelRequest(parts=[UserPromptPart(content='fix it')])],
+            None,
+            ModelRequestParameters(),
+        ) as streamed:
+            with pytest.raises(Exception):
+                async for _ in streamed:
+                    pass
+
+
+async def test_a_malformed_stream_line_raises() -> None:
+    """
+    A stream with an unparseable line must surface mid-stream.
+    """
+
+    def handler(request: Request) -> Response:
+        return Response(200, content=_ndjson([_stream_chunk('Hel')]) + b'\nnot json')
+
+    async with _mocked_model(handler) as model:
+        async with model.request_stream(
+            [ModelRequest(parts=[UserPromptPart(content='fix it')])],
+            None,
+            ModelRequestParameters(),
+        ) as streamed:
+            with pytest.raises(Exception):
+                async for _ in streamed:
+                    pass
+
+
+async def test_a_stream_without_a_final_chunk_raises() -> None:
+    """
+    A stream cut off before completion must not read as a complete response.
+    """
+
+    def handler(request: Request) -> Response:
+        return Response(200, content=_ndjson([_stream_chunk('Hel'), _stream_chunk('lo')]))
+
+    async with _mocked_model(handler) as model:
+        async with model.request_stream(
+            [ModelRequest(parts=[UserPromptPart(content='fix it')])],
+            None,
+            ModelRequestParameters(),
+        ) as streamed:
+            with pytest.raises(UnexpectedModelBehavior):
+                async for _ in streamed:
+                    pass
 
 
 def test_nothing_loaded_requests_the_required_window() -> None:
