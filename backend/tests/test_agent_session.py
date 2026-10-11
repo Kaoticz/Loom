@@ -17,6 +17,7 @@ from schemas.agent_messages import MessageType
 from services.code_search import CodeSearchService
 from services.projects import normalise_project_path
 from services.conversation_history import ConversationHistory
+from services.feedback_trail import FeedbackSource
 from services.docker_sandbox import DockerSandboxManager
 from services.events import (
     INDEXING_PROGRESS_KEY,
@@ -641,6 +642,176 @@ async def test_user_can_reject_the_finished_work(monkeypatch: pytest.MonkeyPatch
     assert await session.run() is SessionState.merged
     assert 'Please also update the README.' in seen['coder'][1]
     assert services.git.merged == ['ai-task-testsess']
+
+
+async def test_first_planning_prompt_carries_no_feedback_section(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """
+    With nothing rejected yet the planner prompt keeps today's shape.
+
+    The trail renders to an empty string, so no header with nothing under it is
+    appended to the first round's prompt.
+    """
+    seen = stub_agents(monkeypatch, ['1. Do the thing'], [(True, 'Looks fine.')])
+    session, _, _, _ = build_session([
+        opening(),
+        json.dumps({'approved': True}),
+        json.dumps({'approved': True}),
+    ])
+
+    assert await session.run() is SessionState.merged
+    assert 'Feedback from earlier rounds' not in seen['coder'][0]
+    assert list(session._feedback_trail.entries) == []
+
+
+async def test_plan_rejection_reaches_the_next_plan_in_full(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """
+    A plan-level objection reaches the planner verbatim, however long it is.
+
+    The history path would collapse this to a stub once it aged out of the
+    recent turns; the trail carries it in full regardless.
+    """
+    reason: str = (
+        'You forgot the database migration: '
+        + 'the users table needs an index on email address. ' * 10
+    )
+    seen = stub_agents(
+        monkeypatch, ['1. First attempt', '1. Second attempt'], [(True, 'Fine.')]
+    )
+    session, _, _, _ = build_session([
+        opening(),
+        json.dumps({'approved': False, 'reason': reason}),
+        json.dumps({'approved': True}),
+        json.dumps({'approved': True}),
+    ])
+
+    assert await session.run() is SessionState.merged
+    assert reason in seen['coder'][1]
+
+    entries = list(session._feedback_trail.entries)
+    assert len(entries) == 1
+    assert entries[0].source is FeedbackSource.user_plan_rejection
+    assert entries[0].text == reason
+
+
+async def test_reviewer_rejection_reaches_the_next_plan_in_full(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """
+    Reviewer criticism reaches the planner verbatim, however long it is.
+    """
+    comments: str = (
+        'The empty case is unhandled: '
+        + 'an empty input file must produce an empty report, not a crash. ' * 10
+    )
+    seen = stub_agents(
+        monkeypatch,
+        ['1. First attempt', '1. Second attempt'],
+        [(False, comments), (True, 'Better.')],
+    )
+    session, _, _, _ = build_session([
+        opening(),
+        json.dumps({'approved': True}),
+        json.dumps({'approved': True}),
+        json.dumps({'approved': True}),
+        json.dumps({'approved': True}),
+    ])
+
+    assert await session.run() is SessionState.merged
+    assert comments in seen['coder'][1]
+
+    entries = list(session._feedback_trail.entries)
+    assert len(entries) == 1
+    assert entries[0].source is FeedbackSource.reviewer_rejection
+    assert entries[0].text == comments
+
+
+async def test_result_rejection_reaches_the_next_plan_in_full(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """
+    Rejecting the finished work reaches the planner verbatim, however long.
+    """
+    reason: str = (
+        'Please also update the README: '
+        + 'the new timeout flag must be documented with an example. ' * 10
+    )
+    seen = stub_agents(
+        monkeypatch, ['1. First', '1. Second'], [(True, 'Fine.'), (True, 'Fine again.')]
+    )
+    session, _, _, _ = build_session([
+        opening(),
+        json.dumps({'approved': True}),
+        json.dumps({'approved': False, 'reason': reason}),
+        json.dumps({'approved': True}),
+        json.dumps({'approved': True}),
+    ])
+
+    assert await session.run() is SessionState.merged
+    assert reason in seen['coder'][1]
+
+    entries = list(session._feedback_trail.entries)
+    assert len(entries) == 1
+    assert entries[0].source is FeedbackSource.user_result_rejection
+    assert entries[0].text == reason
+
+
+async def test_earliest_reviewer_feedback_survives_later_rounds_in_full(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """
+    The trail is never summarized: after three rejections the first round's
+    comment is still in the planner prompt in full.
+
+    By this round the token-budgeted history has collapsed that first comment
+    to a 160-character stub, so its full presence here can only come from the
+    trail. Each round is recorded as its own entry rather than replacing the
+    last one.
+    """
+    first: str = (
+        'First round rejection: '
+        + 'the empty case in a.py is still unhandled and crashes on empty input. ' * 10
+    )
+    seen = stub_agents(
+        monkeypatch,
+        ['1. First', '1. Second', '1. Third', '1. Fourth'],
+        [
+            (False, first),
+            (False, 'Second round rejection: the timeout is still hardcoded.'),
+            (False, 'Third round rejection: the new test never runs.'),
+            (True, 'Fine at last.'),
+        ],
+    )
+    session, _, _, _ = build_session(
+        [opening()] + [json.dumps({'approved': True})] * 8,
+    )
+
+    assert await session.run() is SessionState.merged
+    assert first in seen['coder'][3]
+
+    entries = list(session._feedback_trail.entries)
+    assert [entry.iteration for entry in entries] == [1, 2, 3]
+    assert all(entry.source is FeedbackSource.reviewer_rejection for entry in entries)
+
+
+async def test_an_approved_review_adds_nothing_to_the_trail(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """
+    Only an actual rejection is recorded; an approval leaves no entry behind.
+    """
+    stub_agents(monkeypatch, ['1. Do the thing'], [(True, 'Looks correct.')])
+    session, _, _, _ = build_session([
+        opening(),
+        json.dumps({'approved': True}),
+        json.dumps({'approved': True}),
+    ])
+
+    assert await session.run() is SessionState.merged
+    assert list(session._feedback_trail.entries) == []
 
 
 async def test_plan_retry_cap_pauses_for_the_user(monkeypatch: pytest.MonkeyPatch) -> None:

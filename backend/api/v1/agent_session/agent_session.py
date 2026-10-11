@@ -23,6 +23,7 @@ from schemas.agent_commands import parse_command
 from schemas.command_action import CommandAction
 from schemas.session_command import SessionCommand
 from services.conversation_history import ConversationHistory
+from services.feedback_trail import FeedbackSource, FeedbackTrail
 from services.embedding import DEFAULT_EMBEDDING_MODEL, EmbeddingService
 from services.events import (
     CommitEvent,
@@ -158,6 +159,7 @@ class AgentSession:
     _deps: AgentDeps
     _session: SessionContext
     _history: ConversationHistory
+    _feedback_trail: FeedbackTrail
     _machine: SessionStateMachine
     _limits: IterationLimits
 
@@ -242,6 +244,7 @@ class AgentSession:
         )
         self._session = session
         self._history = history
+        self._feedback_trail = FeedbackTrail()
         self._machine = machine
         self._limits = limits
         self._connection_lost = connection_lost if connection_lost is not None else Event()
@@ -1117,6 +1120,11 @@ class AgentSession:
             command.reason or 'The user rejected this plan without giving a reason.',
             metadata={'rejection': True}
         )
+        self._feedback_trail.add(
+            FeedbackSource.user_plan_rejection,
+            self._history.iteration,
+            command.reason or 'The user rejected this plan without giving a reason.',
+        )
         await self._record_rejection('plan', command.reason)
 
         if self._plan_rejections >= self._limits.max_plan_retries:
@@ -1499,6 +1507,10 @@ class AgentSession:
         self._history.add(
             TurnRole.reviewer, review.comments, metadata={'approved': review.approved}
         )
+        if not review.approved:
+            self._feedback_trail.add(
+                FeedbackSource.reviewer_rejection, self._history.iteration, review.comments
+            )
 
         if review.approved:
             return SessionState.completed
@@ -1552,6 +1564,11 @@ class AgentSession:
             TurnRole.user,
             command.reason or 'The user rejected the finished work without giving a reason.',
             metadata={'rejection': True}
+        )
+        self._feedback_trail.add(
+            FeedbackSource.user_result_rejection,
+            self._history.iteration,
+            command.reason or 'The user rejected the finished work without giving a reason.',
         )
         await self._record_rejection('result', command.reason)
         return SessionState.re_working

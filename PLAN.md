@@ -315,7 +315,7 @@ These apply across the entire plan and to every phase.
   absent); `render_for_coder` on an all-plan-rejection trail; both render
   functions on an empty trail.
 
-### Phase 2: Wire the trail into AgentSession and the planner prompt — Status: Not Started
+### Phase 2: Wire the trail into AgentSession and the planner prompt — Status: Done
 - **Goal:** `AgentSession` populates the feedback trail at the three existing
   rejection/review points, and the planner's prompt includes it.
 - **Requirements:**
@@ -353,7 +353,7 @@ These apply across the entire plan and to every phase.
   - `backend/api/v1/agent_session/planning_coordinator.py`:
     `build_planning_prompt()`.
 - **Acceptance Criteria:**
-  - [ ] Extend `backend/tests/test_agent_session.py`, using the existing
+  - [x] Extend `backend/tests/test_agent_session.py`, using the existing
     `build_session`/`stub_agents`/`opening` harness, with tests asserting the
     planner prompt (`seen['coder']` in that harness's existing naming, which the
     harness's own docstring explains captures planning prompts only, because
@@ -364,10 +364,11 @@ These apply across the entire plan and to every phase.
     `test_rejected_plan_is_replanned_with_the_reason` already assert something
     adjacent to this for the pre-existing summarized path — extend or add
     alongside them rather than duplicating unrelated setup.)
-  - [ ] A test confirms the first planning round's prompt is unaffected (no new
-    section) when nothing has been rejected yet.
-  - [ ] `python -m pytest -m "not integration"` passes with no new failures.
-  - [ ] `mypy . && basedpyright .` reports no new errors.
+    — verified by: `pytest tests/test_agent_session.py` (`test_reviewer_rejection_reaches_the_next_plan_in_full`, `test_plan_rejection_reaches_the_next_plan_in_full`, `test_result_rejection_reaches_the_next_plan_in_full`, plus `test_earliest_reviewer_feedback_survives_later_rounds_in_full` proving the full text survives even once the history path would have stubbed it, and `test_an_approved_review_adds_nothing_to_the_trail`).
+  - [x] A test confirms the first planning round's prompt is unaffected (no new
+    section) when nothing has been rejected yet. — verified by: `pytest tests/test_agent_session.py` (`test_first_planning_prompt_carries_no_feedback_section`).
+  - [x] `python -m pytest -m "not integration"` passes with no new failures. — verified by: full run from `backend/`, 878 passed / 4 skipped / 140 pre-existing Postgres-connection errors, identical to the Phase 0 baseline plus the 22 new tests.
+  - [x] `mypy . && basedpyright .` reports no new errors. — verified by: ran both from `backend/`, clean.
 - **Testing Notes:** Extend `backend/tests/test_agent_session.py` rather than
   creating a new file, matching its existing fixtures and conventions.
 
