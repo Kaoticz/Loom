@@ -892,7 +892,7 @@ def test_the_model_is_told_the_window_it_is_budgeted_against() -> None:
 
     settings: Any = model_settings(8_192)
 
-    assert settings['extra_body']['options']['num_ctx'] == 8_192
+    assert settings['ollama_required_num_ctx'] == 8_192
     # max_tokens is deliberately absent. Setting it only decided which number
     # appeared in "token limit exceeded before any response was generated"; the
     # prompt filling the window is what caused it, whatever the reply cap was.

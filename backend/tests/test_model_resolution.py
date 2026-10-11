@@ -4,7 +4,6 @@ import json
 
 import pytest
 from httpx import AsyncClient, ConnectError, MockTransport, Request, Response
-from pydantic_ai.models.openai import OpenAIChatModel
 
 from services.model_resolution import (
     effective_context_window,
@@ -12,6 +11,7 @@ from services.model_resolution import (
     model_settings,
     resolve_model,
 )
+from services.ollama_native_model import OllamaNativeModel
 
 """
 Turning a configured model name into something an agent can run.
@@ -33,14 +33,15 @@ def test_a_name_without_the_ollama_prefix_is_passed_through() -> None:
 
 def test_an_ollama_name_becomes_a_configured_model() -> None:
     """
-    Ollama is reached through its OpenAI-compatible endpoint.
+    Ollama is reached through its native API.
     """
     resolved = resolve_model('ollama:qwen2.5-coder')
 
-    assert isinstance(resolved, OpenAIChatModel)
+    assert isinstance(resolved, OllamaNativeModel)
     # The prefix is stripped: Ollama is asked for the model, not for the name
     # this project happens to call it by.
     assert resolved.model_name == 'qwen2.5-coder'
+    assert resolved.system == 'ollama'
 
 
 def test_only_the_first_colon_separates_the_prefix() -> None:
@@ -53,7 +54,7 @@ def test_only_the_first_colon_separates_the_prefix() -> None:
     """
     resolved = resolve_model('ollama:qwen2.5-coder:14b')
 
-    assert isinstance(resolved, OpenAIChatModel)
+    assert isinstance(resolved, OllamaNativeModel)
     assert resolved.model_name == 'qwen2.5-coder:14b'
 
 
@@ -65,8 +66,8 @@ def test_the_configured_host_is_used(monkeypatch: pytest.MonkeyPatch) -> None:
 
     resolved = resolve_model('ollama:qwen2.5-coder')
 
-    assert isinstance(resolved, OpenAIChatModel)
-    assert 'elsewhere:9999' in str(resolved.client.base_url)
+    assert isinstance(resolved, OllamaNativeModel)
+    assert 'elsewhere:9999' in resolved.base_url
 
 
 def test_the_default_host_is_used_when_none_is_set(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -77,24 +78,24 @@ def test_the_default_host_is_used_when_none_is_set(monkeypatch: pytest.MonkeyPat
 
     resolved = resolve_model('ollama:qwen2.5-coder')
 
-    assert isinstance(resolved, OpenAIChatModel)
-    assert 'ollama:11434' in str(resolved.client.base_url)
+    assert isinstance(resolved, OllamaNativeModel)
+    assert 'ollama:11434' in resolved.base_url
 
 
-def test_the_openai_compatible_suffix_is_appended(monkeypatch: pytest.MonkeyPatch) -> None:
+def test_the_native_endpoint_has_no_openai_suffix(monkeypatch: pytest.MonkeyPatch) -> None:
     """
-    Ollama serves its OpenAI-compatible API under `/v1`.
+    The native API lives at the base URL itself, not under `/v1`.
 
-    Asserted on its own because it is the single character most likely to be
-    wrong and the least likely to be noticed: everything else about the
-    configuration would look right, and every request would fail.
+    That suffix belonged to the OpenAI-compatible route this model replaces:
+    sending native chat requests there would fail, so its absence is asserted
+    as directly as its presence once was.
     """
     monkeypatch.setenv('OLLAMA_BASE_URL', 'http://ollama:11434')
 
     resolved = resolve_model('ollama:qwen2.5-coder')
 
-    assert isinstance(resolved, OpenAIChatModel)
-    assert str(resolved.client.base_url).rstrip('/').endswith('/v1')
+    assert isinstance(resolved, OllamaNativeModel)
+    assert resolved.base_url == 'http://ollama:11434'
 
 
 def test_a_name_that_merely_contains_ollama_is_not_treated_as_one() -> None:
@@ -259,4 +260,4 @@ def test_a_small_measured_window_reaches_ollama_unchanged() -> None:
     A real sub-minimum model limit must not be raised before it is sent back.
     """
     settings = model_settings(1_024, allow_subminimum=True)
-    assert settings.get('extra_body') == {'options': {'num_ctx': 1_024}}
+    assert settings.get('ollama_required_num_ctx') == 1_024

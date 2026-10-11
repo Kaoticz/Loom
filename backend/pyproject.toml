@@ -14,27 +14,28 @@ authors = [
     {name = "Kaoticz", email = "1812311+Kaoticz@users.noreply.github.com"},
 ]
 dependencies = [
-    "aiofiles",
-    "bcrypt",
-    "beautifulsoup4",
-    "setuptools",
-    "wheel",
-    "beartype",
-    "markdownify",
-    "httpx",
-    "fastapi[standard]",
-    "tortoise-orm[asyncpg]",
-    "aerich[toml]",
-    "python-dotenv",
-    "pydantic",
-    "pydantic-ai>=2.18.0,<3",
-    "pydantic-ai-harness",
-    "pyjwt",
-    "tortoise-embeddings",
-    "dishka",
-    "GitPython",
-    "docker",
-    "python-multipart"
+    "aiofiles==25.1.0",
+    "bcrypt==5.0.0",
+    "beautifulsoup4==4.15.0",
+    "setuptools==84.0.0",
+    "wheel==0.48.0",
+    "beartype==0.22.9",
+    "markdownify==1.2.3",
+    "httpx==0.28.1",
+    "fastapi[standard]==0.141.1",
+    "tortoise-orm[asyncpg]==1.1.8",
+    "aerich[toml]==0.10.0",
+    "python-dotenv==1.2.3",
+    "pydantic==2.13.4",
+    "pydantic-ai==2.33.0",
+    "pydantic-ai-harness==0.25.0",
+    "pyjwt==2.13.0",
+    "tortoise-embeddings==2.0.1",
+    "dishka==1.10.1",
+    "GitPython==3.1.59",
+    "docker==7.2.0",
+    "ollama==0.6.3",
+    "python-multipart==0.0.32"
 ]
 
 [tool.setuptools.packages.find]
@@ -69,11 +70,11 @@ reportUnknownLambdaType = false
 
 [project.optional-dependencies]
 dev = [
-    "setuptools",   # Often needed for tools in editable mode
-    "mypy",
-    "basedpyright",
-    "pytest",
-    "pytest-asyncio"
+    "setuptools==84.0.0",   # Often needed for tools in editable mode
+    "mypy==2.3.1",
+    "basedpyright==1.39.10",
+    "pytest==9.1.1",
+    "pytest-asyncio==1.4.0"
 ]
 
 [tool.pytest.ini_options]

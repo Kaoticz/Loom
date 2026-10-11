@@ -19,8 +19,6 @@ from pydantic_ai.exceptions import UnexpectedModelBehavior
 from pydantic_ai_harness.compaction import ContextUsage, ReportContextUsage, estimate_token_count
 from pydantic_ai.agent import AgentRunResult
 from pydantic_ai.messages import ModelMessage
-from pydantic_ai.models.openai import OpenAIChatModel, OpenAIChatModelSettings
-from pydantic_ai.providers.openai import OpenAIProvider
 from schemas.agent_commands import parse_command
 from schemas.command_action import CommandAction
 from schemas.session_command import SessionCommand
@@ -83,6 +81,7 @@ from services.model_resolution import (
     model_settings,
     resolve_model,
 )
+from services.ollama_native_model import OllamaNativeModelSettings
 from services.session_context import SessionContext
 from services.session_inbox import SessionInbox
 from services.client_gone import ClientGone
@@ -904,7 +903,7 @@ class AgentSession:
         """
         return ReportProviderUsage(self._reconcile_provider_usage)
 
-    def _model_settings_for(self, context_window: int) -> OpenAIChatModelSettings:
+    def _model_settings_for(self, context_window: int) -> OllamaNativeModelSettings:
         """
         Build provider settings against this session's effective window.
 
