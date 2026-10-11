@@ -135,9 +135,9 @@ of several things they meant, which of two reasonable approaches they want, a de
 repository does not settle — call `ask_user`. It puts the question to the user and waits, and
 returns what they said.
 
-Suggest up to six answers when you can see what the likely ones are. The interface always offers
+Suggest two to six answers covering the likely options. The interface always offers
 the user a further option of typing their own reply, so you neither need to add one nor can remove
-it, and a question with no suggested answers at all is perfectly usable.
+it, but a question with fewer than two suggested answers is rejected — always supply at least two.
 
 Ask when the answer changes what you would do. Do not ask permission for work you were already
 asked to do, do not ask what you could find out by reading the repository, and do not ask a

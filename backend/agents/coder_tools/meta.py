@@ -9,27 +9,27 @@ from services.events import CommitEvent, WarningEvent
 from services.commit_result import CommitResult
 from services.session_context import SessionContext
 from services.tool_reporting import report_tool
-from services.user_questioner import MAX_SUGGESTED_ANSWERS, UserQuestioner
+from services.user_questioner import MAX_SUGGESTED_ANSWERS, MIN_SUGGESTED_ANSWERS, UserQuestioner
 
 from .deps import AgentDeps
 
 
-async def ask_user(
-    ctx: RunContext[AgentDeps], question: str, options: list[str] | None = None
-) -> str:
+async def ask_user(ctx: RunContext[AgentDeps], question: str, options: list[str]) -> str:
     """
     Ask the user a question and wait for their answer.
 
     Use this when the task cannot be carried out correctly without something
     only the user can tell you: which of several things they meant, which
-    approach they want, or a decision the repository does not settle. Suggest up
-    to six answers if you can; the interface always offers the user the further
-    option of typing their own, so a question with no suggestions is fine too.
+    approach they want, or a decision the repository does not settle. Provide
+    two to six suggested answers covering the likely options; the call is
+    rejected when fewer than two non-blank suggestions are given. The interface
+    always offers the user the further option of typing their own, so you
+    neither need to add one nor can remove it.
 
     Do not use it to ask permission for work you have already been asked to do,
     and do not use it in place of reading the repository to find something out.
     :param question: The question to put to the user, in one or two sentences.
-    :param options: Up to six suggested answers. The user can always type their own instead, so this may be left empty.
+    :param options: Two to six suggested answers. The user can always type their own instead, but at least two suggestions are required.
     """
     async with report_tool(ctx.deps.events, 'ask_user', {'question': question}) as report:
         questioner: UserQuestioner | None = ctx.deps.questioner
@@ -44,7 +44,14 @@ async def ask_user(
         if not asked:
             return report.fail('ask_user was rejected: the question was empty.')
 
-        reply, truncated = await questioner.ask(asked, options or [])
+        presented: list[str] = [option.strip() for option in options if option.strip()]
+        if len(presented) < MIN_SUGGESTED_ANSWERS:
+            return report.fail(
+                f'ask_user was rejected: provide at least {MIN_SUGGESTED_ANSWERS} suggested '
+                f'answers (two to {MAX_SUGGESTED_ANSWERS} non-blank options).'
+            )
+
+        reply, truncated = await questioner.ask(asked, options)
         if truncated:
             return report.succeed(
                 f'Only the first {MAX_SUGGESTED_ANSWERS} suggested answers were shown; the rest '
