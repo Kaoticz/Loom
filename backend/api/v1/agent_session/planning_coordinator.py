@@ -7,6 +7,7 @@ from agents.planner import PLANNER_SYSTEM_PROMPT, planner_agent
 from agents.structured_plan import StructuredPlan
 from pydantic_ai.agent import AgentRunResult
 from services.compaction import looks_like_context_overflow
+from services.feedback_trail import render_for_planner
 from services.turn_role import TurnRole
 from services.events import CompactionRunPath, ErrorEvent, SessionStatus
 from services.parsed_plan import ParsedPlan
@@ -132,5 +133,8 @@ class PlanningCoordinator:
         sections: list[str] = [f'Task: {self._session._task}']
         if context:
             sections.append(f'What has happened so far:\n{context}')
+        feedback: str = render_for_planner(self._session._feedback_trail)
+        if feedback:
+            sections.append(feedback)
         sections.append('Produce a step-by-step plan for this task.')
         return '\n\n'.join(sections)

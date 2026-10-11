@@ -14,6 +14,14 @@ at which point a free reply serves the reader better anyway. The interface adds
 its own free-reply option on top, so the reader always sees one more than this.
 """
 
+MIN_SUGGESTED_ANSWERS: int = 2
+"""
+How many answers the agent must suggest at minimum.
+
+A question with fewer than two suggestions offers no real choice, so the tool
+rejects it outright rather than putting it in front of the user.
+"""
+
 
 EmitQuestion = Callable[[str, Sequence[str]], Awaitable[None]]
 AwaitReply = Callable[[], Awaitable[str]]

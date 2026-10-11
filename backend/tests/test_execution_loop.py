@@ -27,6 +27,7 @@ from services.events import (
     ToolActionEvent,
 )
 from services.git_manager import GitManagerService
+from services.feedback_trail import FeedbackSource
 from services.command_result import CommandResult
 from services.session_state import SessionState
 from tests.test_agent_session import FakeGit, build_session, opening
@@ -1211,6 +1212,141 @@ async def test_a_later_step_is_told_what_earlier_steps_did(
     assert 'config.py line 12' in prompts[1], 'the second step was not told the first step findings'
     # The first step cannot be told about itself.
     assert 'config.py line 12' not in prompts[0]
+
+
+async def test_a_step_prompt_includes_reviewer_feedback(
+    monkeypatch: pytest.MonkeyPatch, git_repo: GitManagerService
+) -> None:
+    """
+    After a reviewer rejection the next step sees the criticism verbatim.
+
+    The planner may mistranslate feedback when turning it into step text, so
+    the coder gets the raw comment as defense-in-depth.
+    """
+    session, _ = prepare(monkeypatch, [], git_repo)
+    session._feedback_trail.add(
+        FeedbackSource.reviewer_rejection, 1, 'The empty case in a.py is unhandled.'
+    )
+
+    prompt: str = session._build_step_prompt(session._plan.steps[0], 1, 1)
+
+    assert 'The empty case in a.py is unhandled.' in prompt
+
+
+async def test_a_step_prompt_includes_result_rejection_feedback(
+    monkeypatch: pytest.MonkeyPatch, git_repo: GitManagerService
+) -> None:
+    """
+    After the user rejects the finished work the next step sees why.
+    """
+    session, _ = prepare(monkeypatch, [], git_repo)
+    session._feedback_trail.add(
+        FeedbackSource.user_result_rejection, 1, 'Please also update the README.'
+    )
+
+    prompt: str = session._build_step_prompt(session._plan.steps[0], 1, 1)
+
+    assert 'Please also update the README.' in prompt
+
+
+async def test_a_step_prompt_excludes_plan_rejection_feedback(
+    monkeypatch: pytest.MonkeyPatch, git_repo: GitManagerService
+) -> None:
+    """
+    Plan-rejection feedback never reaches the coder, even beside other feedback.
+
+    It describes a plan the coder never executed, so it is noise rather than
+    something actionable. Its absence is asserted explicitly, not inferred from
+    the other entries being present.
+    """
+    session, _ = prepare(monkeypatch, [], git_repo)
+    session._feedback_trail.add(
+        FeedbackSource.reviewer_rejection, 1, 'The empty case in a.py is unhandled.'
+    )
+    session._feedback_trail.add(
+        FeedbackSource.user_plan_rejection, 2, 'You forgot the database migration.'
+    )
+
+    prompt: str = session._build_step_prompt(session._plan.steps[0], 1, 1)
+
+    assert 'The empty case in a.py is unhandled.' in prompt
+    assert 'You forgot the database migration.' not in prompt
+
+
+async def test_a_step_prompt_after_only_a_plan_rejection_has_no_feedback_section(
+    monkeypatch: pytest.MonkeyPatch, git_repo: GitManagerService
+) -> None:
+    """
+    With only plan-level feedback there is nothing to show the coder.
+
+    The step prompt keeps today's shape rather than gaining an empty section.
+    """
+    session, _ = prepare(monkeypatch, [], git_repo)
+    session._feedback_trail.add(
+        FeedbackSource.user_plan_rejection, 1, 'You forgot the database migration.'
+    )
+
+    prompt: str = session._build_step_prompt(session._plan.steps[0], 1, 1)
+
+    assert 'You forgot the database migration.' not in prompt
+    assert 'Feedback from earlier rounds' not in prompt
+
+
+async def test_a_step_prompt_without_any_feedback_has_no_feedback_section(
+    monkeypatch: pytest.MonkeyPatch, git_repo: GitManagerService
+) -> None:
+    """
+    The first round's steps read exactly as they do today.
+    """
+    session, _ = prepare(monkeypatch, [], git_repo)
+
+    prompt: str = session._build_step_prompt(session._plan.steps[0], 1, 1)
+
+    assert 'Feedback from earlier rounds' not in prompt
+
+
+async def test_every_step_of_a_reworked_plan_sees_the_feedback(
+    monkeypatch: pytest.MonkeyPatch, git_repo: GitManagerService
+) -> None:
+    """
+    Feedback is included on every step, not just the first one.
+
+    A reworked plan's later steps need the criticism as much as the first.
+    """
+    prompts: list[str] = []
+    session, _ = prepare(monkeypatch, [], git_repo)
+    session._plan = three_step_plan()
+    session._feedback_trail.add(
+        FeedbackSource.reviewer_rejection, 1, 'The empty case is unhandled.'
+    )
+    monkeypatch.setattr(
+        agent_run_helper_module, 'resolve_model', lambda name: counting_model(prompts, [])
+    )
+
+    await session._handle_executing()
+
+    assert len(prompts) == 3
+    assert all('The empty case is unhandled.' in prompt for prompt in prompts)
+
+
+async def test_a_step_prompt_carries_every_round_of_reviewer_feedback(
+    monkeypatch: pytest.MonkeyPatch, git_repo: GitManagerService
+) -> None:
+    """
+    Two rejections in a row both reach the next step, not just the latest.
+    """
+    session, _ = prepare(monkeypatch, [], git_repo)
+    session._feedback_trail.add(
+        FeedbackSource.reviewer_rejection, 1, 'The empty case is unhandled.'
+    )
+    session._feedback_trail.add(
+        FeedbackSource.reviewer_rejection, 2, 'The timeout is still hardcoded.'
+    )
+
+    prompt: str = session._build_step_prompt(session._plan.steps[0], 1, 1)
+
+    assert 'The empty case is unhandled.' in prompt
+    assert 'The timeout is still hardcoded.' in prompt
 
 
 async def test_a_step_cannot_finish_without_verifying_its_change(
