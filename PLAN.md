@@ -372,7 +372,7 @@ These apply across the entire plan and to every phase.
 - **Testing Notes:** Extend `backend/tests/test_agent_session.py` rather than
   creating a new file, matching its existing fixtures and conventions.
 
-### Phase 3: Wire the trail into the coder's step prompt — Status: Not Started
+### Phase 3: Wire the trail into the coder's step prompt — Status: Done
 - **Goal:** `_build_step_prompt()` includes reviewer/result-rejection feedback,
   and provably excludes plan-rejection feedback.
 - **Requirements:**
@@ -393,21 +393,21 @@ These apply across the entire plan and to every phase.
 - **Affected Areas:**
   - `backend/api/v1/agent_session/agent_session.py`: `_build_step_prompt()`.
 - **Acceptance Criteria:**
-  - [ ] Extend `backend/tests/test_execution_loop.py`, which already drives
+  - [x] Extend `backend/tests/test_execution_loop.py`, which already drives
     `_handle_executing()`/`_build_step_prompt()` directly against a real
     repository (see `test_each_step_is_told_which_step_it_is` and
     `test_a_later_step_is_told_what_earlier_steps_did` for the existing pattern
     of asserting on built step prompts), with tests asserting:
-    - [ ] After a reviewer rejection, the next step's prompt contains the
-      reviewer's comments.
-    - [ ] After a user result rejection, the next step's prompt contains that
-      rejection's reason.
-    - [ ] After a user plan rejection, the next step's prompt does **not**
+    - [x] After a reviewer rejection, the next step's prompt contains the
+      reviewer's comments. — verified by: `pytest tests/test_execution_loop.py` (`test_a_step_prompt_includes_reviewer_feedback`).
+    - [x] After a user result rejection, the next step's prompt contains that
+      rejection's reason. — verified by: `pytest tests/test_execution_loop.py` (`test_a_step_prompt_includes_result_rejection_feedback`).
+    - [x] After a user plan rejection, the next step's prompt does **not**
       contain that rejection's reason (the explicit negative case proving the
       coder/planner scope split actually holds, not merely inferred from the
-      other assertions).
-  - [ ] `python -m pytest -m "not integration"` passes with no new failures.
-  - [ ] `mypy . && basedpyright .` reports no new errors.
+      other assertions). — verified by: `pytest tests/test_execution_loop.py` (`test_a_step_prompt_excludes_plan_rejection_feedback`, `test_a_step_prompt_after_only_a_plan_rejection_has_no_feedback_section`).
+  - [x] `python -m pytest -m "not integration"` passes with no new failures. — verified by: full run from `backend/`, 878 passed / 4 skipped / 140 pre-existing Postgres-connection errors, identical to the Phase 0 baseline plus the 22 new tests.
+  - [x] `mypy . && basedpyright .` reports no new errors. — verified by: ran both from `backend/`, clean.
 - **Testing Notes:** Extend `backend/tests/test_execution_loop.py` rather than
   creating a new file. The negative case (plan-rejection text absent) is the
   most important single assertion in this phase — do not skip it in favor of

@@ -23,7 +23,7 @@ from schemas.agent_commands import parse_command
 from schemas.command_action import CommandAction
 from schemas.session_command import SessionCommand
 from services.conversation_history import ConversationHistory
-from services.feedback_trail import FeedbackSource, FeedbackTrail
+from services.feedback_trail import FeedbackSource, FeedbackTrail, render_for_coder
 from services.embedding import DEFAULT_EMBEDDING_MODEL, EmbeddingService
 from services.events import (
     CommitEvent,
@@ -1406,6 +1406,10 @@ class AgentSession:
                 'required no change. Do not call complete_task: the plan is not finished until '
                 'every step is.'
             )
+
+        feedback: str = render_for_coder(self._feedback_trail)
+        if feedback:
+            prompt += f'\n\n{feedback}'
 
         if self._repository_has_frontend():
             prompt += f'\n\n{BROWSER_GUIDANCE}'
