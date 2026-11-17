@@ -14,7 +14,7 @@ from services.ollama_model_metadata import (
     positive_int,
 )
 
-DEFAULT_EMBEDDING_MODEL: str = 'nomic-embed-text'
+DEFAULT_EMBEDDING_MODEL: str = 'snowflake-arctic-embed2'
 DIMENSION_PROBE_TEXT: str = 'dimension probe'
 
 EMBEDDING_LENGTH_SUFFIX: str = '.embedding_length'

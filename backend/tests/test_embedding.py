@@ -38,7 +38,7 @@ def test_configuration_defaults() -> None:
     """
     service: EmbeddingService = service_returning(lambda request: Response(200, json={'embedding': [1.0]}))
     assert service.ollama_url == 'http://ollama:11434'
-    assert service.embedding_model == DEFAULT_EMBEDDING_MODEL == 'nomic-embed-text'
+    assert service.embedding_model == DEFAULT_EMBEDDING_MODEL == 'snowflake-arctic-embed2'
 
 
 @pytest.mark.parametrize(

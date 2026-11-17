@@ -14,53 +14,58 @@ throwaway container rather than on your host.
 
 You give Loom a task. It then:
 
-1. **Indexes** the repository into Postgres — file contents, AST symbols, and vector embeddings
+1. **Indexes** the repository into Postgres, file contents, AST symbols, and vector embeddings
    for semantic search.
-2. **Plans** the change and shows you the steps. Nothing happens until you approve.
-3. **Executes** the plan with tools: reading and searching code, editing files, and running
+2. **Classifies** the task. If it only calls for an answer, explaining code, assessing a design,
+   Loom answers it and stops, with no plan, branch, or review to sit through.
+3. **Plans** the change and shows you the steps. Nothing happens until you approve.
+4. **Executes** the plan with tools: reading and searching code, editing files, and running
    test or lint commands inside a sandbox container. Every edit is committed to a task branch.
-4. **Reviews** the cumulative diff with a second model.
-5. **Waits** for you to merge, or to send it back for another pass.
-
-The run is driven by an explicit state machine, so every transition is validated and a session
-can only ever be in one of a known set of states.
+5. **Reviews** the cumulative diff with a second model.
+6. **Waits** for you to merge, or to send it back for another pass.
 
 ---
 
 ## Requirements
 
-- **Docker** or **Podman** — for the sandbox, and for the bundled services
+- **Docker** or **Podman**, for the sandbox and for the bundled services
 - **Ollama**, with at least one chat model and one embedding model pulled
-- **Python 3.14+** and **Node 24+**, if you run Loom directly rather than in containers
+- **Python 3.14+** and **Node 25+**, if you run Loom directly rather than in containers
 
 Pull the models Loom expects by default:
 
 ```bash
-ollama pull qwen2.5-coder
-ollama pull nomic-embed-text
+ollama pull qwen3.5:9b  # Any LLM that supports tool calls will do
+ollama pull snowflake-arctic-embed2  # The default embedding model
 ```
 
-The embedding model must genuinely be an *embedding* model. A chat model such as `llama3` will
-produce unusable vectors and semantic search will return nonsense.
+If you would rather embed with a different model, such as `nomic-embed-text`, set
+`EMBEDDING_MODEL` to match whatever you pulled.
 
 ---
 
 ## Quick start with Docker Compose
 
 ```bash
-git clone <your-fork> loom
-cd loom
+git clone https://github.com/Kaoticz/Loom
+cd Loom
 docker compose up --build
 ```
 
 Then open <http://localhost:5173>.
 
-Compose brings up Postgres with pgvector, SearXNG, the backend and the frontend. It expects
-Ollama at `http://ollama:11434`; change `OLLAMA_BASE_URL` in `docker-compose.yml` if yours runs
-elsewhere.
+Compose brings up Postgres with pgvector, Ollama, SearXNG, the backend and the frontend. The
+bundled Ollama shares the host's network, and the backend is pointed at
+`http://host.docker.internal:11434`. If yours listens elsewhere, change `OLLAMA_BASE_URL`
+in `docker-compose.yml`.
 
-Put the repository you want Loom to work on in `./data/repo`, then pick it with the directory
-picker in the interface. Anything beneath a directory mounted into the Loom container will do.
+The bundled Ollama keeps its pulled models in `./data/ollama` and reserves every NVIDIA GPU it
+can see, which asks for the NVIDIA container toolkit. On a machine without one, remove the
+`deploy` block from the `ollama` service in `docker-compose.yml`.
+
+Put the repository you want Loom to work on in `./data/repo` (a symlink also works), then pick it
+with the directory picker in the interface. Anything beneath a directory mounted into the Loom
+container will do.
 
 ### If you use Podman
 
@@ -105,23 +110,36 @@ docker compose up -d postgres searxng
 
 ### Backend
 
+`dev.sh` does the setup for you. It creates the virtualenv, installs everything including the
+test and type-checking tools, and defines a `migrate` helper around Aerich:
+
+```bash
+cd backend
+source dev.sh
+fastapi dev
+```
+
+Driven by hand instead:
+
 ```bash
 cd backend
 python -m venv .venv && source .venv/bin/activate
-pip install -e .
+pip install -e '.[dev]'
 
-cp .env.example .env        # then edit if the defaults do not suit you
+cp env.example .env         # then edit if the defaults do not suit you
 uvicorn main:app --reload --port 8000
 ```
 
-The schema is created by migrations at startup. There is no separate migration step.
+The schema is created by Aerich migrations, applied automatically at startup. There is no
+separate migration step. After the models change, `migrate add <name>` writes the migration and
+`migrate apply` takes it to the database.
 
 ### Frontend
 
 ```bash
 cd frontend
 npm install
-cp .env.example .env        # then edit if the backend is not on localhost:8000
+cp env.example .env         # then edit if the backend is not on localhost:8000
 npm run dev
 ```
 
@@ -131,15 +149,15 @@ npm run dev
 
 Configuration comes from three places, in order of precedence:
 
-1. **The environment** — a shell variable, or a value injected by Docker Compose
-2. **A `.env` file** — `backend/.env` and `frontend/.env`
+1. **The environment**, a shell variable, or a value injected by Docker Compose
+2. **A `.env` file**, `backend/.env` and `frontend/.env`
 3. **The default** built into the code
 
 So a value in `.env` overrides the default, and anything already in the environment overrides
 the file. Docker Compose and Vite use the same ordering, so all three layers agree.
 
-Both `.env` files are optional; a fresh clone runs without them. Copy the matching
-`.env.example` to get started — it lists every variable with an explanation.
+Both `.env` files are optional. A fresh clone runs without them. Copy the matching `env.example`
+to get started, it lists every variable with an explanation.
 
 Compose reads `backend/.env` and `frontend/.env` as well, so one file serves both ways of
 running. Compose then overrides the connection settings, because inside its network the
@@ -153,7 +171,7 @@ services are reachable by name rather than on `localhost`.
 | `OLLAMA_BASE_URL` | `http://localhost:11434` | Where Ollama is listening |
 | `SEARXNG_URL` | `http://localhost:8080` | Where SearXNG is listening |
 | `REPO_PATH` | `/tmp/repo` | The repository, as this process sees it |
-| `EMBEDDING_MODEL` | `nomic-embed-text` | Must be an embedding model |
+| `EMBEDDING_MODEL` | `snowflake-arctic-embed2` | Must be an embedding model |
 | `LOOM_MAX_FILE_SIZE_BYTES` | `1048576` | Largest file indexed. `0` or negative means unlimited |
 | `LOOM_MAX_PLAN_RETRIES` | `10` | Plan rejections before Loom asks how to proceed |
 | `LOOM_MAX_REVIEW_RETRIES` | `10` | Review rejections before Loom asks how to proceed |
@@ -164,8 +182,8 @@ services are reachable by name rather than on `localhost`.
 Bind mount sources are resolved by the container runtime's daemon, which runs on the host, so a
 containerised Loom asking for `/tmp/repo` would mount the *host's* `/tmp/repo` rather than the
 project. Loom discovers the host's view of the repository by inspecting its own container's mounts,
-so nothing needs configuring. If it cannot — because the repository is not under anything mounted
-in from the host — the sandbox is reported as unavailable and the session continues without being
+so nothing needs configuring. If it cannot, because the repository is not under anything mounted
+in from the host, the sandbox is reported as unavailable and the session continues without being
 able to verify its work.
 
 ### Frontend, `frontend/.env`
@@ -178,7 +196,8 @@ able to verify its work.
 ### Compose-only variables
 
 These configure Compose itself rather than the application. Put them in a `.env` at the
-repository root, beside `docker-compose.yml`. All are optional.
+repository root, beside `docker-compose.yml`. The `env.example` there is a template for it,
+and also carries the test suite's `TEST_DATABASE_URL`. All are optional.
 
 | Variable | Default | Purpose |
 |---|---|---|
@@ -191,11 +210,10 @@ repository root, beside `docker-compose.yml`. All are optional.
 ## Secrets
 
 Secrets entered in Settings are passed to the sandbox as environment variables so the agent's
-commands can use them. Their **values are never stored** — not in the database, not in browser
-storage — and they are stripped from all command output before it reaches the model or the
-screen. The agent is told the names only.
+commands can use them. Their **values are never stored** and they are stripped from all command
+output before it reaches the model or the screen. The agent is told the names only.
 
-The consequence is that you re-enter them each browser session. That is deliberate.
+This means you have re-enter them each browser session. This is deliberate.
 
 ---
 
@@ -206,7 +224,8 @@ cd backend && pytest
 cd frontend && npm test
 ```
 
-The backend suite runs with no external services, skipping the parts that need them. To run
+The backend suite runs with no external services, skipping the parts that need them. It requires
+its dev extras installed first (`pip install -e '.[dev]'`, or `source dev.sh`). To run
 everything:
 
 ```bash
@@ -218,31 +237,15 @@ pytest
 `TEST_DATABASE_URL` must point at Postgres with pgvector. The suite creates and drops its own
 databases, so use a development server rather than anything you care about.
 
+The driver, `playwright-core`, is an optional dependency that downloads no browsers
+of its own. Each of these variables is explained in an `env.example` file: `TEST_DATABASE_URL`
+in the repository root's, `AST_GREP_BIN` in the backend's, `LOOM_BROWSER_BIN` in the frontend's.
+
 Type checking:
 
 ```bash
 cd backend && mypy . && basedpyright .
-cd frontend && npm run check
-```
-
----
-
-## Project layout
-
-```
-backend/
-  agents/       coder and reviewer agent definitions, and their tools
-  api/v1/       HTTP routes, the WebSocket controller, and the session state machine
-  database/     models, migrations, and schema setup
-  services/     indexing, search, git, sandbox, chunking, and session support
-  schemas/      request, response, and WebSocket message contracts
-  tests/
-frontend/
-  src/lib/      the agent store, chat, and diff viewer
-  src/routes/   the main view, settings, and task history
-data/
-  repo/         where Compose expects the repository being worked on
-  searxng/      SearXNG configuration
+cd frontend && npm run check && npm run lint
 ```
 
 ---

@@ -151,7 +151,7 @@ export interface AgentState {
 const defaultConfig: AgentConfig = {
     coderModel: 'ollama:llama3',
     reviewerModel: 'ollama:llama3',
-    embeddingModel: 'nomic-embed-text',
+    embeddingModel: 'snowflake-arctic-embed2',
     chunkLines: null,
     coderContextWindow: null,
     plannerContextWindow: null,
